@@ -189,18 +189,21 @@ static bool kicadImportSchematic( std::string aPath, std::string aTypeName, std:
     if( !frame )
         return false;
 
+    // Malformed or non-object props are refused BEFORE any side effect (the
+    // blocking-dialog close below, and importFile's default screens on failure).
+    nlohmann::json parsed = nlohmann::json::parse( aPropsJson, nullptr, false );
+
+    if( !parsed.is_object() )
+        return false;
+
     if( wxWindow* blocking = frame->Kiway().GetBlockingDialog() )
         blocking->Close( true );
 
     std::map<std::string, UTF8> props;
-    nlohmann::json parsed = nlohmann::json::parse( aPropsJson, nullptr, false );
 
-    if( parsed.is_object() )
-    {
-        for( auto& [key, value] : parsed.items() )
-            if( value.is_string() )
-                props[key] = UTF8( value.get<std::string>() );
-    }
+    for( const auto& [key, value] : parsed.items() )
+        if( value.is_string() )
+            props[key] = UTF8( value.get<std::string>() );
 
     if( !frame->ImportSchematicFile( wxString::FromUTF8( aPath ), type, &props ) )
         return false;

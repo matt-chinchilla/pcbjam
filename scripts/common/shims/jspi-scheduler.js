@@ -170,8 +170,8 @@
       }, 16);
     },
 
-    // The embind PARKERs (kicadOpenFile / kicadOpenFiles / kicadLibsReload,
-    // registered emscripten::async()): wrap them with the
+    // The embind PARKERs (kicadOpenFile / kicadOpenFiles / kicadLibsReload /
+    // kicadLibsAddEntry / kicadImportSchematic, registered emscripten::async()): wrap them with the
     // same activation tracking as the raw promising exports, so their parks
     // (wxWasmYieldUntil inside the load) find a tracked record and get the
     // green-region spill-stack discipline. Embind names live on Module WITHOUT
@@ -182,7 +182,8 @@
       "kicadLibsReload",
       "kicadLibsAddEntry",
       // Non-KiCad schematic import (eeschema_embind.cpp): parks through
-      // SCH_EDIT_FRAME::importFile's progress reporter like an open.
+      // SCH_EDIT_FRAME::importFile's progress reporter like an open, and in
+      // its modal dialogs (the import-issues report, the error message).
       "kicadImportSchematic",
     ],
     _wrapParkers: function () {
