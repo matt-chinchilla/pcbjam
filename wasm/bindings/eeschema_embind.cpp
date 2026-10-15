@@ -151,13 +151,37 @@ bool kicadSetReadOnly( bool aReadOnly )
 // Modified by Chirichella Inc. on 2026-10-15: import a non-KiCad schematic (or an
 // Altium project's document list) through SCH_EDIT_FRAME's own import path, the one
 // File > Import drives on the desktop. Same busy guard and coroutine rules as
-// kicadOpenFile. aProps is a flat JSON object of string to string.
+// kicadOpenFile. aPropsJson is a flat JSON object of string to string.
+// aTypeName is one of the eight importer types, spelled as SCH_IO_MGR::EnumFromStr reads
+// them: "Altium", "CADSTAR Schematic Archive", "EAGLE", "EasyEDA (JLCEDA) Std",
+// "EasyEDA (JLCEDA) Pro", "gEDA / Lepton EDA", "LTspice", "PADS Logic". Any other name
+// (KiCad, Legacy, Database, HTTP, PCBJAM, unknown) returns false before the frame is
+// touched. Resolves true only when a sheet was loaded (the item check at the end).
 // Outside KICAD_MERGED_EMBIND on purpose: the JS name is eeschema-only, so this TU
 // registers it in both the standalone and the merged image (like kicadSaveSchematic),
 // and kicad_editor_embind.cpp stays free of eeschema headers.
 static bool kicadImportSchematic( std::string aPath, std::string aTypeName, std::string aPropsJson )
 {
     pcbjam_open::BusyGuard busy;
+
+    SCH_IO_MGR::SCH_FILE_T type = SCH_IO_MGR::EnumFromStr( wxString::FromUTF8( aTypeName ) );
+
+    // The cases importFile's own switch handles; its default branch imports nothing.
+    switch( type )
+    {
+    case SCH_IO_MGR::SCH_ALTIUM:
+    case SCH_IO_MGR::SCH_CADSTAR_ARCHIVE:
+    case SCH_IO_MGR::SCH_EAGLE:
+    case SCH_IO_MGR::SCH_LTSPICE:
+    case SCH_IO_MGR::SCH_EASYEDA:
+    case SCH_IO_MGR::SCH_EASYEDAPRO:
+    case SCH_IO_MGR::SCH_PADS:
+    case SCH_IO_MGR::SCH_GEDA:
+        break;
+
+    default:
+        return false;
+    }
 
     SCH_EDIT_FRAME* frame =
             wxTheApp ? dynamic_cast<SCH_EDIT_FRAME*>( wxTheApp->GetTopWindow() ) : nullptr;
@@ -167,12 +191,6 @@ static bool kicadImportSchematic( std::string aPath, std::string aTypeName, std:
 
     if( wxWindow* blocking = frame->Kiway().GetBlockingDialog() )
         blocking->Close( true );
-
-    SCH_IO_MGR::SCH_FILE_T type = SCH_IO_MGR::EnumFromStr( wxString::FromUTF8( aTypeName ) );
-
-    if( type == SCH_IO_MGR::SCH_FILE_UNKNOWN || type == SCH_IO_MGR::SCH_KICAD
-        || type == SCH_IO_MGR::SCH_LEGACY )
-        return false;
 
     std::map<std::string, UTF8> props;
     nlohmann::json parsed = nlohmann::json::parse( aPropsJson, nullptr, false );
@@ -184,7 +202,16 @@ static bool kicadImportSchematic( std::string aPath, std::string aTypeName, std:
                 props[key] = UTF8( value.get<std::string>() );
     }
 
-    return frame->ImportSchematicFile( wxString::FromUTF8( aPath ), type, &props );
+    if( !frame->ImportSchematicFile( wxString::FromUTF8( aPath ), type, &props ) )
+        return false;
+
+    // importFile reports true on every path but a non-absolute aPath: a failed load (null
+    // sheet, IO_ERROR, std::exception) calls CreateDefaultScreens() and falls through to its
+    // one `return true`. That default root screen is empty, so the item check is what
+    // tells a loaded sheet from the default screen.
+    SCH_SCREEN* root = frame->Schematic().RootScreen();
+
+    return root && !root->Items().empty();
 }
 
 // ───────────────────────────── Yjs collaborative bridge ─────────────────────────────
