@@ -207,11 +207,17 @@ static bool kicadImportSchematic( std::string aPath, std::string aTypeName, std:
 
     // importFile reports true on every path but a non-absolute aPath: a failed load (null
     // sheet, IO_ERROR, std::exception) calls CreateDefaultScreens() and falls through to its
-    // one `return true`. That default root screen is empty, so the item check is what
-    // tells a loaded sheet from the default screen.
-    SCH_SCREEN* root = frame->Schematic().RootScreen();
+    // one `return true`. That default schematic is one top-level sheet with an empty screen,
+    // so the item check is what tells a loaded sheet from the default screen. Every
+    // top-level sheet is read, not RootScreen() alone: an Altium project import makes each
+    // document a top-level sheet, and the first one may be blank.
+    for( SCH_SHEET* sheet : frame->Schematic().GetTopLevelSheets() )
+    {
+        if( sheet && sheet->GetScreen() && !sheet->GetScreen()->Items().empty() )
+            return true;
+    }
 
-    return root && !root->Items().empty();
+    return false;
 }
 
 // ───────────────────────────── Yjs collaborative bridge ─────────────────────────────
