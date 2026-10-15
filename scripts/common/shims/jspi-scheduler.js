@@ -22,6 +22,8 @@
 //
 // Observability: an event ring + live activation table via __wxWaitDump().
 
+// Modified by Chirichella Inc. on 2026-10-15: kicadImportSchematic joins PARKER_NAMES.
+
 (function () {
   "use strict";
 
@@ -179,6 +181,9 @@
       "kicadOpenFiles",
       "kicadLibsReload",
       "kicadLibsAddEntry",
+      // Non-KiCad schematic import (eeschema_embind.cpp): parks through
+      // SCH_EDIT_FRAME::importFile's progress reporter like an open.
+      "kicadImportSchematic",
     ],
     _wrapParkers: function () {
       var wrapped = 0;

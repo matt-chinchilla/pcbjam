@@ -5,6 +5,9 @@
  * the eeschema app (it compiles wasm/bindings/<app>_embind.cpp if present).
  */
 
+// Modified by Chirichella Inc. on 2026-10-15: kicadImportSchematic, importing a non-KiCad
+// schematic or an Altium project through SCH_EDIT_FRAME's own import path.
+
 #ifdef __EMSCRIPTEN__
 #include <emscripten.h>
 #include <emscripten/bind.h>
@@ -28,6 +31,7 @@
 #include <sch_edit_frame.h>
 #include <symbol_edit_frame.h>
 #include <sch_io/kicad_sexpr/sch_io_kicad_sexpr.h>
+#include <sch_io/sch_io_mgr.h>
 #include <sch_sheet.h>
 #include <richio.h>
 #include <lib_symbol.h>
@@ -143,6 +147,45 @@ bool kicadSetReadOnly( bool aReadOnly )
     return true;
 }
 #endif // !KICAD_MERGED_EMBIND
+
+// Modified by Chirichella Inc. on 2026-10-15: import a non-KiCad schematic (or an
+// Altium project's document list) through SCH_EDIT_FRAME's own import path, the one
+// File > Import drives on the desktop. Same busy guard and coroutine rules as
+// kicadOpenFile. aProps is a flat JSON object of string to string.
+// Outside KICAD_MERGED_EMBIND on purpose: the JS name is eeschema-only, so this TU
+// registers it in both the standalone and the merged image (like kicadSaveSchematic),
+// and kicad_editor_embind.cpp stays free of eeschema headers.
+static bool kicadImportSchematic( std::string aPath, std::string aTypeName, std::string aPropsJson )
+{
+    pcbjam_open::BusyGuard busy;
+
+    SCH_EDIT_FRAME* frame =
+            wxTheApp ? dynamic_cast<SCH_EDIT_FRAME*>( wxTheApp->GetTopWindow() ) : nullptr;
+
+    if( !frame )
+        return false;
+
+    if( wxWindow* blocking = frame->Kiway().GetBlockingDialog() )
+        blocking->Close( true );
+
+    SCH_IO_MGR::SCH_FILE_T type = SCH_IO_MGR::EnumFromStr( wxString::FromUTF8( aTypeName ) );
+
+    if( type == SCH_IO_MGR::SCH_FILE_UNKNOWN || type == SCH_IO_MGR::SCH_KICAD
+        || type == SCH_IO_MGR::SCH_LEGACY )
+        return false;
+
+    std::map<std::string, UTF8> props;
+    nlohmann::json parsed = nlohmann::json::parse( aPropsJson, nullptr, false );
+
+    if( parsed.is_object() )
+    {
+        for( auto& [key, value] : parsed.items() )
+            if( value.is_string() )
+                props[key] = UTF8( value.get<std::string>() );
+    }
+
+    return frame->ImportSchematicFile( wxString::FromUTF8( aPath ), type, &props );
+}
 
 // ───────────────────────────── Yjs collaborative bridge ─────────────────────────────
 //
@@ -2600,6 +2643,9 @@ EMSCRIPTEN_BINDINGS(eeschema) {
     // Sheet navigator bridge (sheet-panel): hierarchy tree + navigate.
     function("kicadSheetsGetTree", &schSheetsGetTree);
     function("kicadSheetsEnter", &schSheetsEnter);
+    // Non-KiCad schematic / Altium project import (eeschema-only name, so registered
+    // here in both images; suspends like kicadOpenFile, hence the PARKER policy).
+    function("kicadImportSchematic", &kicadImportSchematic PCBJAM_PARKER_POLICY);
 
 #ifndef KICAD_MERGED_EMBIND
     // JS names ALSO registered by pcbnew_embind.cpp — in the merged image these are
