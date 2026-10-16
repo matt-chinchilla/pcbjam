@@ -1,6 +1,9 @@
 /*
  * WASM implementation of kiplatform/io.h
  * Provides file I/O functions for WASM virtual filesystem
+ *
+ * Modified by Chirichella Inc. on 2026-10-15: MAPPED_FILE for the WebAssembly
+ * platform (the Allegro board importer reads its input through it).
  */
 
 #include <kiplatform/io.h>
@@ -78,6 +81,23 @@ long long TimestampDir( const wxString& aDirPath, const wxString& aFilespec )
     }
 
     return timestamp;
+}
+
+
+// Modified by Chirichella Inc. on 2026-10-15: the memory-mapped file of
+// kiplatform/io.h, which the Allegro board importer (pcb_io_allegro.cpp) reads
+// its input through. The unix and windows platforms map the file and fall back
+// to a plain read; Emscripten's virtual file systems have no mapping worth
+// keeping, so the file is read whole into the class's own fallback buffer by
+// the common readIntoBuffer (os/common/io.cpp), and there is nothing to unmap.
+MAPPED_FILE::MAPPED_FILE( const wxString& aFileName )
+{
+    readIntoBuffer( aFileName );
+}
+
+
+MAPPED_FILE::~MAPPED_FILE()
+{
 }
 
 } // namespace IO
