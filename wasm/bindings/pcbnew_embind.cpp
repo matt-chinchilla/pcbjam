@@ -2462,6 +2462,90 @@ bool pcbCollabTestSetFootprintField( std::string aId, std::string aField, std::s
     return true;
 }
 
+// Circuit Center (island cc12, footprint.models): replace one footprint's 3D
+// model list as ONE undo step. The collab apply (kicadCollabApplyItems) replaces
+// a footprint by its uuid but pushes SKIP_UNDO by design (a peer's edit never
+// lands on the local undo stack), so the reader's Ctrl+Z could not take a model
+// change back; this is a REAL BOARD_COMMIT, as a model edit in KiCad's own
+// footprint properties dialog is: Modify, the new list, Push (undo, OnModify).
+// aModelsJson is a JSON array of { path, offset: [x,y,z] mm, rotate: [x,y,z]
+// degrees, scale: [x,y,z] }, each model shown at full opacity. Answers false
+// (nothing queued) when the uuid is not a footprint of the board or the JSON is
+// not that shape; true once the commit is queued on the apply coroutine, which
+// re-resolves the footprint there (the host waits for kicadCollabBusy to clear).
+bool pcbFootprintSetModels( std::string aId, std::string aModelsJson )
+{
+    PCB_EDIT_FRAME* fr = pcbFrame();
+    BOARD_ITEM*     item = testResolve( fr, aId );
+
+    if( !item || item->Type() != PCB_FOOTPRINT_T )
+        return false;
+
+    json parsed = json::parse( aModelsJson, nullptr, /*allow_exceptions*/ false );
+
+    if( parsed.is_discarded() || !parsed.is_array() )
+        return false;
+
+    auto vec3 = []( const json& aObj, const char* aKey, VECTOR3D& aOut ) -> bool
+    {
+        auto it = aObj.find( aKey );
+
+        if( it == aObj.end() )
+            return false;
+
+        const json& v = *it;
+
+        if( !v.is_array() || v.size() != 3 )
+            return false;
+
+        for( const json& n : v )
+        {
+            if( !n.is_number() )
+                return false;
+        }
+
+        aOut = VECTOR3D( v[0].get<double>(), v[1].get<double>(), v[2].get<double>() );
+        return true;
+    };
+
+    std::vector<FP_3DMODEL> models;
+
+    for( const json& m : parsed )
+    {
+        if( !m.is_object() )
+            return false;
+
+        auto path = m.find( "path" );
+
+        if( path == m.end() || !path->is_string() )
+            return false;
+
+        FP_3DMODEL model;
+        model.m_Filename = wxString::FromUTF8( path->get<std::string>().c_str() );
+
+        if( !vec3( m, "offset", model.m_Offset ) || !vec3( m, "rotate", model.m_Rotation )
+                || !vec3( m, "scale", model.m_Scale ) )
+            return false;
+
+        models.push_back( model );
+    }
+
+    pcbjam_collab::runOnCoroutine( fr, [fr, aId, models]() {   // re-resolve on the coroutine (S4)
+        BOARD_ITEM* live = testResolve( fr, aId );
+
+        if( !live || live->Type() != PCB_FOOTPRINT_T )
+            return;
+
+        FOOTPRINT*   fp = static_cast<FOOTPRINT*>( live );
+        BOARD_COMMIT commit( fr );
+        commit.Modify( fp );
+        fp->Models() = models;
+        commit.Push( wxT( "Change 3D Models" ) );
+    } );
+
+    return true;
+}
+
 bool pcbCollabTestSetBoardItemLocked( std::string aId, bool aLocked )
 {
     PCB_EDIT_FRAME* fr = pcbFrame();
@@ -3009,6 +3093,8 @@ EMSCRIPTEN_BINDINGS(pcbnew) {
     function("kicadCollabTestSetBoardItemLocked", &pcbCollabTestSetBoardItemLocked);
     function("kicadCollabTestMoveBoardItem", &pcbCollabTestMoveBoardItem);
     function("kicadCollabTestDuplicateBoardItem", &pcbCollabTestDuplicateBoardItem);
+    // Circuit Center (island cc12): a footprint's 3D models as one undo step (footprint.models).
+    function("kicadFootprintSetModels", &pcbFootprintSetModels);
 
 #ifndef KICAD_MERGED_EMBIND
     // JS names ALSO registered by eeschema_embind.cpp — in the merged image these are
