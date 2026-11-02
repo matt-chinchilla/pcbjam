@@ -59,6 +59,11 @@
 #include <view/view.h>
 #include <view/view_overlay.h>
 #include <pcb_draw_panel_gal.h>
+#include <jobs/job_export_pcb_gerbers.h>
+#include <jobs/job_export_pcb_drill.h>
+#include <pgm_base.h>
+#include <reporter.h>
+#include <settings/settings_manager.h>
 #include <nlohmann/json.hpp>
 #include "collab_common.h"
 #include "collab_presence_core.h"
@@ -70,13 +75,16 @@
 #include "pcbjam_libs_reload.h"
 #include <algorithm>
 #include <chrono>
+#include <cstdio>
 #include <map>
 #include <memory>
+#include <optional>
 #include <set>
 #include <string>
 #include <vector>
 #include <wx/app.h>
 #include <wx/event.h>
+#include <wx/filename.h>
 #include <wx/string.h>
 #include <wx/window.h>
 
@@ -2546,6 +2554,244 @@ bool pcbFootprintSetModels( std::string aId, std::string aModelsJson )
     return true;
 }
 
+// Circuit Center (island cc13, project.plot): the board's Gerbers and drill
+// files plotted with NO KiCad dialog. KiCad's own jobs (JOB_EXPORT_PCB_GERBERS,
+// JOB_EXPORT_PCB_DRILL) run through the pcbnew kiface's job handler
+// (KIWAY::ProcessJob, the path kicad-cli and jobsets take). In a GUI build with
+// a project open, PCBNEW_JOBS_HANDLER::getBoard answers the board the editor
+// holds, unsaved edits included; it never reads the file. Neither job reaches a
+// dialog on this path (the zone refill that asks is off: a refill is an edit,
+// so pours plot as the board last filled them; EnsurePathExists only reports).
+namespace
+{
+/** Every line a job reports, with its severity, in order (WX_STRING_REPORTER keeps the text alone). */
+class PLOT_LINES_REPORTER : public REPORTER
+{
+public:
+    using REPORTER::Report;
+
+    REPORTER& Report( const wxString& aText, SEVERITY aSeverity = RPT_SEVERITY_UNDEFINED ) override
+    {
+        REPORTER::Report( aText, aSeverity );
+        wxString text = aText;
+        text.Trim( true ).Trim( false );
+
+        if( !text.IsEmpty() )
+            m_lines.emplace_back( aSeverity, text );
+
+        return *this;
+    }
+
+    std::vector<std::pair<SEVERITY, wxString>> m_lines;
+};
+
+const char* plotSeverityWord( SEVERITY aSeverity )
+{
+    switch( aSeverity )
+    {
+    case RPT_SEVERITY_ERROR:   return "error";
+    case RPT_SEVERITY_WARNING: return "warning";
+    case RPT_SEVERITY_ACTION:  return "action";
+    default:                   return "info";
+    }
+}
+
+/**
+ * <dir>/.cc-plot.json, written LAST and whole (a part file renamed into place):
+ * {"gerbers": exit code, "drill": exit code or null, "lines": [{severity, text}]}.
+ * The host reads the folder once it is there and the apply queue is empty.
+ */
+void writePlotDone( const std::string& aDir, int aGerbers, const std::optional<int>& aDrill,
+                    const PLOT_LINES_REPORTER& aReporter )
+{
+    json lines = json::array();
+
+    for( const auto& [severity, text] : aReporter.m_lines )
+    {
+        json line = json::object();
+        line["severity"] = plotSeverityWord( severity );
+        line["text"] = std::string( text.ToUTF8() );
+        lines.push_back( std::move( line ) );
+    }
+
+    json done = json::object();
+    done["gerbers"] = aGerbers;
+    done["drill"] = aDrill ? json( *aDrill ) : json( nullptr );
+    done["lines"] = std::move( lines );
+
+    const std::string body = done.dump( -1, ' ', false, json::error_handler_t::replace );
+    const std::string part = aDir + "/.cc-plot.json.part";
+    const std::string fin = aDir + "/.cc-plot.json";
+
+    if( FILE* f = std::fopen( part.c_str(), "wb" ) )
+    {
+        std::fwrite( body.data(), 1, body.size(), f );
+        std::fclose( f );
+        std::rename( part.c_str(), fin.c_str() );
+    }
+}
+
+/** One job through the pcbnew kiface's handler; a throw is an error line and exit code -1. */
+int runPlotJob( PCB_EDIT_FRAME* aFrame, JOB* aJob, PLOT_LINES_REPORTER& aReporter, const char* aWhat )
+{
+    try
+    {
+        return aFrame->Kiway().ProcessJob( KIWAY::FACE_PCB, aJob, &aReporter );
+    }
+    catch( const std::exception& e )
+    {
+        aReporter.Report( wxString::Format( wxS( "the %s job failed: %s" ), aWhat,
+                                            wxString::FromUTF8( e.what() ) ),
+                          RPT_SEVERITY_ERROR );
+    }
+    catch( ... )
+    {
+        aReporter.Report( wxString::Format( wxS( "the %s job failed" ), aWhat ),
+                          RPT_SEVERITY_ERROR );
+    }
+
+    return -1;
+}
+
+/** The plot itself, on the apply coroutine: both jobs, then the done file. */
+void runPlot( const std::string& aDir, bool aBoardPreset, bool aDrill, bool aJobFile )
+{
+    PLOT_LINES_REPORTER reporter;
+    int                 gerbers = -1;
+    std::optional<int>  drill;
+
+    if( aDrill )
+        drill = -1;
+
+    const wxString dir = wxString::FromUTF8( aDir.c_str() );
+
+    if( !wxFileName::DirExists( dir ) )
+        wxFileName::Mkdir( dir, wxS_DIR_DEFAULT, wxPATH_MKDIR_FULL );
+
+    PCB_EDIT_FRAME* fr = pcbFrame();   // re-resolved on the coroutine (S4)
+    BOARD*          brd = fr ? fr->GetBoard() : nullptr;
+
+    if( !brd || !fr->Kiway().KiFACE( KIWAY::FACE_PCB, false ) )
+    {
+        reporter.Report( wxS( "no board editor to plot" ), RPT_SEVERITY_ERROR );
+    }
+    else if( !Pgm().IsGUI() || !Pgm().GetSettingsManager().IsProjectOpen() )
+    {
+        // getBoard would load the saved file instead of the editor's board (and keep it).
+        reporter.Report( wxS( "the job handler would not plot the editor's board" ),
+                         RPT_SEVERITY_ERROR );
+    }
+    else
+    {
+        JOB_EXPORT_PCB_GERBERS gerberJob;
+        gerberJob.SetConfiguredOutputPath( dir );
+        gerberJob.m_useBoardPlotParams = aBoardPreset;
+        gerberJob.m_createJobsFile = aJobFile;
+        gerberJob.m_checkZonesBeforePlot = false;
+        gerberJob.m_variant = wxEmptyString;
+
+        if( !aBoardPreset )
+        {
+            // A board house set (kicad-cli's defaults otherwise): every enabled copper
+            // layer, both masks, pastes and silkscreens and the outline, X2 with the
+            // netlist attributes, .gbr names, KiCad's dialog precision (4.6 in mm).
+            const LSET layers = ( brd->GetEnabledLayers() & LSET::AllCuMask() )
+                                | LSET( { F_Mask, B_Mask, F_Paste, B_Paste, F_SilkS, B_SilkS,
+                                          Edge_Cuts } );
+            gerberJob.m_plotLayerSequence = layers.SeqStackupForPlotting();
+            gerberJob.m_plotOnAllLayersSequence.clear();
+            gerberJob.m_useX2Format = true;
+            gerberJob.m_includeNetlistAttributes = true;
+            gerberJob.m_useProtelFileExtension = false;
+            gerberJob.m_precision = 6;
+            gerberJob.m_disableApertureMacros = false;
+            gerberJob.m_useDrillOrigin = false;
+        }
+
+        gerbers = runPlotJob( fr, &gerberJob, reporter, "gerbers" );
+
+        if( aDrill )
+        {
+            // Both presets (kicad-cli's pcb export drill has no board option):
+            // separate PTH and NPTH Excellon files in mm, decimal, absolute origin.
+            JOB_EXPORT_PCB_DRILL drillJob;
+            drillJob.SetConfiguredOutputPath( dir );
+            drillJob.m_format = JOB_EXPORT_PCB_DRILL::DRILL_FORMAT::EXCELLON;
+            drillJob.m_drillUnits = JOB_EXPORT_PCB_DRILL::DRILL_UNITS::MM;
+            drillJob.m_zeroFormat = JOB_EXPORT_PCB_DRILL::ZEROS_FORMAT::DECIMAL;
+            drillJob.m_drillOrigin = JOB_EXPORT_PCB_DRILL::DRILL_ORIGIN::ABS;
+            drillJob.m_excellonCombinePTHNPTH = false;
+            drillJob.m_excellonMirrorY = false;
+            drillJob.m_excellonMinimalHeader = false;
+            drillJob.m_excellonOvalDrillRoute = false;
+            drillJob.m_generateMap = false;
+            drillJob.m_generateTenting = false;
+            drillJob.m_generateReport = false;
+            drill = runPlotJob( fr, &drillJob, reporter, "drill" );
+        }
+    }
+
+    writePlotDone( aDir, gerbers, drill, reporter );
+}
+} // namespace
+
+// aArgsJson: {"dir": "/tmp/cc-plot/<n>", "preset": "fab"|"board", "drill": bool, "job": bool},
+// those four keys only. dir is a folder under /tmp/cc-plot/, outside the project folder;
+// "fab" is a board house set, "board" the board's own plot settings (kicad-cli's
+// --board-plot-params); drill adds the PTH and NPTH Excellon files, job the .gbrjob file.
+// Answers false (nothing queued) for any other JSON or with no board frame; true once the
+// plot is queued on the apply coroutine (the host waits for kicadCollabBusy to clear and
+// for <dir>/.cc-plot.json).
+bool pcbPlotBoard( std::string aArgsJson )
+{
+    PCB_EDIT_FRAME* fr = pcbFrame();
+
+    if( !fr || !fr->GetBoard() )
+        return false;
+
+    json args = json::parse( aArgsJson, nullptr, /*allow_exceptions*/ false );
+
+    if( args.is_discarded() || !args.is_object() || args.size() != 4 )
+        return false;
+
+    auto dir = args.find( "dir" );
+    auto preset = args.find( "preset" );
+    auto drill = args.find( "drill" );
+    auto job = args.find( "job" );
+
+    if( dir == args.end() || !dir->is_string() || preset == args.end() || !preset->is_string()
+            || drill == args.end() || !drill->is_boolean() || job == args.end()
+            || !job->is_boolean() )
+    {
+        return false;
+    }
+
+    static const std::string root = "/tmp/cc-plot/";
+    const std::string        d = dir->get<std::string>();
+
+    if( d.size() <= root.size() || d.compare( 0, root.size(), root ) != 0
+            || d.find( ".." ) != std::string::npos || d.back() == '/'
+            || d.find( '\0' ) != std::string::npos )
+    {
+        return false;
+    }
+
+    const std::string p = preset->get<std::string>();
+
+    if( p != "fab" && p != "board" )
+        return false;
+
+    const bool boardPreset = p == "board";
+    const bool withDrill = drill->get<bool>();
+    const bool withJob = job->get<bool>();
+
+    pcbjam_collab::runOnCoroutine( fr, [d, boardPreset, withDrill, withJob]() {
+        runPlot( d, boardPreset, withDrill, withJob );
+    } );
+
+    return true;
+}
+
 bool pcbCollabTestSetBoardItemLocked( std::string aId, bool aLocked )
 {
     PCB_EDIT_FRAME* fr = pcbFrame();
@@ -3095,6 +3341,8 @@ EMSCRIPTEN_BINDINGS(pcbnew) {
     function("kicadCollabTestDuplicateBoardItem", &pcbCollabTestDuplicateBoardItem);
     // Circuit Center (island cc12): a footprint's 3D models as one undo step (footprint.models).
     function("kicadFootprintSetModels", &pcbFootprintSetModels);
+    // Circuit Center (island cc13): the board's Gerbers and drill files, no dialog (project.plot).
+    function("kicadPlotBoard", &pcbPlotBoard);
 
 #ifndef KICAD_MERGED_EMBIND
     // JS names ALSO registered by eeschema_embind.cpp — in the merged image these are
