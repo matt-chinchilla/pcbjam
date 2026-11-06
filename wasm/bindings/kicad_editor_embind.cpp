@@ -221,6 +221,7 @@ static struct
 {
     wxFrame*              frame = nullptr;
     bool                  valid = false;
+    bool                  hidden = false;   // the chrome is held hidden on `frame` (sticky)
     bool                  menuShown = false;
     bool                  statusShown = false;
     std::vector<wxString> paneNames;
@@ -230,6 +231,184 @@ static bool chromeSkipsPane( const wxAuiPaneInfo& aPane )
 {
     // keep the central editor canvas (named "DrawFrame" in both editors)
     return aPane.dock_direction == wxAUI_DOCK_CENTER || aPane.name == wxT( "DrawFrame" );
+}
+
+// The hidden chrome is STICKY. KiCad brings its chrome back on paths nobody
+// lists one by one: a pane toggle (Ctrl+H, the properties and search panes, the
+// selection filter that rides with them), a pane's close button (which ends in
+// a menu bar rebuild: doReCreateMenuBar attaches a NEW wxMenuBar, shown), a
+// save or a load (the file history rebuilds the menu bar), a theme or settings
+// change (menu bar and toolbars rebuilt). Every one of them ends in either a
+// wxAuiManager::Update (whose Repaint fires wxEVT_AUI_RENDER) or a frame size
+// event (wxFrame::AttachMenuBar sends one), so two handlers bound on the
+// frame's manager (it is the first handler on the frame's stack) put the
+// hidden state back inside the same call, before the browser draws a frame.
+static bool chromeHeld( const wxFrame* aFrame )
+{
+    return aFrame && s_chromeSnap.hidden && s_chromeSnap.frame == aFrame;
+}
+
+// Anything of KiCad's own showing: the menu bar, the status bar, or a pane
+// other than the canvas. What the host's "Show/Hide KiCad's menus" reads.
+static bool chromeVisible( wxFrame* aFrame, wxAuiManager* aMgr )
+{
+    if( wxMenuBar* menuBar = aFrame->GetMenuBar(); menuBar && menuBar->IsShown() )
+        return true;
+
+    if( wxStatusBar* statusBar = aFrame->GetStatusBar(); statusBar && statusBar->IsShown() )
+        return true;
+
+    if( aMgr )
+    {
+        wxAuiPaneInfoArray& panes = aMgr->GetAllPanes();
+
+        for( size_t i = 0; i < panes.GetCount(); ++i )
+        {
+            if( !chromeSkipsPane( panes.Item( i ) ) && panes.Item( i ).IsShown() )
+                return true;
+        }
+    }
+
+    return false;
+}
+
+// Tells the page each time the real chrome state flips (window.kicadChrome.
+// onChange(shown)); no-op without a listener.
+static void reportChrome( wxFrame* aFrame, wxAuiManager* aMgr )
+{
+    static int s_reported = -1;
+    const int  shown = chromeVisible( aFrame, aMgr ) ? 1 : 0;
+
+    if( shown == s_reported )
+        return;
+
+    s_reported = shown;
+    EM_ASM( {
+        if( window.kicadChrome && window.kicadChrome.onChange )
+        {
+            // A throwing listener must never unwind the wasm frame that called it.
+            try { window.kicadChrome.onChange( !!$0 ); }
+            catch( e ) { console.error( '[cc chrome] onChange listener threw', e ); }
+        }
+    }, shown );
+}
+
+// Hides the bars that came back while the chrome is held hidden; answers
+// whether it hid any (the client area changed).
+static bool rehideBars( wxFrame* aFrame )
+{
+    bool hid = false;
+
+    if( wxMenuBar* menuBar = aFrame->GetMenuBar(); menuBar && menuBar->IsShown() )
+    {
+        menuBar->Show( false );
+        hid = true;
+    }
+
+    if( wxStatusBar* statusBar = aFrame->GetStatusBar(); statusBar && statusBar->IsShown() )
+    {
+        statusBar->Show( false );
+        hid = true;
+    }
+
+    return hid;
+}
+
+// Marks hidden every pane but the canvas that came back; answers whether any did.
+static bool rehidePanes( wxAuiManager* aMgr )
+{
+    bool               hid = false;
+    wxAuiPaneInfoArray& panes = aMgr->GetAllPanes();
+
+    for( size_t i = 0; i < panes.GetCount(); ++i )
+    {
+        wxAuiPaneInfo& pane = panes.Item( i );
+
+        if( !chromeSkipsPane( pane ) && pane.IsShown() )
+        {
+            pane.Show( false );
+            hid = true;
+        }
+    }
+
+    return hid;
+}
+
+// Set while the handlers below lay the frame out again, so the Update they run
+// (which renders, and may size) does not re-enter them.
+static bool s_chromeReapplying = false;
+
+// Every wxAuiManager::Update and every manager repaint ends here. A pane shown
+// while the chrome is held is hidden again and the frame laid out once more
+// without it; the stale layout is not drawn (no caption of it ever paints).
+static void onChromeRender( wxAuiManagerEvent& aEvent )
+{
+    aEvent.Skip();   // the manager's own OnRender draws, unless we lay out again
+
+    wxAuiManager* mgr = aEvent.GetManager();
+    wxFrame*      frame = mgr ? dynamic_cast<wxFrame*>( mgr->GetManagedWindow() ) : nullptr;
+
+    if( !frame || s_chromeReapplying )
+        return;
+
+    if( chromeHeld( frame ) )
+    {
+        const bool bars = rehideBars( frame );
+        const bool panes = rehidePanes( mgr );
+
+        if( bars || panes )
+        {
+            aEvent.Skip( false );
+            s_chromeReapplying = true;
+            mgr->Update();
+
+            if( bars )
+                frame->SendSizeEvent();
+
+            s_chromeReapplying = false;
+        }
+    }
+
+    reportChrome( frame, mgr );
+}
+
+// A frame size event (wxFrame::AttachMenuBar sends one for a rebuilt menu bar)
+// reaches the manager before its own OnSize lays the frame out: a bar that came
+// back is hidden first, so that layout already has the whole client area.
+static void onChromeSize( wxSizeEvent& aEvent )
+{
+    aEvent.Skip();
+
+    wxFrame*      frame = dynamic_cast<wxFrame*>( aEvent.GetEventObject() );
+    wxAuiManager* mgr = frame ? wxAuiManager::GetManager( frame ) : nullptr;
+
+    if( !frame || s_chromeReapplying )
+        return;
+
+    if( chromeHeld( frame ) )
+        rehideBars( frame );
+
+    reportChrome( frame, mgr );
+}
+
+// Binds the two handlers on the frame's manager once (an Unbind first makes a
+// repeated call harmless).
+static void holdChrome( wxAuiManager* aMgr )
+{
+    aMgr->Unbind( wxEVT_AUI_RENDER, &onChromeRender );
+    aMgr->Bind( wxEVT_AUI_RENDER, &onChromeRender );
+    aMgr->Unbind( wxEVT_SIZE, &onChromeSize );
+    aMgr->Bind( wxEVT_SIZE, &onChromeSize );
+}
+
+// What the page's state line reads after a boot: true while anything of
+// KiCad's own chrome shows on the top frame (false with no frame yet).
+static bool kicadChromeShown()
+{
+    wxFrame* frame =
+            wxTheApp ? dynamic_cast<wxFrame*>( wxTheApp->GetTopWindow() ) : nullptr;
+
+    return frame && chromeVisible( frame, wxAuiManager::GetManager( frame ) );
 }
 
 static bool kicadSetChrome( bool aShow )
@@ -243,6 +422,13 @@ static bool kicadSetChrome( bool aShow )
     wxMenuBar*    menuBar = frame->GetMenuBar();
     wxStatusBar*  statusBar = frame->GetStatusBar();
     wxAuiManager* mgr = wxAuiManager::GetManager( frame );
+
+    // The hold flag first: the Update below renders, and the render handler
+    // must already know whether to put the hidden state back.
+    s_chromeSnap.hidden = !aShow;
+
+    if( mgr )
+        holdChrome( mgr );
 
     if( !aShow )
     {
@@ -323,6 +509,7 @@ static bool kicadSetChrome( bool aShow )
         s_chromeSnap.valid = false;
 
     frame->SendSizeEvent();
+    reportChrome( frame, mgr );
     return true;
 }
 
@@ -657,6 +844,8 @@ EMSCRIPTEN_BINDINGS(kicad_editor) {
 
     // Canvas-only mobile mode (features/mobile).
     function("kicadSetChrome", &kicadSetChrome);
+    // The real chrome state (menu bar, status bar or a pane showing).
+    function("kicadChromeShown", &kicadChromeShown);
 
     // Read-only viewer lock (read-only-viewer).
     function("kicadSetReadOnly", &kicadSetReadOnly);
