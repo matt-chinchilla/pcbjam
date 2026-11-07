@@ -7,6 +7,8 @@
 
 // Modified by Chirichella Inc. on 2026-10-15: kicadImportSchematic, importing a non-KiCad
 // schematic or an Altium project through SCH_EDIT_FRAME's own import path.
+// Modified by Chirichella Inc. on 2026-11-07: kicadSymbolGet, kicadSymbolSet, kicadAnnotate
+// and kicadCheckSheet, the Editing window's symbol properties, numbering and check.
 
 #ifdef __EMSCRIPTEN__
 #include <emscripten.h>
@@ -72,6 +74,20 @@
 #include "pcbjam_libs_reload.h"
 #include "pcbjam_async_policy.h"
 #include <algorithm>
+#include <cmath>
+#include <cstdio>
+#include <optional>
+#include <base_units.h>
+#include <eeschema_settings.h>
+#include <lib_id.h>
+#include <reporter.h>
+#include <sch_marker.h>
+#include <sch_reference_list.h>
+#include <sch_view.h>
+#include <erc/erc.h>
+#include <erc/erc_item.h>
+#include <erc/erc_report.h>
+#include <erc/erc_settings.h>
 
 using namespace emscripten;
 using json = nlohmann::json;
@@ -2662,6 +2678,1441 @@ std::string schPlaceImportedItem( std::string aSexpr )
     return out.dump();
 }
 
+// Modified by Chirichella Inc. on 2026-11-07: the Editing window's four exports (island
+// cc15: symbol.get, symbol.set, sheet.annotate, sheet.check). One symbol's properties read
+// and written by uuid, the parts numbered and the sheet checked, all through KiCad's own
+// classes (SCH_COMMIT, AnnotateSymbols and its reference lists, ERC_TESTER and ERC_REPORT),
+// with no KiCad dialog on any road. Each takes closed JSON args; a false answer queues
+// nothing. Registered outside the KICAD_MERGED_EMBIND guard: the names are eeschema-only.
+namespace
+{
+/** A lowercase 8-4-4-4-12 uuid (KIID's string constructor takes any text, so this gate comes first). */
+bool isLowerUuid( const std::string& aText )
+{
+    if( aText.size() != 36 )
+        return false;
+
+    for( size_t i = 0; i < aText.size(); ++i )
+    {
+        const char c = aText[i];
+
+        if( i == 8 || i == 13 || i == 18 || i == 23 )
+        {
+            if( c != '-' )
+                return false;
+        }
+        else if( !( ( c >= '0' && c <= '9' ) || ( c >= 'a' && c <= 'f' ) ) )
+        {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+bool hasControlChar( const wxString& aText )
+{
+    for( wxUniChar c : aText )
+    {
+        if( c < 0x20 || c == 0x7f )
+            return true;
+    }
+
+    return false;
+}
+
+/**
+ * A JSON string as UTF-8 text of aMin to aMax characters (code points), or nothing.
+ * Invalid UTF-8 is refused (wxString::FromUTF8 answers empty for it).
+ */
+std::optional<wxString> boundedText( const json& aValue, size_t aMin, size_t aMax )
+{
+    if( !aValue.is_string() )
+        return std::nullopt;
+
+    const std::string& raw = aValue.get_ref<const std::string&>();
+
+    if( raw.find( '\0' ) != std::string::npos )
+        return std::nullopt;
+
+    wxString text = wxString::FromUTF8( raw.c_str(), raw.size() );
+
+    if( !raw.empty() && text.IsEmpty() )
+        return std::nullopt;
+
+    if( text.length() < aMin || text.length() > aMax )
+        return std::nullopt;
+
+    return text;
+}
+
+/** A folder under aRoot (the plot export's rule): no "..", no trailing slash, nothing else. */
+bool isRunDir( const std::string& aDir, const std::string& aRoot )
+{
+    return aDir.size() > aRoot.size() && aDir.compare( 0, aRoot.size(), aRoot ) == 0
+           && aDir.find( ".." ) == std::string::npos && aDir.back() != '/'
+           && aDir.find( '\0' ) == std::string::npos;
+}
+
+/** "lib:name", both halves present, as LIB_ID reads it; or empty. */
+bool isFootprintId( const wxString& aText )
+{
+    if( aText.IsEmpty() )
+        return true;
+
+    if( hasControlChar( aText ) )
+        return false;
+
+    LIB_ID id;
+
+    return id.Parse( UTF8( aText ) ) == -1 && !id.GetLibNickname().empty()
+           && !id.GetLibItemName().empty();
+}
+
+struct SYMBOL_HIT
+{
+    SCH_SYMBOL*    symbol = nullptr;
+    SCH_SHEET_PATH path;
+};
+
+/**
+ * The symbol whose uuid is aUuid, on aSheetPath when that path holds it, else (aStrict
+ * false, or aSheetPath empty) on the sheet the editor shows, else on the first path of the
+ * hierarchy holding it. A reused sheet shares one SCH_SYMBOL between its paths; the path
+ * picks the instance (its reference, unit and flags).
+ */
+SYMBOL_HIT resolveSymbol( SCH_EDIT_FRAME* aFrame, const std::string& aUuid,
+                          const std::string& aSheetPath, bool aStrict )
+{
+    SYMBOL_HIT hit;
+
+    if( !aFrame || !isLowerUuid( aUuid ) )
+        return hit;
+
+    const KIID                  id( wxString::FromUTF8( aUuid.c_str() ) );
+    std::vector<SCH_SHEET_PATH> holding;
+    SCH_SYMBOL*                 symbol = nullptr;
+
+    for( const SCH_SHEET_PATH& path : aFrame->Schematic().Hierarchy() )
+    {
+        SCH_SCREEN* screen = path.LastScreen();
+
+        if( !screen )
+            continue;
+
+        for( SCH_ITEM* item : screen->Items().OfType( SCH_SYMBOL_T ) )
+        {
+            if( item->m_Uuid == id )
+            {
+                symbol = static_cast<SCH_SYMBOL*>( item );
+                holding.push_back( path );
+                break;
+            }
+        }
+    }
+
+    if( !symbol )
+        return hit;
+
+    if( !aSheetPath.empty() )
+    {
+        const wxString wanted = wxString::FromUTF8( aSheetPath.c_str() );
+
+        for( const SCH_SHEET_PATH& path : holding )
+        {
+            if( path.PathAsString().CmpNoCase( wanted ) == 0 )
+            {
+                hit.symbol = symbol;
+                hit.path = path;
+                return hit;
+            }
+        }
+
+        if( aStrict )
+            return hit;
+    }
+
+    const SCH_SHEET_PATH& shown = aFrame->GetCurrentSheet();
+
+    for( const SCH_SHEET_PATH& path : holding )
+    {
+        if( path == shown )
+        {
+            hit.symbol = symbol;
+            hit.path = path;
+            return hit;
+        }
+    }
+
+    hit.symbol = symbol;
+    hit.path = holding.front();
+    return hit;
+}
+
+/** The sheet's name as the editor shows it; the root carries none, so its file's name (sheetsStateJson's rule). */
+wxString sheetNameOf( const SCH_SHEET_PATH& aPath )
+{
+    SCH_SHEET*  sheet = aPath.Last();
+    SCH_SCREEN* screen = aPath.LastScreen();
+    wxString    name = sheet ? sheet->GetName() : wxString();
+
+    if( name.IsEmpty() && screen )
+        name = wxFileName( screen->GetFileName() ).GetName();
+
+    return name;
+}
+
+const char* fieldKind( const SCH_FIELD& aField )
+{
+    switch( aField.GetId() )
+    {
+    case FIELD_T::REFERENCE:   return "reference";
+    case FIELD_T::VALUE:       return "value";
+    case FIELD_T::FOOTPRINT:   return "footprint";
+    case FIELD_T::DATASHEET:   return "datasheet";
+    case FIELD_T::DESCRIPTION: return "description";
+    default:                   return "user";
+    }
+}
+
+/** The symbol's field named aName (KiCad's canonical name: Reference, Value, ... or the user field's own). */
+SCH_FIELD* fieldNamed( SCH_SYMBOL* aSymbol, const wxString& aName )
+{
+    for( SCH_FIELD& field : aSymbol->GetFields() )
+    {
+        if( field.GetCanonicalName() == aName )
+            return &field;
+    }
+
+    return nullptr;
+}
+
+/** Is aName taken on this symbol in any casing (a mandatory field's name included)? */
+bool fieldNameTaken( SCH_SYMBOL* aSymbol, const wxString& aName )
+{
+    for( const SCH_FIELD& field : aSymbol->GetFields() )
+    {
+        if( field.GetCanonicalName().CmpNoCase( aName ) == 0 || field.GetName().CmpNoCase( aName ) == 0 )
+            return true;
+    }
+
+    static const char* const mandatory[] = { "Reference", "Value", "Footprint", "Datasheet",
+                                             "Description" };
+
+    for( const char* name : mandatory )
+    {
+        if( aName.CmpNoCase( wxString::FromUTF8( name ) ) == 0 )
+            return true;
+    }
+
+    return false;
+}
+
+/** 0, 90, 180 or 270 and the mirror, as KiCad's own GetOrientation decomposes the transform. */
+void decomposeOrientation( const SCH_SYMBOL* aSymbol, int& aDegrees, char& aMirror )
+{
+    const int orientation = aSymbol->GetOrientation();
+    const int mirror = orientation & ( SYM_MIRROR_X | SYM_MIRROR_Y );
+
+    switch( orientation & ~( SYM_MIRROR_X | SYM_MIRROR_Y ) )
+    {
+    case SYM_ORIENT_90:  aDegrees = 90;  break;
+    case SYM_ORIENT_180: aDegrees = 180; break;
+    case SYM_ORIENT_270: aDegrees = 270; break;
+    default:             aDegrees = 0;   break;
+    }
+
+    aMirror = ( mirror & SYM_MIRROR_X ) ? 'x' : ( ( mirror & SYM_MIRROR_Y ) ? 'y' : 'n' );
+}
+
+int orientationConstant( int aDegrees, char aMirror )
+{
+    int orientation = SYM_ORIENT_0;
+
+    switch( aDegrees )
+    {
+    case 90:  orientation = SYM_ORIENT_90;  break;
+    case 180: orientation = SYM_ORIENT_180; break;
+    case 270: orientation = SYM_ORIENT_270; break;
+    default:  break;
+    }
+
+    if( aMirror == 'x' )
+        orientation += SYM_MIRROR_X;
+    else if( aMirror == 'y' )
+        orientation += SYM_MIRROR_Y;
+
+    return orientation;
+}
+
+/** 1 for a single drawing, 2 for a symbol with exactly one alternate drawing (KiCad's De Morgan pair). */
+int bodyStylesOf( const SCH_SYMBOL* aSymbol )
+{
+    return aSymbol->GetBodyStyleCount() == 2 ? 2 : 1;
+}
+
+int unitsOf( const SCH_SYMBOL* aSymbol )
+{
+    return std::max( 1, aSymbol->GetUnitCount() );
+}
+
+double roundMm( int aIu )
+{
+    return std::round( schIUScale.IUTomm( aIu ) * 10000.0 ) / 10000.0;
+}
+
+/** The island's SymbolSheet (spec 6.2) for one instance. */
+json symbolSheetJson( SCH_EDIT_FRAME* aFrame, SCH_SYMBOL* aSymbol, const SCH_SHEET_PATH& aPath )
+{
+    SCHEMATIC& sch = aFrame->Schematic();
+
+    std::vector<SCH_FIELD*> ordered;
+    aSymbol->GetFields( ordered, /*aVisibleOnly*/ false );
+
+    json fields = json::array();
+
+    for( SCH_FIELD* field : ordered )
+    {
+        wxString value;
+
+        switch( field->GetId() )
+        {
+        case FIELD_T::REFERENCE:
+            value = aSymbol->GetRef( &aPath, false );
+            break;
+
+        case FIELD_T::VALUE:
+            value = aSymbol->GetValue( false, &aPath, false, wxEmptyString );
+            break;
+
+        case FIELD_T::FOOTPRINT:
+            value = aSymbol->GetFootprintFieldText( false, &aPath, false, wxEmptyString );
+            break;
+
+        default:
+            value = sch.ConvertKIIDsToRefs( field->GetText() );
+            break;
+        }
+
+        json f = json::object();
+        f["name"] = toUtf8( field->GetCanonicalName() );
+        f["value"] = toUtf8( value );
+        f["shown"] = field->IsVisible();
+        f["kind"] = fieldKind( *field );
+        fields.push_back( std::move( f ) );
+    }
+
+    int  degrees = 0;
+    char mirror = 'n';
+    decomposeOrientation( aSymbol, degrees, mirror );
+
+    const int      bodyStyles = bodyStylesOf( aSymbol );
+    const VECTOR2I pos = aSymbol->GetPosition();
+
+    json out = json::object();
+    out["uuid"] = toUtf8( aSymbol->m_Uuid.AsString() );
+    out["sheetPath"] = toUtf8( aPath.PathAsString() );
+    out["sheetName"] = toUtf8( sheetNameOf( aPath ) );
+    out["ref"] = toUtf8( aSymbol->GetRef( &aPath, false ) );
+    out["value"] = toUtf8( aSymbol->GetValue( false, &aPath, false, wxEmptyString ) );
+    out["footprint"] = toUtf8( aSymbol->GetFootprintFieldText( false, &aPath, false, wxEmptyString ) );
+    out["libId"] = std::string( aSymbol->GetLibId().Format().c_str() );
+    out["fields"] = std::move( fields );
+    out["inBom"] = !aSymbol->GetExcludedFromBOM( &aPath, wxEmptyString );
+    out["onBoard"] = !aSymbol->GetExcludedFromBoard( &aPath, wxEmptyString );
+    out["inSim"] = !aSymbol->GetExcludedFromSim( &aPath, wxEmptyString );
+    out["dnp"] = aSymbol->GetDNP( &aPath, wxEmptyString );
+    out["rotation"] = degrees;
+    out["mirror"] = mirror == 'x' ? "x" : ( mirror == 'y' ? "y" : "none" );
+    out["x"] = roundMm( pos.x );
+    out["y"] = roundMm( pos.y );
+    out["unit"] = std::max( 1, aSymbol->GetUnitSelection( &aPath ) );
+    out["units"] = unitsOf( aSymbol );
+    out["bodyStyle"] = bodyStyles == 2 ? std::clamp( aSymbol->GetBodyStyle(), 1, 2 ) : 1;
+    out["bodyStyles"] = bodyStyles;
+
+    // The footprint filters of the symbol's own definition (the copy the schematic holds,
+    // so no library is read): KiCad's chooser ranks footprints matching these first.
+    json filters = json::array();
+
+    if( const std::unique_ptr<LIB_SYMBOL>& lib = aSymbol->GetLibSymbolRef() )
+    {
+        for( const wxString& filter : lib->GetFPFilters() )
+            filters.push_back( toUtf8( filter ) );
+    }
+
+    out["filters"] = std::move( filters );
+    return out;
+}
+
+struct FIELD_EDIT
+{
+    wxString                name;
+    std::optional<wxString> value;
+    std::optional<bool>     shown;
+};
+
+/** One symbol.set, read and checked whole before anything is queued. */
+struct SYMBOL_SET
+{
+    std::optional<wxString>   ref;
+    std::optional<wxString>   value;
+    std::optional<wxString>   footprint;
+    std::vector<FIELD_EDIT>   fields;
+    std::optional<FIELD_EDIT> addField;
+    std::optional<wxString>   removeField;
+    std::optional<bool>       inBom, onBoard, inSim, dnp;
+    std::optional<int>        rotation;
+    std::optional<char>       mirror;
+    std::optional<double>     x, y;
+    std::optional<int>        unit;
+    std::optional<int>        bodyStyle;
+};
+
+constexpr size_t FIELD_TEXT_MAX = 1024;
+constexpr double POSITION_MAX_MM = 50000.0;
+
+/**
+ * Reads aSet against aSymbol (whose fields, units and drawings bound what may be asked).
+ * Answers false for any key, type or bound outside spec 11.2.
+ */
+bool readSymbolSet( const json& aSet, SCH_SYMBOL* aSymbol, SYMBOL_SET& aOut )
+{
+    if( !aSet.is_object() || aSet.empty() )
+        return false;
+
+    std::set<wxString> named;   // field names a fields[] entry or removeField touches
+
+    for( const auto& [key, value] : aSet.items() )
+    {
+        if( key == "ref" )
+        {
+            aOut.ref = boundedText( value, 1, 64 );
+
+            if( !aOut.ref || hasControlChar( *aOut.ref ) )
+                return false;
+        }
+        else if( key == "value" )
+        {
+            if( !( aOut.value = boundedText( value, 0, FIELD_TEXT_MAX ) ) )
+                return false;
+        }
+        else if( key == "footprint" )
+        {
+            aOut.footprint = boundedText( value, 0, FIELD_TEXT_MAX );
+
+            if( !aOut.footprint || !isFootprintId( *aOut.footprint ) )
+                return false;
+        }
+        else if( key == "fields" )
+        {
+            if( !value.is_array() || value.empty() || value.size() > 64 )
+                return false;
+
+            for( const json& entry : value )
+            {
+                if( !entry.is_object() || !entry.contains( "name" ) || entry.size() < 2 )
+                    return false;
+
+                FIELD_EDIT edit;
+
+                for( const auto& [k, v] : entry.items() )
+                {
+                    if( k == "name" )
+                    {
+                        std::optional<wxString> name = boundedText( v, 1, 128 );
+
+                        if( !name )
+                            return false;
+
+                        edit.name = *name;
+                    }
+                    else if( k == "value" )
+                    {
+                        if( !( edit.value = boundedText( v, 0, FIELD_TEXT_MAX ) ) )
+                            return false;
+                    }
+                    else if( k == "shown" )
+                    {
+                        if( !v.is_boolean() )
+                            return false;
+
+                        edit.shown = v.get<bool>();
+                    }
+                    else
+                    {
+                        return false;
+                    }
+                }
+
+                SCH_FIELD* field = fieldNamed( aSymbol, edit.name );
+
+                if( !field || !named.insert( edit.name ).second )
+                    return false;
+
+                if( edit.value )
+                {
+                    if( field->GetId() == FIELD_T::REFERENCE
+                            && ( edit.value->IsEmpty() || edit.value->length() > 64
+                                 || hasControlChar( *edit.value ) ) )
+                    {
+                        return false;
+                    }
+
+                    if( field->GetId() == FIELD_T::FOOTPRINT && !isFootprintId( *edit.value ) )
+                        return false;
+                }
+
+                aOut.fields.push_back( std::move( edit ) );
+            }
+        }
+        else if( key == "addField" )
+        {
+            if( !value.is_object() || value.size() != 3 || !value.contains( "name" )
+                    || !value.contains( "value" ) || !value.contains( "shown" )
+                    || !value["shown"].is_boolean() )
+            {
+                return false;
+            }
+
+            std::optional<wxString> name = boundedText( value["name"], 1, 128 );
+            std::optional<wxString> text = boundedText( value["value"], 0, FIELD_TEXT_MAX );
+
+            if( !name || !text || hasControlChar( *name ) || fieldNameTaken( aSymbol, *name ) )
+                return false;
+
+            aOut.addField = FIELD_EDIT{ *name, *text, value["shown"].get<bool>() };
+        }
+        else if( key == "removeField" )
+        {
+            std::optional<wxString> name = boundedText( value, 1, 128 );
+
+            if( !name )
+                return false;
+
+            SCH_FIELD* field = fieldNamed( aSymbol, *name );
+
+            if( !field || field->IsMandatory() )
+                return false;
+
+            aOut.removeField = *name;
+        }
+        else if( key == "inBom" || key == "onBoard" || key == "inSim" || key == "dnp" )
+        {
+            if( !value.is_boolean() )
+                return false;
+
+            const bool on = value.get<bool>();
+
+            if( key == "inBom" )
+                aOut.inBom = on;
+            else if( key == "onBoard" )
+                aOut.onBoard = on;
+            else if( key == "inSim" )
+                aOut.inSim = on;
+            else
+                aOut.dnp = on;
+        }
+        else if( key == "rotation" )
+        {
+            if( !value.is_number_integer() )
+                return false;
+
+            const long long degrees = value.get<long long>();
+
+            if( degrees != 0 && degrees != 90 && degrees != 180 && degrees != 270 )
+                return false;
+
+            aOut.rotation = static_cast<int>( degrees );
+        }
+        else if( key == "mirror" )
+        {
+            if( !value.is_string() )
+                return false;
+
+            const std::string& m = value.get_ref<const std::string&>();
+
+            if( m == "none" )
+                aOut.mirror = 'n';
+            else if( m == "x" )
+                aOut.mirror = 'x';
+            else if( m == "y" )
+                aOut.mirror = 'y';
+            else
+                return false;
+        }
+        else if( key == "x" || key == "y" )
+        {
+            if( !value.is_number() )
+                return false;
+
+            const double mm = value.get<double>();
+
+            if( !std::isfinite( mm ) || std::fabs( mm ) > POSITION_MAX_MM )
+                return false;
+
+            ( key == "x" ? aOut.x : aOut.y ) = mm;
+        }
+        else if( key == "unit" )
+        {
+            if( !value.is_number_integer() )
+                return false;
+
+            const long long unit = value.get<long long>();
+
+            if( unit < 1 || unit > unitsOf( aSymbol ) )
+                return false;
+
+            aOut.unit = static_cast<int>( unit );
+        }
+        else if( key == "bodyStyle" )
+        {
+            if( !value.is_number_integer() )
+                return false;
+
+            const long long style = value.get<long long>();
+
+            if( style < 1 || style > bodyStylesOf( aSymbol ) )
+                return false;
+
+            aOut.bodyStyle = static_cast<int>( style );
+        }
+        else
+        {
+            return false;
+        }
+    }
+
+    // One change per thing: a field named twice (by its own key and in fields[], or kept
+    // and removed, or removed and added again) is ambiguous and refused.
+    if( aOut.ref && named.count( wxS( "Reference" ) ) )
+        return false;
+
+    if( aOut.value && named.count( wxS( "Value" ) ) )
+        return false;
+
+    if( aOut.footprint && named.count( wxS( "Footprint" ) ) )
+        return false;
+
+    if( aOut.removeField && named.count( *aOut.removeField ) )
+        return false;
+
+    if( aOut.removeField && aOut.addField && aOut.removeField->CmpNoCase( aOut.addField->name ) == 0 )
+        return false;
+
+    return true;
+}
+
+/** Applies a read set on the apply coroutine, as ONE commit (one undo step). */
+void applySymbolSet( SCH_EDIT_FRAME* aFrame, SCH_SYMBOL* aSymbol, const SCH_SHEET_PATH& aPath,
+                     const SYMBOL_SET& aSet )
+{
+    SCHEMATIC&  sch = aFrame->Schematic();
+    SCH_SCREEN* screen = aPath.LastScreen();
+    SCH_COMMIT  commit( aFrame );
+
+    commit.Modify( aSymbol, screen );
+
+    bool shared = false;     // a change the other units of a multi-unit part must share
+    bool reshaped = false;   // orientation, unit or drawing: the fields may need placing again
+
+    auto setFieldValue =
+            [&]( SCH_FIELD* aField, const wxString& aText )
+            {
+                switch( aField->GetId() )
+                {
+                case FIELD_T::REFERENCE:
+                    aSymbol->SetRef( &aPath, aText );
+                    break;
+
+                case FIELD_T::VALUE:
+                    aSymbol->SetValueFieldText( aText, &aPath, wxEmptyString );
+                    shared = true;
+                    break;
+
+                case FIELD_T::FOOTPRINT:
+                    aSymbol->SetFootprintFieldText( aText );
+                    shared = true;
+                    break;
+
+                default:
+                    aField->SetText( sch.ConvertRefsToKIIDs( aText ) );
+                    shared = true;
+                    break;
+                }
+            };
+
+    if( aSet.ref )
+        aSymbol->SetRef( &aPath, *aSet.ref );
+
+    if( aSet.value )
+        setFieldValue( aSymbol->GetField( FIELD_T::VALUE ), *aSet.value );
+
+    if( aSet.footprint )
+        setFieldValue( aSymbol->GetField( FIELD_T::FOOTPRINT ), *aSet.footprint );
+
+    for( const FIELD_EDIT& edit : aSet.fields )
+    {
+        SCH_FIELD* field = fieldNamed( aSymbol, edit.name );
+
+        if( !field )
+            continue;
+
+        if( edit.value )
+            setFieldValue( field, *edit.value );
+
+        if( edit.shown )
+        {
+            field->SetVisible( *edit.shown );
+            shared = shared || field->GetId() != FIELD_T::REFERENCE;
+        }
+    }
+
+    if( aSet.removeField )
+    {
+        aSymbol->RemoveField( *aSet.removeField );
+        shared = true;
+    }
+
+    if( aSet.addField && !fieldNameTaken( aSymbol, aSet.addField->name ) )
+    {
+        // As the symbol properties dialog adds a row: at the symbol's anchor, the
+        // reference's angle, the schematic's default text size, the next user ordinal.
+        SCH_FIELD    added( aSymbol, FIELD_T::USER, aSet.addField->name );
+        const int    size = sch.Settings().m_DefaultTextSize;
+        const SCH_FIELD* reference = aSymbol->GetField( FIELD_T::REFERENCE );
+
+        added.SetText( sch.ConvertRefsToKIIDs( *aSet.addField->value ) );
+        added.SetVisible( *aSet.addField->shown );
+        added.SetTextSize( VECTOR2I( size, size ) );
+
+        if( reference )
+            added.SetTextAngle( reference->GetTextAngle() );
+
+        added.SetPosition( aSymbol->GetPosition() );
+        added.SetOrdinal( aSymbol->GetNextFieldOrdinal() );
+
+        if( SCH_FIELD* placed = aSymbol->AddField( added ) )
+            placed->SetParent( aSymbol );
+
+        shared = true;
+    }
+
+    if( aSet.inBom )
+    {
+        aSymbol->SetExcludedFromBOM( !*aSet.inBom, &aPath, wxEmptyString );
+        shared = true;
+    }
+
+    if( aSet.onBoard )
+    {
+        aSymbol->SetExcludedFromBoard( !*aSet.onBoard, &aPath, wxEmptyString );
+        shared = true;
+    }
+
+    if( aSet.inSim )
+    {
+        aSymbol->SetExcludedFromSim( !*aSet.inSim, &aPath, wxEmptyString );
+        shared = true;
+    }
+
+    if( aSet.dnp )
+    {
+        aSymbol->SetDNP( *aSet.dnp, &aPath, wxEmptyString );
+        shared = true;
+    }
+
+    if( aSet.unit )
+    {
+        aSymbol->SetUnitSelection( &aPath, *aSet.unit );
+        aSymbol->SetUnit( *aSet.unit );
+        reshaped = true;
+    }
+
+    if( aSet.bodyStyle )
+    {
+        aSymbol->SetBodyStyle( *aSet.bodyStyle );
+        reshaped = true;
+    }
+
+    if( aSet.rotation || aSet.mirror )
+    {
+        // The properties dialog's way: the absolute rotation, then the mirror, from one
+        // constant; the half not asked for keeps its current reading.
+        int  degrees = 0;
+        char mirror = 'n';
+        decomposeOrientation( aSymbol, degrees, mirror );
+
+        aSymbol->SetOrientation( orientationConstant( aSet.rotation.value_or( degrees ),
+                                                      aSet.mirror.value_or( mirror ) ) );
+        reshaped = true;
+    }
+
+    if( aSet.x || aSet.y )
+    {
+        VECTOR2I pos = aSymbol->GetPosition();
+
+        if( aSet.x )
+            pos.x = KiROUND( schIUScale.mmToIU( *aSet.x ) );
+
+        if( aSet.y )
+            pos.y = KiROUND( schIUScale.mmToIU( *aSet.y ) );
+
+        aSymbol->SetPosition( pos );   // moves the fields with the body
+    }
+
+    // The edit tool places the fields again after the dialog when autoplacement is on;
+    // here inside the same commit, so the one undo step takes it back too.
+    if( reshaped && aFrame->eeconfig() && aFrame->eeconfig()->m_AutoplaceFields.enable )
+    {
+        AUTOPLACE_ALGO placed = aSymbol->GetFieldsAutoplaced();
+
+        if( placed == AUTOPLACE_AUTO || placed == AUTOPLACE_MANUAL )
+            aSymbol->AutoplaceFields( screen, placed );
+    }
+
+    // The dialog keeps the fields (all but the reference), the flags and the alternate
+    // pins of every unit of a multi-unit part in step; same commit.
+    if( shared && aSymbol->IsMultiUnit() )
+        aSymbol->SyncOtherUnits( aPath, commit, nullptr, wxEmptyString );
+
+    commit.Push( wxT( "Edit symbol" ) );
+}
+
+/** Every line a run reports, with its severity, in order. */
+class RUN_LINES_REPORTER : public REPORTER
+{
+public:
+    using REPORTER::Report;
+
+    REPORTER& Report( const wxString& aText, SEVERITY aSeverity = RPT_SEVERITY_UNDEFINED ) override
+    {
+        REPORTER::Report( aText, aSeverity );
+        wxString text = aText;
+        text.Trim( true ).Trim( false );
+
+        if( !text.IsEmpty() )
+            m_lines.emplace_back( aSeverity, text );
+
+        return *this;
+    }
+
+    json Lines() const
+    {
+        json lines = json::array();
+
+        for( const auto& [severity, text] : m_lines )
+        {
+            json line = json::object();
+
+            switch( severity )
+            {
+            case RPT_SEVERITY_ERROR:   line["severity"] = "error";   break;
+            case RPT_SEVERITY_WARNING: line["severity"] = "warning"; break;
+            case RPT_SEVERITY_ACTION:  line["severity"] = "action";  break;
+            default:                   line["severity"] = "info";    break;
+            }
+
+            line["text"] = toUtf8( text );
+            lines.push_back( std::move( line ) );
+        }
+
+        return lines;
+    }
+
+    std::vector<std::pair<SEVERITY, wxString>> m_lines;
+};
+
+/** <dir>/<name>, written LAST and whole (a part file renamed into place), as the plot's done file. */
+void writeRunDone( const std::string& aDir, const char* aName, const json& aBody )
+{
+    const std::string body = aBody.dump( -1, ' ', false, json::error_handler_t::replace );
+    const std::string fin = aDir + "/" + aName;
+    const std::string part = fin + ".part";
+
+    if( FILE* f = std::fopen( part.c_str(), "wb" ) )
+    {
+        std::fwrite( body.data(), 1, body.size(), f );
+        std::fclose( f );
+        std::rename( part.c_str(), fin.c_str() );
+    }
+}
+
+void ensureRunDir( const std::string& aDir )
+{
+    const wxString dir = wxString::FromUTF8( aDir.c_str() );
+
+    if( !wxFileName::DirExists( dir ) )
+        wxFileName::Mkdir( dir, wxS_DIR_DEFAULT, wxPATH_MKDIR_FULL );
+}
+
+struct INSTANCE_REF
+{
+    std::string uuid;
+    std::string sheetPath;
+    wxString    ref;
+    bool        power = false;
+};
+
+/** Every symbol instance's designator, keyed by sheet path then uuid. */
+std::map<std::string, INSTANCE_REF> instanceRefs( SCH_EDIT_FRAME* aFrame )
+{
+    std::map<std::string, INSTANCE_REF> refs;
+
+    for( const SCH_SHEET_PATH& path : aFrame->Schematic().Hierarchy() )
+    {
+        SCH_SCREEN* screen = path.LastScreen();
+
+        if( !screen )
+            continue;
+
+        const std::string sheetPath = toUtf8( path.PathAsString() );
+
+        for( SCH_ITEM* item : screen->Items().OfType( SCH_SYMBOL_T ) )
+        {
+            SCH_SYMBOL*  symbol = static_cast<SCH_SYMBOL*>( item );
+            INSTANCE_REF entry;
+            entry.uuid = toUtf8( symbol->m_Uuid.AsString() );
+            entry.sheetPath = sheetPath;
+            entry.ref = symbol->GetRef( &path, false );
+            entry.power = symbol->IsPower();
+            refs[sheetPath + entry.uuid] = std::move( entry );
+        }
+    }
+
+    return refs;
+}
+
+/**
+ * AnnotateSymbols' own steps (annotate.cpp) with the kept designators taken out of the
+ * numbering and handed to it as additional references, so they stay and stay taken.
+ * KiCad's ANNOTATE_SELECTION cannot carry this: it reads the selection on the CURRENT
+ * sheet path only (AppendSymbol on GetCurrentSheet), so it never reaches a part on
+ * another sheet of the design. A kept uuid keeps its DESIGNATOR: every unit (and every
+ * instance) sharing it is kept with it.
+ */
+void annotateKeeping( SCH_EDIT_FRAME* aFrame, SCH_COMMIT* aCommit, bool aWholeDesign,
+                      ANNOTATE_ORDER_T aOrder, bool aReset, const std::set<std::string>& aKeep,
+                      REPORTER& aReporter )
+{
+    SCHEMATIC&     sch = aFrame->Schematic();
+    SCH_SCREENS    screens( sch.Root() );
+    SCH_SHEET_LIST sheets = sch.Hierarchy();
+    SCH_SHEET_PATH currentSheet = aFrame->GetCurrentSheet();
+
+    std::set<wxString> keptRefs;
+
+    for( const SCH_SHEET_PATH& path : sheets )
+    {
+        for( SCH_ITEM* item : path.LastScreen()->Items().OfType( SCH_SYMBOL_T ) )
+        {
+            SCH_SYMBOL* symbol = static_cast<SCH_SYMBOL*>( item );
+
+            if( aKeep.count( toUtf8( symbol->m_Uuid.AsString() ) ) && symbol->IsAnnotated( &path ) )
+                keptRefs.insert( symbol->GetRef( &path, false ) );
+        }
+    }
+
+    auto isKept =
+            [&]( SCH_REFERENCE& aRef )
+            {
+                return keptRefs.count( aRef.GetSymbol()->GetRef( &aRef.GetSheetPath(), false ) ) > 0;
+            };
+
+    if( int count = screens.ReplaceDuplicateTimeStamps() )
+    {
+        aReporter.ReportTail( wxString::Format( wxS( "%d duplicate time stamps were found and replaced." ),
+                                                count ),
+                              RPT_SEVERITY_WARNING );
+    }
+
+    SCH_MULTI_UNIT_REFERENCE_MAP lockedSymbols;
+
+    if( aWholeDesign )
+        sheets.GetMultiUnitSymbols( lockedSymbols, SYMBOL_FILTER_ALL );
+    else
+        currentSheet.GetMultiUnitSymbols( lockedSymbols, SYMBOL_FILTER_ALL );
+
+    if( aReset )
+    {
+        std::vector<wxString> conflictingRefs;
+
+        for( auto& [refBase, refList] : lockedSymbols )
+        {
+            std::set<int> seenUnits;
+
+            for( size_t i = 0; i < refList.GetCount(); ++i )
+            {
+                if( !seenUnits.insert( refList[i].GetUnit() ).second )
+                {
+                    conflictingRefs.push_back( refBase );
+                    break;
+                }
+            }
+        }
+
+        for( const wxString& ref : conflictingRefs )
+            lockedSymbols.erase( ref );
+    }
+
+    for( const wxString& ref : keptRefs )
+        lockedSymbols.erase( ref );
+
+    aFrame->SetSheetNumberAndCount();
+
+    SCH_REFERENCE_LIST scoped;
+
+    if( aWholeDesign )
+        sheets.GetSymbols( scoped, SYMBOL_FILTER_ALL );
+    else
+        currentSheet.GetSymbols( scoped, SYMBOL_FILTER_ALL );
+
+    SCH_REFERENCE_LIST references;
+
+    for( size_t i = 0; i < scoped.GetCount(); ++i )
+    {
+        if( !isKept( scoped[i] ) )
+            references.AddItem( scoped[i] );
+    }
+
+    if( aReset )
+        references.RemoveAnnotation();
+
+    SCH_REFERENCE_LIST allRefs;
+    SCH_REFERENCE_LIST additionalRefs;
+    sheets.GetSymbols( allRefs, SYMBOL_FILTER_ALL );
+
+    for( size_t i = 0; i < allRefs.GetCount(); ++i )
+    {
+        if( !references.Contains( allRefs[i] ) )
+            additionalRefs.AddItem( allRefs[i] );
+    }
+
+    references.SetRefDesTracker( sch.Settings().m_refDesTracker );
+    references.SplitReferences();
+    references.AnnotateByOptions( aOrder, INCREMENTAL_BY_REF, 0, lockedSymbols, additionalRefs, false );
+
+    for( size_t i = 0; i < references.GetCount(); ++i )
+    {
+        SCH_REFERENCE& ref = references[i];
+        aCommit->Modify( ref.GetSymbol(), ref.GetSheetPath().LastScreen() );
+        ref.Annotate();
+    }
+
+    aFrame->CheckAnnotate(
+            [&aReporter]( ERCE_T, const wxString& aMsg, SCH_REFERENCE*, SCH_REFERENCE* )
+            {
+                aReporter.Report( aMsg, RPT_SEVERITY_ERROR );
+            },
+            aWholeDesign ? ANNOTATE_ALL : ANNOTATE_CURRENT_SHEET, false, SYMBOL_FILTER_ALL );
+
+    aFrame->GetCurrentSheet().UpdateAllScreenReferences();
+    aFrame->SetSheetNumberAndCount();
+    aFrame->SyncView();
+    aFrame->GetCanvas()->Refresh();
+    aFrame->OnModify();
+    aFrame->UpdateNetHighlightStatus();
+}
+
+/** Number the parts, on the apply coroutine; the done file names every designator that moved. */
+void runAnnotate( const std::string& aDir, bool aWholeDesign, ANNOTATE_ORDER_T aOrder, bool aReset,
+                  const std::set<std::string>& aKeep )
+{
+    RUN_LINES_REPORTER reporter;
+    json               changes = json::array();
+
+    ensureRunDir( aDir );
+
+    SCH_EDIT_FRAME* fr = schFrame();   // re-resolved on the coroutine (S4)
+
+    if( !fr )
+    {
+        reporter.Report( wxS( "no schematic editor to number" ), RPT_SEVERITY_ERROR );
+    }
+    else
+    {
+        try
+        {
+            const std::map<std::string, INSTANCE_REF> before = instanceRefs( fr );
+            SCH_COMMIT                                commit( fr );
+
+            if( aKeep.empty() )
+            {
+                fr->AnnotateSymbols( &commit, aWholeDesign ? ANNOTATE_ALL : ANNOTATE_CURRENT_SHEET,
+                                     aOrder, INCREMENTAL_BY_REF, /*aRecursive*/ aWholeDesign,
+                                     /*aStartNumber*/ 0, aReset, /*aRegroupUnits*/ false,
+                                     /*aRepairTimestamps*/ true, reporter, SYMBOL_FILTER_ALL );
+            }
+            else
+            {
+                annotateKeeping( fr, &commit, aWholeDesign, aOrder, aReset, aKeep, reporter );
+            }
+
+            const std::map<std::string, INSTANCE_REF> after = instanceRefs( fr );
+            bool                                      moved = false;
+
+            for( const auto& [key, now] : after )
+            {
+                auto was = before.find( key );
+
+                if( was == before.end() || was->second.ref == now.ref )
+                    continue;
+
+                moved = true;
+
+                if( now.power )
+                    continue;   // power symbols are numbered too, but they are not parts
+
+                json change = json::object();
+                change["uuid"] = now.uuid;
+                change["sheetPath"] = now.sheetPath;
+                change["from"] = toUtf8( was->second.ref );
+                change["to"] = toUtf8( now.ref );
+                changes.push_back( std::move( change ) );
+            }
+
+            if( moved )
+                commit.Push( wxT( "Number the parts" ) );
+            else
+                commit.Revert();   // nothing changed: no undo step
+        }
+        catch( const std::exception& e )
+        {
+            reporter.Report( wxString::Format( wxS( "the numbering failed: %s" ),
+                                               wxString::FromUTF8( e.what() ) ),
+                             RPT_SEVERITY_ERROR );
+        }
+        catch( ... )
+        {
+            reporter.Report( wxS( "the numbering failed" ), RPT_SEVERITY_ERROR );
+        }
+    }
+
+    // Only the warnings and errors: AnnotateSymbols reports an action line per symbol.
+    json lines = json::array();
+
+    for( const json& line : reporter.Lines() )
+    {
+        if( line["severity"] == "warning" || line["severity"] == "error" )
+            lines.push_back( line );
+    }
+
+    json done = json::object();
+    done["changes"] = std::move( changes );
+    done["lines"] = std::move( lines );
+    writeRunDone( aDir, ".cc-annotate.json", done );
+}
+
+/**
+ * Check the sheet, on the apply coroutine: KiCad's ERC dialog preparation (record the
+ * exclusions, clear every ERC marker, mark what is not numbered or numbered twice), then
+ * the ERC job's body (ERC_TESTER::RunTests, then ERC_REPORT::WriteJsonReport in mm at the
+ * default severities) WITHOUT the job's AsyncLoad and BlockUntilLoaded: in this image the
+ * symbol library adapter's AsyncLoad queues a load of every row it has not loaded (the
+ * island serves KiCad's whole set, 222 libraries), and BlockUntilLoaded would wait on
+ * them all on this coroutine. No commit (the undo depth stays); the markers are not saved
+ * content, and any screen the run marks modified is put back as it was.
+ */
+void runCheck( const std::string& aDir )
+{
+    RUN_LINES_REPORTER reporter;
+    int                code = -1;
+
+    ensureRunDir( aDir );
+
+    SCH_EDIT_FRAME* fr = schFrame();   // re-resolved on the coroutine (S4)
+
+    if( !fr )
+    {
+        reporter.Report( wxS( "no schematic editor to check" ), RPT_SEVERITY_ERROR );
+    }
+    else
+    {
+        try
+        {
+            SCHEMATIC*   sch = &fr->Schematic();
+            SCH_SCREENS  screens( sch->Root() );
+
+            std::map<SCH_SCREEN*, bool> modified;
+
+            for( SCH_SCREEN* screen = screens.GetFirst(); screen; screen = screens.GetNext() )
+                modified[screen] = screen->IsContentModified();
+
+            sch->RecordERCExclusions();
+
+            // The dialog clears the selection before it deletes the markers; only a selected
+            // marker would be left dangling, so the reader's selection is kept otherwise.
+            if( SCH_SELECTION_TOOL* selTool = fr->GetToolManager()->GetTool<SCH_SELECTION_TOOL>() )
+            {
+                bool markerSelected = false;
+
+                for( EDA_ITEM* item : selTool->GetSelection() )
+                    markerSelected = markerSelected || item->Type() == SCH_MARKER_T;
+
+                if( markerSelected )
+                    selTool->ClearSelection();
+            }
+
+            screens.DeleteAllMarkers( MARKER_BASE::MARKER_ERC, /*aIncludeExclusions*/ true );
+
+            fr->CheckAnnotate(
+                    []( ERCE_T aType, const wxString& aMsg, SCH_REFERENCE* aItemA, SCH_REFERENCE* aItemB )
+                    {
+                        std::shared_ptr<ERC_ITEM> ercItem = ERC_ITEM::Create( aType );
+                        ercItem->SetErrorMessage( aMsg );
+
+                        if( aItemB )
+                            ercItem->SetItems( aItemA->GetSymbol(), aItemB->GetSymbol() );
+                        else
+                            ercItem->SetItems( aItemA->GetSymbol() );
+
+                        SCH_MARKER* marker = new SCH_MARKER( std::move( ercItem ),
+                                                             aItemA->GetSymbol()->GetPosition() );
+                        aItemA->GetSheetPath().LastScreen()->Append( marker );
+                    },
+                    ANNOTATE_ALL, true, SYMBOL_FILTER_NON_POWER );
+
+            ERC_TESTER tester( sch );
+            tester.RunTests( fr->GetCanvas()->GetView()->GetDrawingSheet(), /*aEditFrame*/ nullptr,
+                             fr->Kiway().KiFACE( KIWAY::FACE_CVPCB, false ), &fr->Prj(),
+                             /*aProgressReporter*/ nullptr );
+
+            auto provider = std::make_shared<SHEETLIST_ERC_ITEMS_PROVIDER>( sch );
+            provider->SetSeverities( RPT_SEVERITY_ERROR | RPT_SEVERITY_WARNING );
+
+            reporter.Report( wxString::Format( wxS( "Found %d violations" ), provider->GetCount() ),
+                             RPT_SEVERITY_INFO );
+
+            ERC_REPORT report( sch, EDA_UNITS::MM, provider );
+            const wxString out = wxString::FromUTF8( ( aDir + "/erc.json" ).c_str() );
+
+            if( report.WriteJsonReport( out ) )
+            {
+                code = 0;
+            }
+            else
+            {
+                code = 1;
+                reporter.Report( wxS( "the report was not written" ), RPT_SEVERITY_ERROR );
+            }
+
+            // The dialog's testErc: the shown sheet's new marks into the view (the other
+            // sheets add theirs when they are shown).
+            for( SCH_ITEM* marker : fr->GetScreen()->Items().OfType( SCH_MARKER_T ) )
+            {
+                fr->GetCanvas()->GetView()->Remove( marker );
+                fr->GetCanvas()->GetView()->Add( marker );
+            }
+
+            fr->GetCanvas()->Refresh();
+
+            for( SCH_SCREEN* screen = screens.GetFirst(); screen; screen = screens.GetNext() )
+            {
+                auto was = modified.find( screen );
+
+                if( was != modified.end() && !was->second && screen->IsContentModified() )
+                    screen->SetContentModified( false );
+            }
+        }
+        catch( const std::exception& e )
+        {
+            reporter.Report( wxString::Format( wxS( "the check failed: %s" ),
+                                               wxString::FromUTF8( e.what() ) ),
+                             RPT_SEVERITY_ERROR );
+        }
+        catch( ... )
+        {
+            reporter.Report( wxS( "the check failed" ), RPT_SEVERITY_ERROR );
+        }
+    }
+
+    json done = json::object();
+    done["code"] = code;
+    done["lines"] = reporter.Lines();
+    writeRunDone( aDir, ".cc-erc.json", done );
+}
+} // namespace
+
+// symbol.get: the SymbolSheet of the symbol whose uuid is aUuid (lowercase 8-4-4-4-12), on
+// aSheetPath when it holds it, else on the sheet the editor shows, else on the first path
+// holding it; "" for no such symbol (or no schematic frame, or an open in flight). A read:
+// synchronous, no coroutine. Unsaved edits included.
+static std::string kicadSymbolGet( std::string aUuid, std::string aSheetPath )
+{
+    SCH_EDIT_FRAME* fr = schFrame();
+
+    if( !fr || pcbjam_open::busy() )
+        return "";
+
+    SYMBOL_HIT hit = resolveSymbol( fr, aUuid, aSheetPath, /*aStrict*/ false );
+
+    if( !hit.symbol )
+        return "";
+
+    return symbolSheetJson( fr, hit.symbol, hit.path )
+            .dump( -1, ' ', false, json::error_handler_t::replace );
+}
+
+// symbol.set: {"uuid", "sheetPath", "set": {...}}, those three keys only; set as spec 11.2
+// (ref, value, footprint, fields, addField, removeField, inBom, onBoard, inSim, dnp,
+// rotation, mirror, x, y, unit, bodyStyle; at least one). A non-empty sheetPath must hold
+// the symbol; an empty one resolves as symbol.get does. False (nothing queued) for any
+// other JSON; true once ONE commit is queued on the apply coroutine (one undo step, pushed
+// as "Edit symbol"). The host waits for kicadCollabBusy to clear, then reads back.
+static bool kicadSymbolSet( std::string aArgsJson )
+{
+    SCH_EDIT_FRAME* fr = schFrame();
+
+    if( !fr || pcbjam_open::busy() )
+        return false;
+
+    json args = json::parse( aArgsJson, nullptr, /*allow_exceptions*/ false );
+
+    if( args.is_discarded() || !args.is_object() || args.size() != 3 )
+        return false;
+
+    auto uuid = args.find( "uuid" );
+    auto sheetPath = args.find( "sheetPath" );
+    auto set = args.find( "set" );
+
+    if( uuid == args.end() || !uuid->is_string() || sheetPath == args.end()
+            || !sheetPath->is_string() || set == args.end() )
+    {
+        return false;
+    }
+
+    const std::string id = uuid->get<std::string>();
+    SYMBOL_HIT        hit = resolveSymbol( fr, id, sheetPath->get<std::string>(), /*aStrict*/ true );
+
+    if( !hit.symbol )
+        return false;
+
+    SYMBOL_SET edits;
+
+    try
+    {
+        if( !readSymbolSet( *set, hit.symbol, edits ) )
+            return false;
+    }
+    catch( ... )
+    {
+        return false;
+    }
+
+    const std::string path = toUtf8( hit.path.PathAsString() );
+
+    pcbjam_collab::runOnCoroutine( fr, [id, path, edits]() {   // re-resolve on the coroutine (S4)
+        SCH_EDIT_FRAME* frame = schFrame();
+        SYMBOL_HIT      live = resolveSymbol( frame, id, path, /*aStrict*/ true );
+
+        if( !live.symbol )
+            return;
+
+        applySymbolSet( frame, live.symbol, live.path, edits );
+    } );
+
+    return true;
+}
+
+// sheet.annotate: {"run": int, "dir": "/tmp/cc-annotate/<n>", "scope": "all"|"sheet",
+// "order": "x"|"y", "reset": bool, "keep": [uuid...]} (at most 4,096 lowercase uuids),
+// those six keys only. Queues the numbering on the apply coroutine (one commit pushed as
+// "Number the parts", none when nothing changed) and then writes <dir>/.cc-annotate.json
+// {"changes": [{uuid, sheetPath, from, to}], "lines": [{severity, text}]} last.
+static bool kicadAnnotate( std::string aArgsJson )
+{
+    SCH_EDIT_FRAME* fr = schFrame();
+
+    if( !fr || pcbjam_open::busy() )
+        return false;
+
+    json args = json::parse( aArgsJson, nullptr, /*allow_exceptions*/ false );
+
+    if( args.is_discarded() || !args.is_object() || args.size() != 6 )
+        return false;
+
+    auto run = args.find( "run" );
+    auto dir = args.find( "dir" );
+    auto scope = args.find( "scope" );
+    auto order = args.find( "order" );
+    auto reset = args.find( "reset" );
+    auto keep = args.find( "keep" );
+
+    if( run == args.end() || !run->is_number_integer() || run->get<long long>() < 0
+            || dir == args.end() || !dir->is_string() || scope == args.end()
+            || !scope->is_string() || order == args.end() || !order->is_string()
+            || reset == args.end() || !reset->is_boolean() || keep == args.end()
+            || !keep->is_array() || keep->size() > 4096 )
+    {
+        return false;
+    }
+
+    const std::string d = dir->get<std::string>();
+    const std::string s = scope->get<std::string>();
+    const std::string o = order->get<std::string>();
+
+    if( !isRunDir( d, "/tmp/cc-annotate/" ) || ( s != "all" && s != "sheet" )
+            || ( o != "x" && o != "y" ) )
+    {
+        return false;
+    }
+
+    std::set<std::string> kept;
+
+    for( const json& k : *keep )
+    {
+        if( !k.is_string() || !isLowerUuid( k.get<std::string>() ) )
+            return false;
+
+        kept.insert( k.get<std::string>() );
+    }
+
+    const bool             wholeDesign = s == "all";
+    const ANNOTATE_ORDER_T sort = o == "y" ? SORT_BY_Y_POSITION : SORT_BY_X_POSITION;
+    const bool             resetAll = reset->get<bool>();
+
+    pcbjam_collab::runOnCoroutine( fr, [d, wholeDesign, sort, resetAll, kept]() {
+        runAnnotate( d, wholeDesign, sort, resetAll, kept );
+    } );
+
+    return true;
+}
+
+// sheet.check: {"run": int, "dir": "/tmp/cc-erc/<n>"}, those two keys only. Queues the
+// check on the apply coroutine; it writes KiCad's JSON report to <dir>/erc.json and then
+// <dir>/.cc-erc.json {"code": int, "lines": [{severity, text}]} last (code 0: the report
+// was written). The marks it adds stay on the drawing; no commit.
+static bool kicadCheckSheet( std::string aArgsJson )
+{
+    SCH_EDIT_FRAME* fr = schFrame();
+
+    if( !fr || pcbjam_open::busy() )
+        return false;
+
+    json args = json::parse( aArgsJson, nullptr, /*allow_exceptions*/ false );
+
+    if( args.is_discarded() || !args.is_object() || args.size() != 2 )
+        return false;
+
+    auto run = args.find( "run" );
+    auto dir = args.find( "dir" );
+
+    if( run == args.end() || !run->is_number_integer() || run->get<long long>() < 0
+            || dir == args.end() || !dir->is_string() )
+    {
+        return false;
+    }
+
+    const std::string d = dir->get<std::string>();
+
+    if( !isRunDir( d, "/tmp/cc-erc/" ) )
+        return false;
+
+    pcbjam_collab::runOnCoroutine( fr, [d]() { runCheck( d ); } );
+
+    return true;
+}
+
 EMSCRIPTEN_BINDINGS(eeschema) {
     // Programmatic save of the in-memory schematic (round-trip tests, README §A).
     function("kicadSaveSchematic", &kicadSaveSchematic);
@@ -2682,6 +4133,13 @@ EMSCRIPTEN_BINDINGS(eeschema) {
     // Non-KiCad schematic / Altium project import (eeschema-only name, so registered
     // here in both images; suspends like kicadOpenFile, hence the PARKER policy).
     function("kicadImportSchematic", &kicadImportSchematic PCBJAM_PARKER_POLICY);
+    // The Editing window (island cc15): one symbol's properties read and written by uuid,
+    // the parts numbered and the sheet checked (eeschema-only names, so registered here in
+    // both images).
+    function("kicadSymbolGet", &kicadSymbolGet);
+    function("kicadSymbolSet", &kicadSymbolSet);
+    function("kicadAnnotate", &kicadAnnotate);
+    function("kicadCheckSheet", &kicadCheckSheet);
 
 #ifndef KICAD_MERGED_EMBIND
     // JS names ALSO registered by pcbnew_embind.cpp — in the merged image these are
