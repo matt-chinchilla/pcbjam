@@ -411,6 +411,14 @@ static bool kicadChromeShown()
     return frame && chromeVisible( frame, wxAuiManager::GetManager( frame ) );
 }
 
+// A marker: this engine's schematic editor asks the page before it opens KiCad's
+// symbol properties dialog (kicad cc/main SCH_EDIT_TOOL::Properties, through
+// window.kicadProperties.onRequest), so the page may take that request.
+static bool kicadHostProperties()
+{
+    return true;
+}
+
 static bool kicadSetChrome( bool aShow )
 {
     wxFrame* frame =
@@ -846,6 +854,8 @@ EMSCRIPTEN_BINDINGS(kicad_editor) {
     function("kicadSetChrome", &kicadSetChrome);
     // The real chrome state (menu bar, status bar or a pane showing).
     function("kicadChromeShown", &kicadChromeShown);
+    // The symbol properties request goes to the page first (window.kicadProperties).
+    function("kicadHostProperties", &kicadHostProperties);
 
     // Read-only viewer lock (read-only-viewer).
     function("kicadSetReadOnly", &kicadSetReadOnly);
