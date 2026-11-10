@@ -3899,7 +3899,8 @@ void ccFillAddRecord( PCB_EDIT_FRAME* aFrame, NETLIST& aNetlist, json& aRecord )
  * (an empty board) centered on the page, KiCad's own point for an empty board. FP_JUST_ADDED
  * is cleared (else their pads stay out of connectivity until a drag, so no unrouted lines),
  * the move joins the update's undo step (APPEND_UNDO: one Undo takes all of it back), and
- * they stay selected; the view fits the board and the new parts.
+ * they stay selected; the view fits the board and the new parts (Zoom to Objects: KiCad's
+ * Zoom to Fit fits the board's outline when it has one, leaving the new parts off screen).
  */
 void ccPlaceNewFootprints( PCB_EDIT_FRAME* aFrame, const std::vector<FOOTPRINT*>& aNew )
 {
@@ -3981,7 +3982,7 @@ void ccPlaceNewFootprints( PCB_EDIT_FRAME* aFrame, const std::vector<FOOTPRINT*>
 
     toolMgr->RunAction( ACTIONS::selectionClear );
     toolMgr->RunAction<EDA_ITEMS*>( ACTIONS::selectItems, &items );
-    toolMgr->RunAction( ACTIONS::zoomFitScreen );
+    toolMgr->RunAction( ACTIONS::zoomFitObjects );   // Zoom to Fit would fit the outline alone
     aFrame->GetCanvas()->Refresh();
 }
 
