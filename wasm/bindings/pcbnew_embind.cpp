@@ -3424,7 +3424,7 @@ std::string ccLayer( PCB_LAYER_ID aLayer )
     if( aLayer < 0 || aLayer >= PCB_LAYER_ID_COUNT )
         return "";
 
-    return toUtf8( BOARD::GetStandardLayerName( aLayer ) );
+    return toUtf8( LSET::Name( aLayer ) );   // the file format's name, never the translated one
 }
 
 /** The layer a canonical name names, among the layers the board enables; UNDEFINED_LAYER else. */
@@ -3432,7 +3432,7 @@ PCB_LAYER_ID ccLayerByName( const BOARD* aBoard, const std::string& aName )
 {
     for( PCB_LAYER_ID layer : aBoard->GetEnabledLayers().Seq() )
     {
-        if( toUtf8( BOARD::GetStandardLayerName( layer ) ) == aName )
+        if( toUtf8( LSET::Name( layer ) ) == aName )
             return layer;
     }
 
@@ -3553,6 +3553,38 @@ bool boardSchematicNetlist( PCB_EDIT_FRAME* aFrame, NETLIST& aOut, CC_SCH_NETLIS
         }
     }
 
+    // What the hidden editor last opened, and every sheet file it read with its size and
+    // modification time: while none changed (and the root is the same), the open is kept
+    // and only the checks and the netlist run again. Each re-open of a design holds more
+    // of the engine's memory, which never shrinks (about 64 MB a re-open of Glasgow).
+    static std::vector<std::string> s_files;
+    static std::string              s_stamp;
+
+    auto stampOf = [&]( const std::vector<std::string>& aFiles ) -> std::string
+                   {
+                       std::string stamp = toUtf8( root.GetFullPath() );
+
+                       for( const TOP_LEVEL_SHEET_INFO& info : prj.GetProjectFile().GetTopLevelSheets() )
+                           stamp += "|top:" + toUtf8( info.filename );
+
+                       for( const std::string& file : aFiles )
+                       {
+                           wxFileName fn( wxString::FromUTF8( file.c_str() ) );
+                           stamp += "|" + file;
+
+                           if( !fn.FileExists() )
+                           {
+                               stamp += ":gone";
+                               continue;
+                           }
+
+                           stamp += ":" + std::to_string( fn.GetSize().GetValue() ) + ":"
+                                    + std::to_string( fn.GetModificationTime().GetValue().GetValue() );
+                       }
+
+                       return stamp;
+                   };
+
     bool        opened = false;
     std::string answer;
 
@@ -3561,15 +3593,23 @@ bool boardSchematicNetlist( PCB_EDIT_FRAME* aFrame, NETLIST& aOut, CC_SCH_NETLIS
             {
                 pcbjam_open::BusyGuard busy;
                 wxLogNull              noLog;
-                KIWAY_PLAYER*          player = aFrame->Kiway().Player( FRAME_SCH, true );
+                KIWAY_PLAYER*          player = aFrame->Kiway().Player( FRAME_SCH, false );
 
-                if( !player )
-                    return;
-
-                // The lock is the hidden editor's own; never ask about it.
-                prj.SetLockOverrideGranted( true );
-
+                if( player && !s_stamp.empty() && stampOf( s_files ) == s_stamp )
                 {
+                    opened = true;
+                }
+                else
+                {
+                    if( !player )
+                        player = aFrame->Kiway().Player( FRAME_SCH, true );
+
+                    if( !player )
+                        return;
+
+                    // The lock is the hidden editor's own; never ask about it.
+                    prj.SetLockOverrideGranted( true );
+
                     wxEventBlocker blocker( aFrame );
                     opened = player->OpenProjectFiles(
                             std::vector<wxString>( 1, root.GetFullPath() ) );
@@ -3585,6 +3625,21 @@ bool boardSchematicNetlist( PCB_EDIT_FRAME* aFrame, NETLIST& aOut, CC_SCH_NETLIS
         readSchematic();
 
     json parsed = json::parse( answer, nullptr, /*allow_exceptions*/ false );
+
+    s_files.clear();
+    s_stamp.clear();
+
+    if( opened && !parsed.is_discarded() && parsed.is_object() && parsed.contains( "files" )
+            && parsed.value( "error", std::string() ).empty() )
+    {
+        for( const json& f : parsed["files"] )
+        {
+            if( f.is_string() )
+                s_files.push_back( f.get<std::string>() );
+        }
+
+        s_stamp = stampOf( s_files );
+    }
 
     if( !opened || parsed.is_discarded() || !parsed.is_object() )
     {

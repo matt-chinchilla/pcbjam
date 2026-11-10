@@ -4130,7 +4130,8 @@ static bool kicadCheckSheet( std::string aArgsJson )
 // unmodified, so the next run's re-open raises no Save Changes prompt.
 // Answers JSON (the two include roots stay apart, so plain strings cross):
 // {"text", "blocked": [{code, ref, message}], "warnings": [{code, message}],
-//  "sheets": [absolute top-level sheet files, in KiCad's order], "error", "message"}.
+//  "sheets": [absolute top-level sheet files, in KiCad's order],
+//  "files": [every sheet file the open read, absolute], "error", "message"}.
 std::string ccSchNetlistForBoard( KIWAY_PLAYER* aPlayer )
 {
     json out = json::object();
@@ -4138,6 +4139,7 @@ std::string ccSchNetlistForBoard( KIWAY_PLAYER* aPlayer )
     out["blocked"] = json::array();
     out["warnings"] = json::array();
     out["sheets"] = json::array();
+    out["files"] = json::array();
     out["error"] = "";
     out["message"] = "";
 
@@ -4203,7 +4205,12 @@ std::string ccSchNetlistForBoard( KIWAY_PLAYER* aPlayer )
         SCH_SCREENS screens( sch.Root() );
 
         for( SCH_SCREEN* screen = screens.GetFirst(); screen; screen = screens.GetNext() )
+        {
             screen->SetContentModified( false );
+
+            if( !screen->GetFileName().IsEmpty() )
+                out["files"].push_back( toUtf8( screen->GetFileName() ) );
+        }
     }
     catch( const std::exception& e )
     {
