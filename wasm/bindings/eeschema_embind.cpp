@@ -88,6 +88,8 @@
 #include <erc/erc_item.h>
 #include <erc/erc_report.h>
 #include <erc/erc_settings.h>
+#include <advanced_config.h>
+#include <netlist_exporters/netlist_exporter_kicad.h>
 
 using namespace emscripten;
 using json = nlohmann::json;
@@ -4112,6 +4114,113 @@ static bool kicadCheckSheet( std::string aArgsJson )
 
     return true;
 }
+
+#ifdef KICAD_MERGED_EMBIND
+// Circuit Center (engine run 12): the eeschema half of the board engine's schematic
+// netlist, shared by Update the board (kicadUpdateBoardFromSchematic) and the board
+// check's schematic parity (kicadCheckBoard), both in pcbnew_embind.cpp. aPlayer is the
+// HIDDEN schematic editor the board engine opened (PCB_EDIT_FRAME::TestStandalone's road,
+// minus every dialog). The steps of MAIL_SCH_GET_NETLIST and ReadyToNetlist with nothing
+// asked: the power symbols numbered; CheckAnnotate with a COLLECTING handler (never the
+// Annotate dialog): a part with no number is an "unannotated" problem, a designator used
+// twice (or units that disagree) a "duplicate_designator" problem, and with any of them no
+// netlist is made; duplicate sheet names a "duplicate_sheet_names" warning (never IsOK);
+// the connections recalculated when incremental connectivity is on; KiCad's own netlist
+// (NETLIST_EXPORTER_KICAD, GNL_ALL | GNL_OPT_KICAD). Last, every screen is marked
+// unmodified, so the next run's re-open raises no Save Changes prompt.
+// Answers JSON (the two include roots stay apart, so plain strings cross):
+// {"text", "blocked": [{code, ref, message}], "warnings": [{code, message}],
+//  "sheets": [absolute top-level sheet files, in KiCad's order], "error", "message"}.
+std::string ccSchNetlistForBoard( KIWAY_PLAYER* aPlayer )
+{
+    json out = json::object();
+    out["text"] = "";
+    out["blocked"] = json::array();
+    out["warnings"] = json::array();
+    out["sheets"] = json::array();
+    out["error"] = "";
+    out["message"] = "";
+
+    SCH_EDIT_FRAME* sf = dynamic_cast<SCH_EDIT_FRAME*>( aPlayer );
+
+    if( !sf )
+    {
+        out["error"] = "schematic_unreadable";
+        out["message"] = "no schematic editor";
+        return out.dump( -1, ' ', false, json::error_handler_t::replace );
+    }
+
+    try
+    {
+        SCHEMATIC& sch = sf->Schematic();
+
+        for( SCH_SHEET* top : sch.GetTopLevelSheets() )
+        {
+            if( top && top->GetScreen() )
+                out["sheets"].push_back( toUtf8( top->GetScreen()->GetFileName() ) );
+        }
+
+        sch.Hierarchy().AnnotatePowerSymbols();
+
+        json blocked = json::array();
+
+        sf->CheckAnnotate(
+                [&]( ERCE_T aType, const wxString& aMsg, SCH_REFERENCE* aItemA, SCH_REFERENCE* )
+                {
+                    json problem = json::object();
+                    problem["code"] = aType == ERCE_UNANNOTATED ? "unannotated"
+                                                                : "duplicate_designator";
+                    problem["ref"] = aItemA ? toUtf8( aItemA->GetSymbol()->GetRef(
+                                                      &aItemA->GetSheetPath(), true ) )
+                                            : std::string();
+                    problem["message"] = toUtf8( aMsg );
+                    blocked.push_back( std::move( problem ) );
+                },
+                ANNOTATE_ALL, true, SYMBOL_FILTER_NON_POWER );
+
+        ERC_TESTER erc( &sch );
+
+        if( erc.TestDuplicateSheetNames( false ) > 0 )
+        {
+            json warning = json::object();
+            warning["code"] = "duplicate_sheet_names";
+            warning["message"] = "Two sheets of the schematic share a name.";
+            out["warnings"].push_back( std::move( warning ) );
+        }
+
+        if( blocked.empty() )
+        {
+            if( ADVANCED_CFG::GetCfg().m_IncrementalConnectivity )
+                sf->RecalculateConnections( nullptr, GLOBAL_CLEANUP );
+
+            NETLIST_EXPORTER_KICAD exporter( &sch );
+            STRING_FORMATTER       formatter;
+
+            exporter.Format( &formatter, GNL_ALL | GNL_OPT_KICAD );
+            out["text"] = formatter.GetString();
+        }
+
+        out["blocked"] = std::move( blocked );
+
+        SCH_SCREENS screens( sch.Root() );
+
+        for( SCH_SCREEN* screen = screens.GetFirst(); screen; screen = screens.GetNext() )
+            screen->SetContentModified( false );
+    }
+    catch( const std::exception& e )
+    {
+        out["error"] = "schematic_unreadable";
+        out["message"] = e.what();
+    }
+    catch( ... )
+    {
+        out["error"] = "schematic_unreadable";
+        out["message"] = "the schematic could not be read";
+    }
+
+    return out.dump( -1, ' ', false, json::error_handler_t::replace );
+}
+#endif // KICAD_MERGED_EMBIND
 
 EMSCRIPTEN_BINDINGS(eeschema) {
     // Programmatic save of the in-memory schematic (round-trip tests, README §A).

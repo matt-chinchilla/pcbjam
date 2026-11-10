@@ -419,6 +419,23 @@ static bool kicadHostProperties()
     return true;
 }
 
+// A marker (engine run 12): this engine's board editor asks the page before it opens
+// KiCad's properties dialog for one footprint, track, arc, via, copper zone, board text or
+// check mark (kicad cc/main EDIT_TOOL::Properties, through window.kicadProperties.onRequest
+// with type "board"), so the page may take that request.
+static bool kicadHostBoardProperties()
+{
+    return true;
+}
+
+// A marker (engine run 12): this engine asks the page before a hotkey's action runs (kicad
+// cc/main ACTION_MANAGER::RunHotKey, through window.kicadHostAction.onRequest), so the page
+// may hold a key whose window it replaces.
+static bool kicadHostActions()
+{
+    return true;
+}
+
 static bool kicadSetChrome( bool aShow )
 {
     wxFrame* frame =
@@ -856,6 +873,9 @@ EMSCRIPTEN_BINDINGS(kicad_editor) {
     function("kicadChromeShown", &kicadChromeShown);
     // The symbol properties request goes to the page first (window.kicadProperties).
     function("kicadHostProperties", &kicadHostProperties);
+    // The board properties request and every hotkey's action go to the page first (run 12).
+    function("kicadHostBoardProperties", &kicadHostBoardProperties);
+    function("kicadHostActions", &kicadHostActions);
 
     // Read-only viewer lock (read-only-viewer).
     function("kicadSetReadOnly", &kicadSetReadOnly);

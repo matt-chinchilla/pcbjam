@@ -61,6 +61,32 @@
 #include <pcb_draw_panel_gal.h>
 #include <jobs/job_export_pcb_gerbers.h>
 #include <jobs/job_export_pcb_drill.h>
+#include <netlist_reader/pcb_netlist.h>
+#include <netlist_reader/netlist_reader.h>
+#include <netlist_reader/board_netlist_updater.h>
+#include <drc/drc_engine.h>
+#include <drc/drc_item.h>
+#include <drc/drc_rule.h>
+#include <drc/drc_rule_condition.h>
+#include <tools/drc_tool.h>
+#include <tools/zone_filler_tool.h>
+#include <pcb_marker.h>
+#include <pcb_textbox.h>
+#include <pcb_table.h>
+#include <pcb_tablecell.h>
+#include <pcb_dimension.h>
+#include <pcb_reference_image.h>
+#include <pcb_barcode.h>
+#include <board_design_settings.h>
+#include <netclass.h>
+#include <netinfo.h>
+#include <project/project_file.h>
+#include <string_utils.h>
+#include <units_provider.h>
+#include <wildcards_and_files_ext.h>
+#include <wx/log.h>
+#include <cmath>
+#include <cstring>
 #include <pgm_base.h>
 #include <reporter.h>
 #include <settings/settings_manager.h>
@@ -3290,6 +3316,2336 @@ std::string pcbPlaceImportedItem( std::string aSexpr )
     return out.dump();
 }
 
+// ════════════════════════ Circuit Center, engine run 12 (engine run A) ════════════════════════
+//
+// The board half of four island ops (cc18): Update the board (board.preview, board.update; cap
+// boardUpdate), the board check (board.check, cap drc), why a rule applies (board.explain, cap
+// explain) and the selected board item's properties (board.item.get and board.item.set, cap
+// boardItem). Every export refuses at once (false or "") with no board frame or while an open
+// is in flight (pcbjam_open::busy()); the runs queue on the apply coroutine and write their
+// record file LAST (a part file renamed into place), as kicadPlotBoard does; no KiCad dialog
+// opens on any of these roads (wxLogNull keeps wx's log window shut too).
+
+#ifdef KICAD_MERGED_EMBIND
+// eeschema_embind.cpp: the hidden schematic editor's checks and KiCad netlist, as JSON.
+std::string ccSchNetlistForBoard( KIWAY_PLAYER* aPlayer );
+#endif
+
+namespace
+{
+using pcbjam_collab::toUtf8;
+
+/** A run folder: under aRoot, longer than it, no "..", no trailing slash, no NUL (the plot's rule). */
+bool ccIsRunDir( const std::string& aDir, const std::string& aRoot )
+{
+    return aDir.size() > aRoot.size() && aDir.compare( 0, aRoot.size(), aRoot ) == 0
+           && aDir.find( ".." ) == std::string::npos && aDir.back() != '/'
+           && aDir.find( '\0' ) == std::string::npos;
+}
+
+void ccEnsureDir( const std::string& aDir )
+{
+    const wxString dir = wxString::FromUTF8( aDir.c_str() );
+
+    if( !wxFileName::DirExists( dir ) )
+        wxFileName::Mkdir( dir, wxS_DIR_DEFAULT, wxPATH_MKDIR_FULL );
+}
+
+/** <dir>/<name>, written whole: a part file renamed into place. */
+void ccWriteJson( const std::string& aDir, const char* aName, const json& aBody )
+{
+    const std::string body = aBody.dump( -1, ' ', false, json::error_handler_t::replace );
+    const std::string fin = aDir + "/" + aName;
+    const std::string part = fin + ".part";
+
+    if( FILE* f = std::fopen( part.c_str(), "wb" ) )
+    {
+        std::fwrite( body.data(), 1, body.size(), f );
+        std::fclose( f );
+        std::rename( part.c_str(), fin.c_str() );
+    }
+}
+
+json ccLines( const PLOT_LINES_REPORTER& aReporter )
+{
+    json lines = json::array();
+
+    for( const auto& [severity, text] : aReporter.m_lines )
+    {
+        json line = json::object();
+        line["severity"] = plotSeverityWord( severity );
+        line["text"] = toUtf8( text );
+        lines.push_back( std::move( line ) );
+    }
+
+    return lines;
+}
+
+/** A string of the records: KiCad's text, cut to aMax bytes. */
+std::string ccText( const wxString& aText, size_t aMax = 1024 )
+{
+    std::string s = toUtf8( aText );
+
+    if( s.size() > aMax )
+    {
+        s.resize( aMax );
+
+        // Never end inside a UTF-8 sequence.
+        while( !s.empty() && ( static_cast<unsigned char>( s.back() ) & 0xC0 ) == 0x80 )
+            s.pop_back();
+
+        if( !s.empty() && ( static_cast<unsigned char>( s.back() ) & 0x80 ) )
+            s.pop_back();
+    }
+
+    return s;
+}
+
+/** KiCad's net name as the records carry it: unescaped. */
+std::string ccNet( const wxString& aNetname )
+{
+    return ccText( UnescapeString( aNetname ), 512 );
+}
+
+/** Millimeters at 4 decimals. */
+double ccMm( long long aIU )
+{
+    return std::round( pcbIUScale.IUTomm( (int) aIU ) * 10000.0 ) / 10000.0;
+}
+
+double ccRound( double aValue, double aScale )
+{
+    return std::round( aValue * aScale ) / aScale;
+}
+
+/** A layer's canonical KiCad name ("F.Cu", "In1.Cu", "Edge.Cuts"); "" for none. */
+std::string ccLayer( PCB_LAYER_ID aLayer )
+{
+    if( aLayer < 0 || aLayer >= PCB_LAYER_ID_COUNT )
+        return "";
+
+    return toUtf8( BOARD::GetStandardLayerName( aLayer ) );
+}
+
+/** The layer a canonical name names, among the layers the board enables; UNDEFINED_LAYER else. */
+PCB_LAYER_ID ccLayerByName( const BOARD* aBoard, const std::string& aName )
+{
+    for( PCB_LAYER_ID layer : aBoard->GetEnabledLayers().Seq() )
+    {
+        if( toUtf8( BOARD::GetStandardLayerName( layer ) ) == aName )
+            return layer;
+    }
+
+    return UNDEFINED_LAYER;
+}
+
+bool ccIsLowerUuid( const std::string& aText )
+{
+    if( aText.size() != 36 )
+        return false;
+
+    for( size_t i = 0; i < aText.size(); ++i )
+    {
+        const char c = aText[i];
+
+        if( i == 8 || i == 13 || i == 18 || i == 23 )
+        {
+            if( c != '-' )
+                return false;
+        }
+        else if( !( ( c >= '0' && c <= '9' ) || ( c >= 'a' && c <= 'f' ) ) )
+        {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+BOARD_ITEM* ccResolve( BOARD* aBoard, const std::string& aUuid )
+{
+    if( !aBoard )
+        return nullptr;
+
+    return aBoard->ResolveItem( KIID( wxString::FromUTF8( aUuid.c_str() ) ), /*allowNull*/ true );
+}
+
+/** Every line a run's KiCad code reports, counted by severity (empty lines left out). */
+class CC_COUNTING_REPORTER : public REPORTER
+{
+public:
+    using REPORTER::Report;
+
+    REPORTER& Report( const wxString& aText, SEVERITY aSeverity = RPT_SEVERITY_UNDEFINED ) override
+    {
+        REPORTER::Report( aText, aSeverity );
+
+        if( aText.IsEmpty() )
+            return *this;
+
+        switch( aSeverity )
+        {
+        case RPT_SEVERITY_ACTION:  m_actions++;  break;
+        case RPT_SEVERITY_WARNING: m_warnings++; break;
+        case RPT_SEVERITY_ERROR:   m_errors++;   break;
+        default:                                 break;
+        }
+
+        return *this;
+    }
+
+    int m_actions = 0;
+    int m_warnings = 0;
+    int m_errors = 0;
+};
+
+// ───────────────────────────── the board's schematic netlist ─────────────────────────────
+
+/** What the hidden schematic editor answered: the problems, the warnings and the sheets read. */
+struct CC_SCH_NETLIST
+{
+    std::string              error;     // "", "no_schematic", "schematic_unreadable", "not_annotated"
+    std::string              message;
+    json                     blocked = json::array();    // [{code, ref, message}]
+    json                     warnings = json::array();   // [{code, message}]
+    std::vector<std::string> sheets;                     // absolute engine paths, KiCad's order
+};
+
+/**
+ * The board's schematic as a NETLIST, read IN THIS ENGINE as KiCad's own F8 does under
+ * __EMSCRIPTEN__ (PCB_EDIT_FRAME::TestStandalone, then MAIL_SCH_GET_NETLIST), minus every
+ * dialog: the root file is <project path>/<project name>.kicad_sch, each top-level sheet the
+ * project lists must be in the folder (a short schematic is never read in silence), the
+ * schematic editor is created HIDDEN and re-opens the files every run (the folder's current
+ * sheets), the open runs on the main stack as KiCad's UpdatePCBFromSchematic runs it
+ * (RunMainStack) under the open gate's BusyGuard with no lock prompt, and the checks and the
+ * netlist are eeschema's (ccSchNetlistForBoard). False with aResult.error set: no_schematic,
+ * schematic_unreadable, or not_annotated (aResult.blocked names the parts). Runs on the apply
+ * coroutine only. Shared by Update the board and the board check's schematic parity.
+ */
+bool boardSchematicNetlist( PCB_EDIT_FRAME* aFrame, NETLIST& aOut, CC_SCH_NETLIST& aResult )
+{
+#ifndef KICAD_MERGED_EMBIND
+    aResult.error = "schematic_unreadable";
+    aResult.message = "this engine has no schematic editor";
+    return false;
+#else
+    PROJECT&   prj = aFrame->Prj();
+    wxFileName root( prj.GetProjectPath(), prj.GetProjectName(),
+                     FILEEXT::KiCadSchematicFileExtension );
+
+    if( !root.FileExists() )
+    {
+        aResult.error = "no_schematic";
+        aResult.message = toUtf8( root.GetFullPath() );
+        return false;
+    }
+
+    for( const TOP_LEVEL_SHEET_INFO& info : prj.GetProjectFile().GetTopLevelSheets() )
+    {
+        wxFileName sheet( prj.GetProjectPath(), info.filename );
+
+        if( !sheet.FileExists() )
+        {
+            aResult.error = "schematic_unreadable";
+            aResult.message = "a top-level sheet is missing: " + toUtf8( info.filename );
+            return false;
+        }
+    }
+
+    bool        opened = false;
+    std::string answer;
+
+    auto readSchematic =
+            [&]()
+            {
+                pcbjam_open::BusyGuard busy;
+                wxLogNull              noLog;
+                KIWAY_PLAYER*          player = aFrame->Kiway().Player( FRAME_SCH, true );
+
+                if( !player )
+                    return;
+
+                // The lock is the hidden editor's own; never ask about it.
+                prj.SetLockOverrideGranted( true );
+
+                {
+                    wxEventBlocker blocker( aFrame );
+                    opened = player->OpenProjectFiles(
+                            std::vector<wxString>( 1, root.GetFullPath() ) );
+                }
+
+                if( opened )
+                    answer = ccSchNetlistForBoard( player );
+            };
+
+    if( COROUTINE<int, int>* cor = pcbjam_collab::activeApplySlot().cor )
+        cor->RunMainStack( readSchematic );
+    else
+        readSchematic();
+
+    json parsed = json::parse( answer, nullptr, /*allow_exceptions*/ false );
+
+    if( !opened || parsed.is_discarded() || !parsed.is_object() )
+    {
+        aResult.error = "schematic_unreadable";
+        aResult.message = "the schematic could not be opened";
+        return false;
+    }
+
+    if( parsed.value( "error", std::string() ) != "" )
+    {
+        aResult.error = "schematic_unreadable";
+        aResult.message = parsed.value( "message", std::string() );
+        return false;
+    }
+
+    for( const json& s : parsed["sheets"] )
+    {
+        if( s.is_string() )
+            aResult.sheets.push_back( s.get<std::string>() );
+    }
+
+    if( aResult.sheets.empty() )
+        aResult.sheets.push_back( toUtf8( root.GetFullPath() ) );
+
+    aResult.blocked = parsed["blocked"];
+    aResult.warnings = parsed["warnings"];
+
+    if( !aResult.blocked.empty() )
+    {
+        aResult.error = "not_annotated";
+        return false;
+    }
+
+    try
+    {
+        const std::string text = parsed.value( "text", std::string() );
+        auto*             lineReader = new STRING_LINE_READER( text, wxS( "Eeschema netlist" ) );
+        KICAD_NETLIST_READER netlistReader( lineReader, &aOut );   // owns lineReader
+
+        netlistReader.LoadNetlist();
+    }
+    catch( const IO_ERROR& e )
+    {
+        aResult.error = "schematic_unreadable";
+        aResult.message = toUtf8( e.What() );
+        return false;
+    }
+
+    return true;
+#endif
+}
+
+// ───────────────────────────── Update the board ─────────────────────────────
+
+/** 16 hex digits, FNV-1a 64 over the text: stable for the life of the engine and across runs. */
+std::string ccDigest( const std::string& aText )
+{
+    uint64_t hash = 1469598103934665603ULL;
+
+    for( unsigned char c : aText )
+    {
+        hash ^= c;
+        hash *= 1099511628211ULL;
+    }
+
+    char buf[17];
+    std::snprintf( buf, sizeof( buf ), "%016llx", static_cast<unsigned long long>( hash ) );
+    return buf;
+}
+
+/**
+ * The preview's token: the parsed netlist as pcbnew formats it (no date in it), the three
+ * options and the board's change count. An apply whose token differs changes nothing (stale).
+ */
+std::string ccUpdateToken( NETLIST& aNetlist, bool aReplace, bool aDelete, bool aRelink,
+                           int aBoardStamp )
+{
+    STRING_FORMATTER formatter;
+    aNetlist.Format( "pcb_netlist", &formatter, 0, 0 );
+
+    std::string text = formatter.GetString();
+    text += aReplace ? "|r1" : "|r0";
+    text += aDelete ? "|d1" : "|d0";
+    text += aRelink ? "|l1" : "|l0";
+    text += "|t" + std::to_string( aBoardStamp );
+
+    return ccDigest( text );
+}
+
+/** One change log record in the island's closed shape (each kind its own keys). */
+json ccChangeRecord( const NETLIST_CHANGE& aChange )
+{
+    const std::string kind = toUtf8( aChange.kind );
+    json              r = json::object();
+
+    r["kind"] = kind;
+
+    auto put = [&]( const char* aKey, const wxString& aValue )
+               {
+                   r[aKey] = ccText( aValue );
+               };
+
+    if( kind == "add" )
+    {
+        put( "ref", aChange.ref );
+        put( "footprint", aChange.footprint );
+        r["pins"] = json::array();
+        r["extraPads"] = json::array();
+        r["sameName"] = false;
+    }
+    else if( kind == "remove" )
+    {
+        put( "ref", aChange.ref );
+        put( "footprint", aChange.footprint );
+    }
+    else if( kind == "footprint" || kind == "value" )
+    {
+        put( "ref", aChange.ref );
+        put( "from", aChange.from );
+        put( "to", aChange.to );
+    }
+    else if( kind == "reference" )
+    {
+        put( "ref", aChange.ref );
+        put( "to", aChange.to );
+    }
+    else if( kind == "detail" )
+    {
+        put( "ref", aChange.ref );
+        put( "topic", aChange.topic );
+        put( "name", aChange.name );
+        put( "from", aChange.from );
+        put( "to", aChange.to );
+    }
+    else if( kind == "connect" )
+    {
+        put( "ref", aChange.ref );
+        put( "pin", aChange.pin );
+        put( "to", aChange.to );
+    }
+    else if( kind == "reconnect" )
+    {
+        put( "ref", aChange.ref );
+        put( "pin", aChange.pin );
+        put( "from", aChange.from );
+        put( "to", aChange.to );
+    }
+    else if( kind == "disconnect" )
+    {
+        put( "ref", aChange.ref );
+        put( "pin", aChange.pin );
+        put( "from", aChange.from );
+    }
+    else if( kind == "net" || kind == "unusedNet" )
+    {
+        put( "net", aChange.net );
+    }
+    else if( kind == "copper" )
+    {
+        put( "item", aChange.topic );
+        put( "name", aChange.name );
+        put( "from", aChange.from );
+        put( "to", aChange.to );
+    }
+    else   // problem
+    {
+        r["kind"] = "problem";
+        put( "code", aChange.code );
+        r["severity"] = toUtf8( aChange.severity ) == "error" ? "error" : "warning";
+        put( "ref", aChange.ref );
+        put( "pin", aChange.pin );
+        put( "footprint", aChange.footprint );
+        put( "net", aChange.net );
+        put( "name", aChange.name );
+    }
+
+    put( "message", aChange.message );
+    return r;
+}
+
+/** A problem record the export adds itself (the annotation check, duplicate sheet names). */
+json ccProblemRecord( const std::string& aCode, const std::string& aSeverity,
+                      const std::string& aRef, const std::string& aMessage )
+{
+    json r = json::object();
+    r["kind"] = "problem";
+    r["code"] = aCode;
+    r["severity"] = aSeverity;
+    r["ref"] = aRef;
+    r["pin"] = "";
+    r["footprint"] = "";
+    r["net"] = "";
+    r["name"] = "";
+    r["message"] = aMessage;
+    return r;
+}
+
+/**
+ * A new part's pins, read from its footprint before anything is placed (KiCad's dry run
+ * says nothing of a new part's pads): each pin of the symbol with its net and whether the
+ * footprint has a pad of that number, the numbered pads no pin names, and whether a part of
+ * that designator is already on the board (the footprints not linked to the symbols).
+ */
+void ccFillAddRecord( PCB_EDIT_FRAME* aFrame, NETLIST& aNetlist, json& aRecord )
+{
+    const wxString ref = wxString::FromUTF8( aRecord["ref"].get<std::string>().c_str() );
+    COMPONENT*     component = aNetlist.GetComponentByReference( ref );
+
+    aRecord["sameName"] = aFrame->GetBoard()->FindFootprintByReference( ref ) != nullptr;
+
+    if( !component )
+        return;
+
+    FOOTPRINT* fp = aFrame->LoadFootprint( component->GetFPID() );
+    json       pins = json::array();
+    std::set<wxString> named;
+
+    for( unsigned ii = 0; ii < component->GetNetCount() && pins.size() < 4096; ++ii )
+    {
+        const COMPONENT_NET& net = component->GetNet( ii );
+        json                 pin = json::object();
+
+        pin["pin"] = ccText( net.GetPinName() );
+        pin["net"] = ccNet( net.GetNetName() );
+        pin["pad"] = fp && fp->FindPadByNumber( net.GetPinName() ) != nullptr;
+        named.insert( net.GetPinName() );
+        pins.push_back( std::move( pin ) );
+    }
+
+    json extra = json::array();
+
+    if( fp )
+    {
+        std::set<wxString> seen;
+
+        for( PAD* pad : fp->Pads() )
+        {
+            const wxString number = pad->GetNumber();
+
+            if( number.IsEmpty() || named.count( number ) || !seen.insert( number ).second )
+                continue;
+
+            if( extra.size() < 4096 )
+                extra.push_back( ccText( number ) );
+        }
+
+        delete fp;
+    }
+
+    aRecord["pins"] = std::move( pins );
+    aRecord["extraPads"] = std::move( extra );
+}
+
+/**
+ * The new footprints KiCad spread at {0,0} moved together beside the board: the pile's upper
+ * left 5 mm right of the board's outline at its top, else right of every other item, else
+ * (an empty board) centered on the page, KiCad's own point for an empty board. FP_JUST_ADDED
+ * is cleared (else their pads stay out of connectivity until a drag, so no unrouted lines),
+ * the move joins the update's undo step (APPEND_UNDO: one Undo takes all of it back), and
+ * they stay selected; the view fits the board and the new parts.
+ */
+void ccPlaceNewFootprints( PCB_EDIT_FRAME* aFrame, const std::vector<FOOTPRINT*>& aNew )
+{
+    if( aNew.empty() )
+        return;
+
+    BOARD*               board = aFrame->GetBoard();
+    std::set<FOOTPRINT*> fresh( aNew.begin(), aNew.end() );
+    BOX2I                pile = aNew.front()->GetBoundingBox( false );
+
+    for( FOOTPRINT* fp : aNew )
+        pile.Merge( fp->GetBoundingBox( false ) );
+
+    const int gap = pcbIUScale.mmToIU( 5 );
+    BOX2I     edges = board->GetBoardEdgesBoundingBox();
+    VECTOR2I  delta;
+
+    if( edges.GetWidth() > 0 || edges.GetHeight() > 0 )
+    {
+        delta = VECTOR2I( edges.GetRight() + gap, edges.GetTop() ) - pile.GetOrigin();
+    }
+    else
+    {
+        BOX2I items;
+        bool  any = false;
+
+        auto add = [&]( const BOX2I& aBox )
+                   {
+                       if( !any )
+                           items = aBox;
+                       else
+                           items.Merge( aBox );
+
+                       any = true;
+                   };
+
+        for( FOOTPRINT* fp : board->Footprints() )
+        {
+            if( !fresh.count( fp ) )
+                add( fp->GetBoundingBox( false ) );
+        }
+
+        for( PCB_TRACK* track : board->Tracks() )
+            add( track->GetBoundingBox() );
+
+        for( BOARD_ITEM* drawing : board->Drawings() )
+            add( drawing->GetBoundingBox() );
+
+        for( ZONE* zone : board->Zones() )
+            add( zone->GetBoundingBox() );
+
+        if( any )
+        {
+            delta = VECTOR2I( items.GetRight() + gap, items.GetTop() ) - pile.GetOrigin();
+        }
+        else
+        {
+            VECTOR2I page = board->GetPageSettings().GetSizeIU( pcbIUScale.IU_PER_MILS );
+            delta = VECTOR2I( page.x / 2, page.y / 2 ) - pile.Centre();
+        }
+    }
+
+    BOARD_COMMIT commit( aFrame );
+
+    for( FOOTPRINT* fp : aNew )
+    {
+        commit.Modify( fp );
+        fp->Move( delta );
+        fp->SetAttributes( fp->GetAttributes() & ~FP_JUST_ADDED );
+    }
+
+    commit.Push( _( "Update Netlist" ), APPEND_UNDO );
+
+    board->BuildConnectivity();
+    aFrame->Compile_Ratsnest( true );
+
+    TOOL_MANAGER* toolMgr = aFrame->GetToolManager();
+    EDA_ITEMS     items( aNew.begin(), aNew.end() );
+
+    toolMgr->RunAction( ACTIONS::selectionClear );
+    toolMgr->RunAction<EDA_ITEMS*>( ACTIONS::selectItems, &items );
+    toolMgr->RunAction( ACTIONS::zoomFitScreen );
+    aFrame->GetCanvas()->Refresh();
+}
+
+struct CC_UPDATE_ARGS
+{
+    long long   run = 0;
+    std::string dir;
+    bool        apply = false;
+    bool        replaceFootprints = true;
+    bool        deleteExtra = false;
+    bool        relinkByReference = false;
+    std::string token;
+};
+
+/**
+ * Update the board, on the apply coroutine: the Update spec's steps 1 to 8. The schematic is
+ * read in this engine (boardSchematicNetlist); a preview runs KiCad's updater as a dry run,
+ * an apply checks the token, runs it for real (one BOARD_COMMIT "Update Netlist"), then
+ * OnNetlistChanged (nets, classes, rules) and ccPlaceNewFootprints. Writes <dir>/report.json
+ * (the engine report) when the updater ran (and for a preview stopped by parts with no number,
+ * so it can list them), then <dir>/.cc-update.json LAST: {error, message, lines}.
+ */
+void ccRunBoardUpdate( const CC_UPDATE_ARGS& aArgs )
+{
+    PLOT_LINES_REPORTER lines;
+    std::string         error;
+    std::string         message;
+
+    ccEnsureDir( aArgs.dir );
+
+    auto finish = [&]()
+                  {
+                      json done = json::object();
+                      done["error"] = error;
+                      done["message"] = message;
+                      done["lines"] = ccLines( lines );
+                      ccWriteJson( aArgs.dir, ".cc-update.json", done );
+                  };
+
+    PCB_EDIT_FRAME* fr = pcbFrame();   // re-resolved on the coroutine (S4)
+
+    if( !fr || !fr->GetBoard() )
+    {
+        error = "island_error";
+        message = "no board editor";
+        finish();
+        return;
+    }
+
+    wxLogNull noLog;
+
+    try
+    {
+        NETLIST        netlist;
+        CC_SCH_NETLIST sch;
+        const bool     read = boardSchematicNetlist( fr, netlist, sch );
+        json           problems = json::array();
+        int            problemWarnings = 0;
+        int            problemErrors = 0;
+
+        for( const json& b : sch.blocked )
+        {
+            problems.push_back( ccProblemRecord( b.value( "code", std::string() ), "error",
+                                                 b.value( "ref", std::string() ),
+                                                 b.value( "message", std::string() ) ) );
+            problemErrors++;
+        }
+
+        for( const json& w : sch.warnings )
+        {
+            problems.push_back( ccProblemRecord( w.value( "code", std::string() ), "warning", "",
+                                                 w.value( "message", std::string() ) ) );
+            lines.Report( wxString::FromUTF8( w.value( "message", std::string() ).c_str() ),
+                          RPT_SEVERITY_WARNING );
+            problemWarnings++;
+        }
+
+        json report = json::object();
+        report["run"] = aArgs.run;
+        report["ok"] = true;
+        report["token"] = "";
+        report["blocked"] = "";
+        report["sheets"] = sch.sheets;
+        report["added"] = json::array();
+        report["truncated"] = false;
+        report["unmapped"] = 0;
+
+        if( !read && sch.error != "not_annotated" )
+        {
+            error = "schematic_unreadable";
+            message = sch.error == "no_schematic" ? "no schematic beside the board: " + sch.message
+                                                  : sch.message;
+            finish();
+            return;
+        }
+
+        if( !read )
+        {
+            if( aArgs.apply )
+            {
+                error = "not_annotated";
+                message = "parts on the schematic have no number";
+                finish();
+                return;
+            }
+
+            report["blocked"] = "not_annotated";
+            report["changes"] = problems;
+            report["warnings"] = problemWarnings;
+            report["errors"] = problemErrors;
+            ccWriteJson( aArgs.dir, "report.json", report );
+            finish();
+            return;
+        }
+
+        netlist.SortByReference();
+        netlist.SetFindByTimeStamp( !aArgs.relinkByReference );
+        netlist.SetReplaceFootprints( aArgs.replaceFootprints );
+
+        const std::string token = ccUpdateToken( netlist, aArgs.replaceFootprints,
+                                                 aArgs.deleteExtra, aArgs.relinkByReference,
+                                                 fr->GetBoard()->GetTimeStamp() );
+
+        if( aArgs.apply && token != aArgs.token )
+        {
+            error = "stale";
+            message = "the board or the schematic changed since the preview";
+            finish();
+            return;
+        }
+
+        TOOL_MANAGER* toolMgr = fr->GetToolManager();
+
+        if( aArgs.apply )
+        {
+            toolMgr->DeactivateTool();
+            toolMgr->RunAction( ACTIONS::selectionClear );
+        }
+
+        CC_COUNTING_REPORTER        counter;
+        std::vector<NETLIST_CHANGE> log;
+        BOARD_NETLIST_UPDATER       updater( fr, fr->GetBoard() );
+
+        updater.SetReporter( &counter );
+        updater.SetChangeLog( &log );
+        updater.SetIsDryRun( !aArgs.apply );
+        updater.SetReplaceFootprints( aArgs.replaceFootprints );
+        updater.SetDeleteUnusedFootprints( aArgs.deleteExtra );
+        updater.SetLookupByTimestamp( !aArgs.relinkByReference );
+        updater.SetTransferGroups( false );
+        updater.SetApplyDesignBlockLayouts( false );
+        updater.SetOverrideLocks( false );
+        updater.SetUpdateFields( true );
+        updater.SetRemoveExtraFields( false );
+        updater.UpdateNetlist( netlist );
+
+        json added = json::array();
+
+        if( aArgs.apply )
+        {
+            bool drag = false;   // never started: the parts are placed beside the board instead
+            fr->OnNetlistChanged( updater, &drag );
+
+            std::vector<FOOTPRINT*> fresh = updater.GetAddedFootprints();
+            ccPlaceNewFootprints( fr, fresh );
+
+            for( FOOTPRINT* fp : fresh )
+                added.push_back( ccText( fp->GetReference() ) );
+        }
+
+        json changes = problems;
+        bool truncated = false;
+
+        for( const NETLIST_CHANGE& change : log )
+        {
+            if( changes.size() >= 4096 )
+            {
+                truncated = true;
+                break;
+            }
+
+            json record = ccChangeRecord( change );
+
+            if( !aArgs.apply && record["kind"] == "add" )
+                ccFillAddRecord( fr, netlist, record );
+
+            changes.push_back( std::move( record ) );
+        }
+
+        report["token"] = aArgs.apply ? "" : token;
+        report["changes"] = std::move( changes );
+        report["added"] = std::move( added );
+        report["warnings"] = counter.m_warnings + problemWarnings;
+        report["errors"] = counter.m_errors + problemErrors;
+        report["truncated"] = truncated;
+        report["unmapped"] =
+                counter.m_actions + counter.m_warnings + counter.m_errors - (int) log.size();
+
+        ccWriteJson( aArgs.dir, "report.json", report );
+    }
+    catch( const std::exception& e )
+    {
+        error = "island_error";
+        message = e.what();
+    }
+    catch( ... )
+    {
+        error = "island_error";
+        message = "the update failed";
+    }
+
+    finish();
+}
+
+// ───────────────────────────── the board check ─────────────────────────────
+
+/** Where a rule came from, and its name as the page shows it (a net class's own name). */
+std::pair<std::string, std::string> ccRuleSource( const DRC_RULE* aRule )
+{
+    if( !aRule )
+        return { "other", "" };
+
+    const wxString name = aRule->m_Name;
+
+    // The implicit rules are named "netclass 'Power'", "keepout area 'X'", "tuning profile 'Y'".
+    auto quoted = [&]() -> std::string
+                  {
+                      int first = name.Find( '\'' );
+                      int last = name.Find( '\'', true );
+
+                      if( first != wxNOT_FOUND && last > first )
+                          return ccText( name.Mid( first + 1, last - first - 1 ) );
+
+                      return "";
+                  };
+
+    switch( aRule->GetImplicitSource() )
+    {
+    case DRC_IMPLICIT_SOURCE::NONE:                   return { "custom", ccText( name ) };
+    case DRC_IMPLICIT_SOURCE::BOARD_SETUP_CONSTRAINT: return { "board", "" };
+    case DRC_IMPLICIT_SOURCE::NET_CLASS:              return { "netclass", quoted() };
+    case DRC_IMPLICIT_SOURCE::KEEPOUT:                return { "keepout", quoted() };
+    case DRC_IMPLICIT_SOURCE::TUNING_PROFILE:         return { "tuning", quoted() };
+    default:                                          return { "other", ccText( name ) };
+    }
+}
+
+/** One item a finding names, in the island's closed shape. */
+json ccDrcItem( EDA_ITEM* aItem, UNITS_PROVIDER& aUnits )
+{
+    json r = json::object();
+    r["uuid"] = toUtf8( aItem->m_Uuid.AsString() );
+    r["kind"] = "other";
+    r["ref"] = "";
+    r["pad"] = "";
+    r["net"] = "";
+    r["layer"] = "";
+    r["parent"] = "";
+    r["description"] = ccText( aItem->GetItemDescription( &aUnits, true ) );
+
+    BOARD_ITEM* item = aItem->IsBOARD_ITEM() ? static_cast<BOARD_ITEM*>( aItem ) : nullptr;
+
+    if( !item )
+        return r;
+
+    FOOTPRINT* parent = item->GetParentFootprint();
+
+    if( parent && item->Type() != PCB_FOOTPRINT_T )
+    {
+        r["ref"] = ccText( parent->GetReference() );
+        r["parent"] = toUtf8( parent->m_Uuid.AsString() );
+    }
+
+    if( BOARD_CONNECTED_ITEM* connected = dynamic_cast<BOARD_CONNECTED_ITEM*>( item ) )
+        r["net"] = ccNet( connected->GetNetname() );
+
+    switch( item->Type() )
+    {
+    case PCB_PAD_T:
+    {
+        PAD* pad = static_cast<PAD*>( item );
+        r["kind"] = pad->GetAttribute() == PAD_ATTRIB::NPTH && pad->GetNumber().IsEmpty()
+                            ? "hole" : "pad";
+        r["pad"] = ccText( pad->GetNumber() );
+        break;
+    }
+
+    case PCB_TRACE_T:
+        r["kind"] = "track";
+        r["layer"] = ccLayer( item->GetLayer() );
+        break;
+
+    case PCB_ARC_T:
+        r["kind"] = "arc";
+        r["layer"] = ccLayer( item->GetLayer() );
+        break;
+
+    case PCB_VIA_T:
+        r["kind"] = "via";
+        break;
+
+    case PCB_ZONE_T:
+        r["kind"] = "zone";
+        r["layer"] = ccLayer( static_cast<ZONE*>( item )->GetFirstLayer() );
+        break;
+
+    case PCB_FOOTPRINT_T:
+        r["kind"] = "footprint";
+        r["ref"] = ccText( static_cast<FOOTPRINT*>( item )->GetReference() );
+        r["layer"] = ccLayer( item->GetLayer() );
+        break;
+
+    case PCB_FIELD_T:
+        r["kind"] = "field";
+        r["layer"] = ccLayer( item->GetLayer() );
+        break;
+
+    case PCB_TEXT_T:
+        r["kind"] = "text";
+        r["layer"] = ccLayer( item->GetLayer() );
+        break;
+
+    case PCB_SHAPE_T:
+        r["kind"] = item->GetLayer() == Edge_Cuts ? "outline" : "shape";
+        r["layer"] = ccLayer( item->GetLayer() );
+        break;
+
+    default:
+        r["layer"] = ccLayer( item->GetLayer() );
+        break;
+    }
+
+    return r;
+}
+
+/** "actual 0.1500 mm" in KiCad's message, in mm; null when the message carries none. */
+json ccActual( const wxString& aMessage )
+{
+    const std::string text = toUtf8( aMessage );
+    const std::string key = "actual ";
+    size_t            at = text.find( key );
+
+    if( at == std::string::npos )
+        return nullptr;
+
+    at += key.size();
+    char*        end = nullptr;
+    const char*  start = text.c_str() + at;
+    const double value = std::strtod( start, &end );
+
+    if( end == start || !std::isfinite( value ) )
+        return nullptr;
+
+    while( *end == ' ' )
+        ++end;
+
+    if( std::strncmp( end, "mm", 2 ) != 0 )
+        return nullptr;
+
+    return ccRound( value, 10000.0 );
+}
+
+struct CC_CHECK_COUNTS
+{
+    int errors = 0;
+    int warnings = 0;
+    int excluded = 0;
+    int listed = 0;
+    bool truncated = false;
+};
+
+/** The findings of one provider, appended to aOut until the island's cap of 4,096 in all. */
+void ccCollectFindings( BOARD* aBoard, DRC_ITEMS_PROVIDER& aProvider,
+                        std::map<KIID, EDA_ITEM*>& aItemMap, UNITS_PROVIDER& aUnits, json& aOut,
+                        CC_CHECK_COUNTS& aCounts )
+{
+    BOARD_DESIGN_SETTINGS& bds = aBoard->GetDesignSettings();
+
+    for( int i = 0; i < aProvider.GetCount(); ++i )
+    {
+        const std::shared_ptr<RC_ITEM> item = aProvider.GetItem( i );
+        PCB_MARKER* marker = item ? dynamic_cast<PCB_MARKER*>( item->GetParent() ) : nullptr;
+
+        if( !marker )
+            continue;
+
+        const bool     excluded = marker->IsTreatedAsExcluded();
+        const SEVERITY severity = bds.GetSeverity( item->GetErrorCode() );
+        const char*    word = severity == RPT_SEVERITY_ERROR ? "error" : "warning";
+
+        if( excluded )
+            aCounts.excluded++;
+        else if( severity == RPT_SEVERITY_ERROR )
+            aCounts.errors++;
+        else
+            aCounts.warnings++;
+
+        if( aCounts.listed >= 4096 )
+        {
+            aCounts.truncated = true;
+            continue;
+        }
+
+        json finding = json::object();
+        finding["marker"] = toUtf8( marker->m_Uuid.AsString() );
+        finding["type"] = ccText( item->GetSettingsKey() );
+        finding["severity"] = word;
+        finding["excluded"] = excluded;
+        finding["comment"] = excluded ? ccText( marker->GetComment() ) : std::string();
+        finding["layer"] = ccLayer( marker->GetLayer() );
+        finding["x"] = ccMm( marker->GetPosition().x );
+        finding["y"] = ccMm( marker->GetPosition().y );
+
+        json items = json::array();
+
+        for( const KIID& id : item->GetIDs() )
+        {
+            if( items.size() >= 64 )
+                break;
+
+            auto it = aItemMap.find( id );
+
+            if( it != aItemMap.end() && it->second )
+                items.push_back( ccDrcItem( it->second, aUnits ) );
+        }
+
+        finding["items"] = std::move( items );
+
+        const DRC_ITEM* drcItem = dynamic_cast<const DRC_ITEM*>( item.get() );
+
+        if( const DRC_RULE* rule = drcItem ? drcItem->GetViolatingRule() : nullptr )
+        {
+            auto [source, name] = ccRuleSource( rule );
+            json r = json::object();
+            r["source"] = source;
+            r["name"] = name;
+            finding["rule"] = std::move( r );
+        }
+        else
+        {
+            finding["rule"] = nullptr;
+        }
+
+        finding["actual"] = ccActual( item->GetErrorMessage( false ) );
+        finding["message"] = ccText( item->GetErrorMessage( false ) );
+
+        aOut.push_back( std::move( finding ) );
+        aCounts.listed++;
+    }
+}
+
+/**
+ * Check the board, on the apply coroutine: the DRC dialog's preparation and the DRC job's
+ * body, minus the job's library wait (FootprintLibAdapter AsyncLoad + BlockUntilLoaded would
+ * queue every footprint library the island serves): the custom rules compiled first (a parse
+ * error ends the run, rules_invalid, as KiCad's dialog stops), the copper areas filled when
+ * asked (headless, its own undo step), the schematic read for parity when asked
+ * (boardSchematicNetlist), the marks the reader has selected unselected, the exclusions
+ * recorded, the old marks deleted, RunTests in mm, the marks pushed with no undo step and the
+ * board not marked changed, the exclusions resolved. Writes <dir>/drc.json (the island's
+ * BoardCheckResult, every finding, excluded ones flagged) then <dir>/.cc-drc.json LAST:
+ * {code, error, message, lines}.
+ */
+void ccRunBoardCheck( const std::string& aDir, bool aFill, bool aParity, bool aAllTrackErrors )
+{
+    PLOT_LINES_REPORTER lines;
+    int                 code = -1;
+    std::string         error;
+    std::string         message;
+
+    ccEnsureDir( aDir );
+
+    auto finish = [&]()
+                  {
+                      json done = json::object();
+                      done["code"] = code;
+                      done["error"] = error;
+                      done["message"] = message;
+                      done["lines"] = ccLines( lines );
+                      ccWriteJson( aDir, ".cc-drc.json", done );
+                  };
+
+    PCB_EDIT_FRAME* fr = pcbFrame();   // re-resolved on the coroutine (S4)
+
+    if( !fr || !fr->GetBoard() )
+    {
+        lines.Report( wxS( "no board editor to check" ), RPT_SEVERITY_ERROR );
+        finish();
+        return;
+    }
+
+    wxLogNull noLog;
+
+    try
+    {
+        BOARD*                      board = fr->GetBoard();
+        TOOL_MANAGER*               toolMgr = fr->GetToolManager();
+        DRC_TOOL*                   drcTool = toolMgr->GetTool<DRC_TOOL>();
+        std::shared_ptr<DRC_ENGINE> engine = drcTool ? drcTool->GetDRCEngine()
+                                                     : board->GetDesignSettings().m_DRCEngine;
+
+        try
+        {
+            engine->InitEngine( fr->GetDesignRulesPath() );
+        }
+        catch( const PARSE_ERROR& e )
+        {
+            error = "rules_invalid";
+            message = toUtf8( e.What() );
+            finish();
+            return;
+        }
+
+        bool filled = false;
+
+        if( aFill )
+        {
+            ZONE_FILLER_TOOL* filler = toolMgr->GetTool<ZONE_FILLER_TOOL>();
+            const int         before = fr->GetUndoCommandCount();
+
+            if( filler && !filler->IsBusy() )
+            {
+                filler->FillAllZones( nullptr, nullptr, /*aHeadless*/ true );
+                fr->m_ZoneFillsDirty = false;
+            }
+
+            filled = fr->GetUndoCommandCount() != before;
+        }
+
+        std::string parityRun = "off";
+        NETLIST     netlist;
+
+        if( aParity )
+        {
+            wxFileName schematic( board->GetFileName() );
+            schematic.SetExt( FILEEXT::KiCadSchematicFileExtension );
+
+            if( !schematic.FileExists() )
+            {
+                parityRun = "no_schematic";
+            }
+            else
+            {
+                CC_SCH_NETLIST sch;
+
+                if( boardSchematicNetlist( fr, netlist, sch ) )
+                {
+                    parityRun = "yes";
+                }
+                else if( sch.error == "not_annotated" )
+                {
+                    parityRun = "not_annotated";
+                }
+                else
+                {
+                    parityRun = "unreadable";
+                    lines.Report( wxString::FromUTF8( sch.message.c_str() ), RPT_SEVERITY_WARNING );
+                }
+            }
+        }
+
+        // The dialog clears the selection before it deletes the marks; only a selected mark
+        // would be left dangling, so the reader's selection is kept otherwise.
+        if( PCB_SELECTION_TOOL* selTool = toolMgr->GetTool<PCB_SELECTION_TOOL>() )
+        {
+            bool markSelected = false;
+
+            for( EDA_ITEM* item : selTool->GetSelection() )
+                markSelected = markSelected || item->Type() == PCB_MARKER_T;
+
+            if( markSelected )
+                selTool->ClearSelection();
+        }
+
+        BOARD_COMMIT commit( fr );
+
+        engine->SetDrawingSheet( fr->GetCanvas()->GetDrawingSheet() );
+        engine->SetSchematicNetlist( parityRun == "yes" ? &netlist : nullptr );
+        engine->SetProgressReporter( nullptr );
+        engine->SetViolationHandler(
+                [&]( const std::shared_ptr<DRC_ITEM>& aItem, const VECTOR2I& aPos, int aLayer,
+                     const std::function<void( PCB_MARKER* )>& aPathGenerator )
+                {
+                    PCB_MARKER* marker = new PCB_MARKER( aItem, aPos, aLayer );
+                    aPathGenerator( marker );
+                    commit.Add( marker );
+                } );
+
+        board->RecordDRCExclusions();
+        board->DeleteMARKERs( true, true );
+        engine->RunTests( EDA_UNITS::MM, aAllTrackErrors, parityRun == "yes", &commit );
+        engine->ClearViolationHandler();
+        engine->SetSchematicNetlist( nullptr );   // the netlist dies with this run
+
+        commit.Push( _( "DRC" ), SKIP_UNDO | SKIP_SET_DIRTY );
+        board->ResolveDRCExclusions( false );
+
+        const int severities = RPT_SEVERITY_ERROR | RPT_SEVERITY_WARNING | RPT_SEVERITY_EXCLUSION;
+        DRC_ITEMS_PROVIDER markers( board, MARKER_BASE::MARKER_DRC, MARKER_BASE::MARKER_DRAWING_SHEET );
+        DRC_ITEMS_PROVIDER ratsnest( board, MARKER_BASE::MARKER_RATSNEST );
+        DRC_ITEMS_PROVIDER parity( board, MARKER_BASE::MARKER_PARITY );
+
+        markers.SetSeverities( severities );
+        ratsnest.SetSeverities( severities );
+        parity.SetSeverities( severities );
+
+        std::map<KIID, EDA_ITEM*> itemMap;
+        board->FillItemMap( itemMap );
+
+        UNITS_PROVIDER  units( pcbIUScale, EDA_UNITS::MM );
+        CC_CHECK_COUNTS counts;
+        json            violations = json::array();
+        json            unconnected = json::array();
+        json            parityList = json::array();
+
+        ccCollectFindings( board, markers, itemMap, units, violations, counts );
+        ccCollectFindings( board, ratsnest, itemMap, units, unconnected, counts );
+        ccCollectFindings( board, parity, itemMap, units, parityList, counts );
+
+        json ignored = json::array();
+
+        for( const RC_ITEM& item : DRC_ITEM::GetItemsWithSeverities() )
+        {
+            const int errorCode = item.GetErrorCode();
+
+            if( errorCode > 0 && board->GetDesignSettings().Ignore( errorCode )
+                    && ignored.size() < 128 )
+            {
+                ignored.push_back( ccText( item.GetSettingsKey() ) );
+            }
+        }
+
+        json result = json::object();
+        result["violations"] = std::move( violations );
+        result["unconnected"] = std::move( unconnected );
+        result["parity"] = std::move( parityList );
+        result["parityRun"] = parityRun;
+        result["filled"] = filled;
+        result["skipped"] = json::array();
+        result["ignored"] = std::move( ignored );
+        result["errors"] = counts.errors;
+        result["warnings"] = counts.warnings;
+        result["excludedCount"] = counts.excluded;
+        result["depth"] = pcbjam_collab::testUndoDepth( fr );
+
+        if( counts.truncated )
+            result["truncated"] = true;
+
+        ccWriteJson( aDir, "drc.json", result );
+
+        // The new marks into the view (the dialog's own refresh after a run).
+        fr->GetCanvas()->Refresh();
+        code = 0;
+    }
+    catch( const std::exception& e )
+    {
+        lines.Report( wxString::Format( wxS( "the check failed: %s" ),
+                                        wxString::FromUTF8( e.what() ) ),
+                      RPT_SEVERITY_ERROR );
+    }
+    catch( ... )
+    {
+        lines.Report( wxS( "the check failed" ), RPT_SEVERITY_ERROR );
+    }
+
+    finish();
+}
+
+// ───────────────────────────── why a rule applies ─────────────────────────────
+
+/** The constraint a DRC error code is explained by: InspectDRCError's own table. */
+bool ccExplainedConstraint( int aCode, const char*& aKind, DRC_CONSTRAINT_T& aType )
+{
+    switch( aCode )
+    {
+    case DRCE_CLEARANCE:                          aKind = "clearance";            aType = CLEARANCE_CONSTRAINT;            return true;
+    case DRCE_HOLE_CLEARANCE:                     aKind = "hole_clearance";       aType = HOLE_CLEARANCE_CONSTRAINT;       return true;
+    case DRCE_DRILLED_HOLES_TOO_CLOSE:            aKind = "hole_to_hole";         aType = HOLE_TO_HOLE_CONSTRAINT;         return true;
+    case DRCE_EDGE_CLEARANCE:                     aKind = "edge_clearance";       aType = EDGE_CLEARANCE_CONSTRAINT;       return true;
+    case DRCE_TRACK_WIDTH:                        aKind = "track_width";          aType = TRACK_WIDTH_CONSTRAINT;          return true;
+    case DRCE_TRACK_ANGLE:                        aKind = "track_angle";          aType = TRACK_ANGLE_CONSTRAINT;          return true;
+    case DRCE_TRACK_SEGMENT_LENGTH:               aKind = "track_segment_length"; aType = TRACK_SEGMENT_LENGTH_CONSTRAINT; return true;
+    case DRCE_CONNECTION_WIDTH:                   aKind = "connection_width";     aType = CONNECTION_WIDTH_CONSTRAINT;     return true;
+    case DRCE_VIA_DIAMETER:                       aKind = "via_diameter";         aType = VIA_DIAMETER_CONSTRAINT;         return true;
+    case DRCE_ANNULAR_WIDTH:                      aKind = "annular_width";        aType = ANNULAR_WIDTH_CONSTRAINT;        return true;
+    case DRCE_DRILL_OUT_OF_RANGE:
+    case DRCE_MICROVIA_DRILL_OUT_OF_RANGE:        aKind = "hole_size";            aType = HOLE_SIZE_CONSTRAINT;            return true;
+    case DRCE_TEXT_HEIGHT:                        aKind = "text_height";          aType = TEXT_HEIGHT_CONSTRAINT;          return true;
+    case DRCE_TEXT_THICKNESS:                     aKind = "text_thickness";       aType = TEXT_THICKNESS_CONSTRAINT;       return true;
+    case DRCE_DIFF_PAIR_UNCOUPLED_LENGTH_TOO_LONG: aKind = "max_uncoupled";       aType = MAX_UNCOUPLED_CONSTRAINT;        return true;
+    case DRCE_ASSERTION_FAILURE:                  aKind = "assertion";            aType = ASSERTION_CONSTRAINT;            return true;
+    default:                                      return false;
+    }
+}
+
+/** A connected item's effective net class name; "" for an item that has none. */
+std::string ccNetclass( const BOARD_ITEM* aItem )
+{
+    const BOARD_CONNECTED_ITEM* connected = dynamic_cast<const BOARD_CONNECTED_ITEM*>( aItem );
+
+    if( !connected )
+        return "";
+
+    if( NETCLASS* nc = connected->GetEffectiveNetClass() )
+        return ccText( nc->GetHumanReadableName() );
+
+    return "";
+}
+
+/**
+ * Why a mark's rule applies: BOARD_INSPECTION_TOOL::InspectDRCError's evaluation, with no
+ * dialog and a fresh rules engine as it builds one (makeDRCEngine): the constraint its error
+ * code is explained by, evaluated for the mark's two items on the layer InspectDRCError picks
+ * (the mark's own layer, else the active layer). For a clearance or a hole clearance KiCad
+ * weighs the electrical and the physical constraint; the answer is the one whose minimum is
+ * larger, the one that raised the mark. JSON as the island's ExplainResult; {"constraint":
+ * "none"} for a code KiCad does not explain, {"constraint":"none","error":"rules_invalid"}
+ * when the custom rules do not compile.
+ */
+std::string ccExplain( PCB_EDIT_FRAME* aFrame, PCB_MARKER* aMarker )
+{
+    BOARD*                   board = aFrame->GetBoard();
+    std::shared_ptr<RC_ITEM> rc = aMarker->GetRCItem();
+    json                     none = json::object();
+
+    none["constraint"] = "none";
+
+    const char*      kind = nullptr;
+    DRC_CONSTRAINT_T type = NULL_CONSTRAINT;
+
+    if( !rc || !ccExplainedConstraint( rc->GetErrorCode(), kind, type ) )
+        return none.dump();
+
+    DRC_ENGINE engine( board, &board->GetDesignSettings() );
+
+    try
+    {
+        engine.InitEngine( aFrame->GetDesignRulesPath() );
+    }
+    catch( const PARSE_ERROR& )
+    {
+        none["error"] = "rules_invalid";
+        return none.dump();
+    }
+
+    for( ZONE* zone : board->Zones() )
+        zone->CacheBoundingBox();
+
+    for( FOOTPRINT* footprint : board->Footprints() )
+    {
+        for( ZONE* zone : footprint->Zones() )
+            zone->CacheBoundingBox();
+
+        footprint->BuildCourtyardCaches();
+    }
+
+    BOARD_ITEM* a = board->ResolveItem( rc->GetMainItemID(), true );
+    BOARD_ITEM* b = board->ResolveItem( rc->GetAuxItemID(), true );
+
+    if( !a )
+        return none.dump();
+
+    const BOARD_CONNECTED_ITEM* ac = dynamic_cast<const BOARD_CONNECTED_ITEM*>( a );
+    const BOARD_CONNECTED_ITEM* bc = dynamic_cast<const BOARD_CONNECTED_ITEM*>( b );
+    PCB_LAYER_ID                layer = aMarker->GetLayer();
+
+    if( layer < 0 || layer >= PCB_LAYER_ID_COUNT )
+        layer = aFrame->GetActiveLayer();
+
+    DRC_CONSTRAINT constraint;
+
+    if( type == MAX_UNCOUPLED_CONSTRAINT )
+    {
+        for( const KIID& id : rc->GetIDs() )
+        {
+            b = board->ResolveItem( id, true );
+            bc = dynamic_cast<const BOARD_CONNECTED_ITEM*>( b );
+
+            if( ac && bc && ac->GetNetCode() != bc->GetNetCode() )
+                break;
+        }
+
+        constraint = engine.EvalRules( type, a, b, layer, nullptr );
+    }
+    else if( type == ASSERTION_CONSTRAINT )
+    {
+        bool found = false;
+
+        engine.ProcessAssertions( a,
+                                  [&]( const DRC_CONSTRAINT* aFailed )
+                                  {
+                                      if( !found && aFailed )
+                                      {
+                                          constraint = *aFailed;
+                                          found = true;
+                                      }
+                                  } );
+
+        if( !found )
+            return none.dump();
+    }
+    else if( type == CLEARANCE_CONSTRAINT || type == HOLE_CLEARANCE_CONSTRAINT )
+    {
+        if( type == CLEARANCE_CONSTRAINT && b )
+        {
+            // InspectDRCError's layer for a clearance: the track's, else an SMD pad's side.
+            if( a->Type() == PCB_TRACE_T || a->Type() == PCB_ARC_T )
+                layer = a->GetLayer();
+            else if( b->Type() == PCB_TRACE_T || b->Type() == PCB_ARC_T )
+                layer = b->GetLayer();
+            else if( a->Type() == PCB_PAD_T
+                     && static_cast<PAD*>( a )->GetAttribute() == PAD_ATTRIB::SMD )
+                layer = static_cast<PAD*>( a )->IsOnLayer( F_Cu ) ? F_Cu : B_Cu;
+            else if( b->Type() == PCB_PAD_T
+                     && static_cast<PAD*>( b )->GetAttribute() == PAD_ATTRIB::SMD )
+                layer = static_cast<PAD*>( b )->IsOnLayer( F_Cu ) ? F_Cu : B_Cu;
+        }
+
+        const DRC_CONSTRAINT_T physical = type == CLEARANCE_CONSTRAINT
+                                                  ? PHYSICAL_CLEARANCE_CONSTRAINT
+                                                  : PHYSICAL_HOLE_CLEARANCE_CONSTRAINT;
+        const bool sameNet = ac && bc && ac->GetNetCode() == bc->GetNetCode();
+        bool       have = false;
+
+        if( !sameNet )
+        {
+            constraint = engine.EvalRules( type, a, b, layer, nullptr );
+            have = true;
+        }
+
+        if( engine.HasRulesForConstraintType( physical ) )
+        {
+            DRC_CONSTRAINT phys = engine.EvalRules( physical, a, b, layer, nullptr );
+
+            if( !have || ( phys.m_Value.HasMin() && phys.m_Value.Min() > constraint.m_Value.Min() ) )
+            {
+                constraint = phys;
+                have = true;
+            }
+        }
+
+        if( !have )
+            return none.dump();
+    }
+    else
+    {
+        if( type == HOLE_TO_HOLE_CONSTRAINT )
+            layer = UNDEFINED_LAYER;
+
+        constraint = engine.EvalRules( type, a, b, layer, nullptr );
+    }
+
+    const bool degrees = type == TRACK_ANGLE_CONSTRAINT;
+    auto       value = [&]( bool aHas, int aIU ) -> json
+                       {
+                           if( !aHas )
+                               return nullptr;
+
+                           return degrees ? json( (double) aIU ) : json( ccMm( aIU ) );
+                       };
+
+    json r = json::object();
+    r["constraint"] = kind;
+    r["unit"] = degrees ? "deg" : "mm";
+    r["min"] = value( constraint.m_Value.HasMin(), constraint.m_Value.HasMin() ? constraint.m_Value.Min() : 0 );
+    r["opt"] = value( constraint.m_Value.HasOpt(), constraint.m_Value.HasOpt() ? constraint.m_Value.Opt() : 0 );
+    r["max"] = value( constraint.m_Value.HasMax(), constraint.m_Value.HasMax() ? constraint.m_Value.Max() : 0 );
+
+    std::string source = "other";
+    std::string name;
+    std::string condition;
+
+    if( const DRC_RULE* rule = constraint.GetParentRule() )
+    {
+        std::tie( source, name ) = ccRuleSource( rule );
+
+        if( !rule->IsImplicit() && rule->m_Condition )
+            condition = ccText( rule->m_Condition->GetExpression(), 2048 );
+    }
+    else
+    {
+        // A constraint resolved without a rule: DRC_ENGINE::EvalRules names it.
+        const std::string named = toUtf8( constraint.GetName() );
+
+        if( named == "board setup" || named == "board minimum" || named.empty() )
+            source = "board";
+        else if( named == "net tie" )
+            source = "netTie";
+        else
+            source = "local";
+
+        name = source == "local" ? ccText( constraint.GetName() ) : std::string();
+    }
+
+    r["source"] = source;
+    r["name"] = source == "board" ? std::string() : name;
+    r["condition"] = condition;
+    r["layer"] = ccLayer( layer );
+
+    json items = json::array();
+
+    for( const BOARD_ITEM* item : { (const BOARD_ITEM*) a, (const BOARD_ITEM*) b } )
+    {
+        if( !item )
+            continue;
+
+        json entry = json::object();
+        entry["uuid"] = toUtf8( item->m_Uuid.AsString() );
+        entry["netclass"] = ccNetclass( item );
+        items.push_back( std::move( entry ) );
+    }
+
+    r["items"] = std::move( items );
+    return r.dump( -1, ' ', false, json::error_handler_t::replace );
+}
+
+// ───────────────────────────── the board item's properties ─────────────────────────────
+
+/** Degrees in (-180, 180], 3 decimals. */
+double ccDegrees( EDA_ANGLE aAngle )
+{
+    double deg = aAngle.Normalize180().AsDegrees();
+
+    if( deg <= -180.0 )
+        deg += 360.0;
+
+    return ccRound( deg, 1000.0 );
+}
+
+const char* ccPadConnection( ZONE_CONNECTION aConnection )
+{
+    switch( aConnection )
+    {
+    case ZONE_CONNECTION::FULL:        return "solid";
+    case ZONE_CONNECTION::NONE:        return "none";
+    case ZONE_CONNECTION::THT_THERMAL: return "thtThermal";
+    default:                           return "thermal";
+    }
+}
+
+const char* ccHAlign( GR_TEXT_H_ALIGN_T aAlign )
+{
+    switch( aAlign )
+    {
+    case GR_TEXT_H_ALIGN_LEFT:  return "left";
+    case GR_TEXT_H_ALIGN_RIGHT: return "right";
+    default:                    return "center";
+    }
+}
+
+/** The kind a board item answers as; "" for a kind the window does not edit. */
+std::string ccEditableKind( const BOARD_ITEM* aItem )
+{
+    switch( aItem->Type() )
+    {
+    case PCB_FOOTPRINT_T: return "footprint";
+    case PCB_TRACE_T:     return "track";
+    case PCB_ARC_T:       return "arc";
+    case PCB_VIA_T:       return "via";
+
+    case PCB_ZONE_T:
+    {
+        const ZONE* zone = static_cast<const ZONE*>( aItem );
+        return zone->GetIsRuleArea() || zone->GetParentFootprint() ? "" : "zone";
+    }
+
+    case PCB_TEXT_T:
+        return aItem->GetParentFootprint() ? "" : "text";
+
+    default:
+        return "";
+    }
+}
+
+/** The OtherSheet type of an item the window does not edit. */
+const char* ccOtherType( const BOARD_ITEM* aItem )
+{
+    switch( aItem->Type() )
+    {
+    case PCB_PAD_T:              return "pad";
+    case PCB_SHAPE_T:            return "shape";
+    case PCB_DIM_ALIGNED_T:
+    case PCB_DIM_LEADER_T:
+    case PCB_DIM_CENTER_T:
+    case PCB_DIM_RADIAL_T:
+    case PCB_DIM_ORTHOGONAL_T:   return "dimension";
+    case PCB_TEXTBOX_T:          return "textbox";
+    case PCB_TABLE_T:
+    case PCB_TABLECELL_T:        return "table";
+    case PCB_GROUP_T:            return "group";
+    case PCB_REFERENCE_IMAGE_T:  return "image";
+    case PCB_BARCODE_T:          return "barcode";
+    case PCB_MARKER_T:           return "marker";
+    case PCB_ZONE_T:
+        return static_cast<const ZONE*>( aItem )->GetIsRuleArea() ? "rulearea" : "other";
+    default:                     return "other";
+    }
+}
+
+/** One item's sheet in the island's closed shape (BoardItemSheet). */
+json ccItemSheet( BOARD* aBoard, BOARD_ITEM* aItem )
+{
+    json r = json::object();
+    r["uuid"] = toUtf8( aItem->m_Uuid.AsString() );
+
+    const std::string kind = ccEditableKind( aItem );
+
+    if( kind.empty() )
+    {
+        r["kind"] = "other";
+        r["type"] = ccOtherType( aItem );
+        return r;
+    }
+
+    r["kind"] = kind;
+    r["locked"] = aItem->IsLocked();
+
+    if( kind == "footprint" )
+    {
+        FOOTPRINT*     fp = static_cast<FOOTPRINT*>( aItem );
+        const wxString variant = aBoard->GetCurrentVariant();
+
+        r["ref"] = ccText( fp->GetReference() );
+        r["value"] = ccText( fp->GetValue() );
+        r["libId"] = ccText( fp->GetFPIDAsString() );
+        r["side"] = fp->IsFlipped() ? "back" : "front";
+        r["x"] = ccMm( fp->GetPosition().x );
+        r["y"] = ccMm( fp->GetPosition().y );
+        r["rotation"] = ccDegrees( fp->GetOrientation() );
+        r["inBom"] = variant.IsEmpty() ? !fp->IsExcludedFromBOM()
+                                       : !fp->GetExcludedFromBOMForVariant( variant );
+        r["inPos"] = variant.IsEmpty() ? !fp->IsExcludedFromPosFiles()
+                                       : !fp->GetExcludedFromPosFilesForVariant( variant );
+        r["dnp"] = variant.IsEmpty() ? fp->IsDNP() : fp->GetDNPForVariant( variant );
+        r["boardOnly"] = fp->IsBoardOnly();
+        r["variant"] = ccText( variant );
+        r["symbolPath"] = ccText( fp->GetPath().AsString() );
+    }
+    else if( kind == "track" || kind == "arc" )
+    {
+        PCB_TRACK* track = static_cast<PCB_TRACK*>( aItem );
+
+        r["net"] = ccNet( track->GetNetname() );
+        r["layer"] = ccLayer( track->GetLayer() );
+        r["width"] = ccMm( track->GetWidth() );
+        r["length"] = ccRound( pcbIUScale.IUTomm( 1 ) * track->GetLength(), 10000.0 );
+    }
+    else if( kind == "via" )
+    {
+        PCB_VIA*     via = static_cast<PCB_VIA*>( aItem );
+        PCB_LAYER_ID top = F_Cu;
+        PCB_LAYER_ID bottom = B_Cu;
+
+        via->LayerPair( &top, &bottom );
+
+        r["net"] = ccNet( via->GetNetname() );
+        r["x"] = ccMm( via->GetPosition().x );
+        r["y"] = ccMm( via->GetPosition().y );
+        r["diameter"] = ccMm( via->GetWidth( top ) );
+        r["drill"] = ccMm( via->GetDrillValue() );
+
+        switch( via->GetViaType() )
+        {
+        case VIATYPE::BLIND:    r["viaType"] = "blind";   break;
+        case VIATYPE::BURIED:   r["viaType"] = "buried";  break;
+        case VIATYPE::MICROVIA: r["viaType"] = "micro";   break;
+        default:                r["viaType"] = "through"; break;
+        }
+
+        r["top"] = ccLayer( top );
+        r["bottom"] = ccLayer( bottom );
+    }
+    else if( kind == "zone" )
+    {
+        ZONE* zone = static_cast<ZONE*>( aItem );
+        json  layers = json::array();
+
+        for( PCB_LAYER_ID layer : zone->GetLayerSet().Seq() )
+            layers.push_back( ccLayer( layer ) );
+
+        std::vector<std::string> nets;
+
+        for( NETINFO_ITEM* net : aBoard->GetNetInfo() )
+        {
+            if( net && net->GetNetCode() > 0 )
+                nets.push_back( ccNet( net->GetNetname() ) );
+        }
+
+        std::sort( nets.begin(), nets.end() );
+        nets.erase( std::unique( nets.begin(), nets.end() ), nets.end() );
+
+        if( nets.size() > 4096 )
+            nets.resize( 4096 );
+
+        r["name"] = ccText( zone->GetZoneName() );
+        r["net"] = ccNet( zone->GetNetname() );
+        r["layers"] = std::move( layers );
+        r["priority"] = (int) zone->GetAssignedPriority();
+        r["clearance"] = ccMm( zone->GetLocalClearance().value_or( 0 ) );
+        r["minWidth"] = ccMm( zone->GetMinThickness() );
+        r["padConnection"] = ccPadConnection( zone->GetPadConnection() );
+        r["thermalGap"] = ccMm( zone->GetThermalReliefGap() );
+        r["spokeWidth"] = ccMm( zone->GetThermalReliefSpokeWidth() );
+        r["netChoices"] = nets;
+    }
+    else   // text
+    {
+        PCB_TEXT* text = static_cast<PCB_TEXT*>( aItem );
+
+        r["text"] = ccText( text->GetText(), 4096 );
+        r["layer"] = ccLayer( text->GetLayer() );
+        r["x"] = ccMm( text->GetTextPos().x );
+        r["y"] = ccMm( text->GetTextPos().y );
+        r["rotation"] = ccDegrees( text->GetTextAngle() );
+        r["height"] = ccMm( text->GetTextHeight() );
+        r["width"] = ccMm( text->GetTextWidth() );
+        r["thickness"] = ccMm( text->GetTextThickness() );
+        r["bold"] = text->IsBold();
+        r["italic"] = text->IsItalic();
+        r["knockout"] = text->IsKnockout();
+        r["mirrored"] = text->IsMirrored();
+        r["hAlign"] = ccHAlign( text->GetHorizJustify() );
+    }
+
+    return r;
+}
+
+/** A plain one-line string: no control character. */
+bool ccPlain( const std::string& aText )
+{
+    for( unsigned char c : aText )
+    {
+        if( c < 0x20 || c == 0x7f )
+            return false;
+    }
+
+    return true;
+}
+
+/** Text of a board text: line breaks and tabs allowed, no other control character. */
+bool ccTextBody( const std::string& aText )
+{
+    for( unsigned char c : aText )
+    {
+        if( ( c < 0x20 && c != '\n' && c != '\t' ) || c == 0x7f )
+            return false;
+    }
+
+    return true;
+}
+
+/** The board's net a sheet's (unescaped) net name names. */
+NETINFO_ITEM* ccFindNet( BOARD* aBoard, const std::string& aName )
+{
+    if( NETINFO_ITEM* net = aBoard->FindNet( wxString::FromUTF8( aName.c_str() ) ) )
+        return net;
+
+    for( NETINFO_ITEM* net : aBoard->GetNetInfo() )
+    {
+        if( net && net->GetNetCode() > 0 && ccNet( net->GetNetname() ) == aName )
+            return net;
+    }
+
+    return nullptr;
+}
+
+/** One set, read whole against the item before anything is queued. */
+struct CC_ITEM_SET
+{
+    std::string  key;
+    double       number = 0;
+    bool         flag = false;
+    std::string  text;
+    PCB_LAYER_ID layer = UNDEFINED_LAYER;
+};
+
+/**
+ * The set's one key is a key of the item's kind and its value in bounds; false otherwise.
+ * Positions at most 50,000 mm in magnitude, sizes 0.001 to 1,000 mm (a via's hole under its
+ * diameter), rotation -360 to 360 degrees, a layer the board enables (copper for a track),
+ * a zone's net one the board has, a designator and value only for a footprint with no symbol.
+ */
+bool ccReadItemSet( BOARD* aBoard, BOARD_ITEM* aItem, const json& aSet, CC_ITEM_SET& aOut )
+{
+    if( !aSet.is_object() || aSet.size() != 1 )
+        return false;
+
+    const std::string kind = ccEditableKind( aItem );
+
+    if( kind.empty() )
+        return false;
+
+    const std::string& key = aSet.begin().key();
+    const json&        v = aSet.begin().value();
+
+    static const std::map<std::string, std::set<std::string>> keys = {
+        { "footprint", { "x", "y", "rotation", "locked", "side", "inBom", "inPos", "dnp", "ref", "value" } },
+        { "track",     { "width", "layer", "locked" } },
+        { "arc",       { "width", "layer", "locked" } },
+        { "via",       { "x", "y", "locked", "diameter", "drill" } },
+        { "zone",      { "name", "net", "priority", "clearance", "minWidth", "padConnection",
+                         "thermalGap", "spokeWidth", "locked" } },
+        { "text",      { "text", "layer", "x", "y", "rotation", "height", "width", "thickness",
+                         "bold", "italic", "knockout", "hAlign", "locked" } },
+    };
+
+    if( !keys.at( kind ).count( key ) )
+        return false;
+
+    aOut.key = key;
+
+    auto number = [&]( double aMin, double aMax ) -> bool
+                  {
+                      if( !v.is_number() )
+                          return false;
+
+                      const double d = v.get<double>();
+
+                      if( !std::isfinite( d ) || d < aMin || d > aMax )
+                          return false;
+
+                      aOut.number = d;
+                      return true;
+                  };
+
+    if( key == "x" || key == "y" )
+        return number( -50000.0, 50000.0 );
+
+    if( key == "rotation" )
+        return number( -360.0, 360.0 );
+
+    if( key == "width" || key == "height" || key == "thickness" || key == "minWidth"
+            || key == "thermalGap" || key == "spokeWidth" )
+        return number( 0.001, 1000.0 );
+
+    if( key == "clearance" )
+        return number( 0.0, 1000.0 );
+
+    if( key == "diameter" || key == "drill" )
+    {
+        if( !number( 0.001, 1000.0 ) )
+            return false;
+
+        PCB_VIA* via = static_cast<PCB_VIA*>( aItem );
+        const int iu = pcbIUScale.mmToIU( aOut.number );
+
+        return key == "drill" ? iu < via->GetWidth( F_Cu ) : via->GetDrillValue() < iu;
+    }
+
+    if( key == "priority" )
+    {
+        if( !v.is_number_integer() )
+            return false;
+
+        const long long p = v.get<long long>();
+
+        if( p < 0 || p > 1000000 )
+            return false;
+
+        aOut.number = (double) p;
+        return true;
+    }
+
+    if( key == "locked" || key == "inBom" || key == "inPos" || key == "dnp" || key == "bold"
+            || key == "italic" || key == "knockout" )
+    {
+        if( !v.is_boolean() )
+            return false;
+
+        aOut.flag = v.get<bool>();
+        return true;
+    }
+
+    if( !v.is_string() )
+        return false;
+
+    aOut.text = v.get<std::string>();
+
+    if( key == "side" )
+        return aOut.text == "front" || aOut.text == "back";
+
+    if( key == "hAlign" )
+        return aOut.text == "left" || aOut.text == "center" || aOut.text == "right";
+
+    if( key == "padConnection" )
+        return aOut.text == "thermal" || aOut.text == "solid" || aOut.text == "none"
+               || aOut.text == "thtThermal";
+
+    if( key == "layer" )
+    {
+        aOut.layer = ccLayerByName( aBoard, aOut.text );
+
+        if( aOut.layer == UNDEFINED_LAYER )
+            return false;
+
+        return kind == "text" || IsCopperLayer( aOut.layer );
+    }
+
+    if( key == "ref" || key == "value" )
+    {
+        if( !static_cast<FOOTPRINT*>( aItem )->IsBoardOnly() || !ccPlain( aOut.text ) )
+            return false;
+
+        return key == "ref" ? !aOut.text.empty() && aOut.text.size() <= 64
+                            : aOut.text.size() <= 1024;
+    }
+
+    if( key == "name" )
+        return aOut.text.size() <= 1024 && ccPlain( aOut.text );
+
+    if( key == "net" )
+        return ccFindNet( aBoard, aOut.text ) != nullptr;
+
+    if( key == "text" )
+        return aOut.text.size() <= 4096 && ccTextBody( aOut.text );
+
+    return false;
+}
+
+/** The set applied to the item, inside the caller's commit (Modify already taken). */
+void ccApplyItemSet( PCB_EDIT_FRAME* aFrame, BOARD_ITEM* aItem, const CC_ITEM_SET& aSet )
+{
+    BOARD*            board = aFrame->GetBoard();
+    const std::string kind = ccEditableKind( aItem );
+    const std::string& key = aSet.key;
+    const int         iu = pcbIUScale.mmToIU( aSet.number );
+
+    if( key == "locked" )
+    {
+        aItem->SetLocked( aSet.flag );
+        return;
+    }
+
+    if( kind == "footprint" )
+    {
+        FOOTPRINT*     fp = static_cast<FOOTPRINT*>( aItem );
+        const wxString variantName = board->GetCurrentVariant();
+
+        auto variant = [&]() -> FOOTPRINT_VARIANT*
+                       {
+                           FOOTPRINT_VARIANT* v = fp->GetVariant( variantName );
+                           return v ? v : fp->AddVariant( variantName );
+                       };
+
+        if( key == "x" )
+            fp->SetPosition( VECTOR2I( iu, fp->GetPosition().y ) );
+        else if( key == "y" )
+            fp->SetPosition( VECTOR2I( fp->GetPosition().x, iu ) );
+        else if( key == "rotation" )
+            fp->SetOrientation( EDA_ANGLE( aSet.number, DEGREES_T ).Normalize180() );
+        else if( key == "side" && ( aSet.text == "back" ) != fp->IsFlipped() )
+            fp->Flip( fp->GetPosition(), aFrame->GetPcbNewSettings()->m_FlipDirection );
+        else if( key == "ref" )
+            fp->SetReference( wxString::FromUTF8( aSet.text.c_str() ) );
+        else if( key == "value" )
+            fp->SetValue( wxString::FromUTF8( aSet.text.c_str() ) );
+        else if( key == "inBom" || key == "inPos" || key == "dnp" )
+        {
+            // Under a variant the three flags are the variant's, as KiCad's properties panel
+            // writes them (PCB_PROPERTIES_PANEL::valueChanged).
+            if( !variantName.IsEmpty() )
+            {
+                if( FOOTPRINT_VARIANT* v = variant() )
+                {
+                    if( key == "inBom" )
+                        v->SetExcludedFromBOM( !aSet.flag );
+                    else if( key == "inPos" )
+                        v->SetExcludedFromPosFiles( !aSet.flag );
+                    else
+                        v->SetDNP( aSet.flag );
+                }
+            }
+            else if( key == "inBom" )
+                fp->SetExcludedFromBOM( !aSet.flag );
+            else if( key == "inPos" )
+                fp->SetExcludedFromPosFiles( !aSet.flag );
+            else
+                fp->SetDNP( aSet.flag );
+        }
+
+        return;
+    }
+
+    if( kind == "track" || kind == "arc" )
+    {
+        PCB_TRACK* track = static_cast<PCB_TRACK*>( aItem );
+
+        if( key == "width" )
+            track->SetWidth( iu );
+        else if( key == "layer" )
+            track->SetLayer( aSet.layer );
+
+        return;
+    }
+
+    if( kind == "via" )
+    {
+        PCB_VIA* via = static_cast<PCB_VIA*>( aItem );
+
+        if( key == "x" )
+            via->SetPosition( VECTOR2I( iu, via->GetPosition().y ) );
+        else if( key == "y" )
+            via->SetPosition( VECTOR2I( via->GetPosition().x, iu ) );
+        else if( key == "diameter" )
+            via->SetWidth( iu );
+        else if( key == "drill" )
+            via->SetDrill( iu );
+
+        return;
+    }
+
+    if( kind == "zone" )
+    {
+        ZONE* zone = static_cast<ZONE*>( aItem );
+
+        if( key == "name" )
+            zone->SetZoneName( wxString::FromUTF8( aSet.text.c_str() ) );
+        else if( key == "net" )
+        {
+            if( NETINFO_ITEM* net = ccFindNet( board, aSet.text ) )
+                zone->SetNet( net );
+        }
+        else if( key == "priority" )
+            zone->SetAssignedPriority( (unsigned) aSet.number );
+        else if( key == "clearance" )
+            zone->SetLocalClearance( std::optional<int>( iu ) );
+        else if( key == "minWidth" )
+            zone->SetMinThickness( iu );
+        else if( key == "thermalGap" )
+            zone->SetThermalReliefGap( iu );
+        else if( key == "spokeWidth" )
+            zone->SetThermalReliefSpokeWidth( iu );
+        else if( key == "padConnection" )
+        {
+            zone->SetPadConnection( aSet.text == "solid"        ? ZONE_CONNECTION::FULL
+                                    : aSet.text == "none"       ? ZONE_CONNECTION::NONE
+                                    : aSet.text == "thtThermal" ? ZONE_CONNECTION::THT_THERMAL
+                                                                : ZONE_CONNECTION::THERMAL );
+        }
+
+        return;
+    }
+
+    if( kind == "text" )
+    {
+        PCB_TEXT* text = static_cast<PCB_TEXT*>( aItem );
+
+        if( key == "text" )
+            text->SetText( wxString::FromUTF8( aSet.text.c_str() ) );
+        else if( key == "layer" )
+        {
+            text->SetLayer( aSet.layer );
+            text->SetMirrored( IsBackLayer( aSet.layer ) );   // mirrored follows the side
+        }
+        else if( key == "x" )
+            text->SetTextPos( VECTOR2I( iu, text->GetTextPos().y ) );
+        else if( key == "y" )
+            text->SetTextPos( VECTOR2I( text->GetTextPos().x, iu ) );
+        else if( key == "rotation" )
+            text->SetTextAngle( EDA_ANGLE( aSet.number, DEGREES_T ).Normalize180() );
+        else if( key == "height" )
+            text->SetTextHeight( iu );
+        else if( key == "width" )
+            text->SetTextWidth( iu );
+        else if( key == "thickness" )
+            text->SetTextThickness( iu );
+        else if( key == "bold" )
+            text->SetBold( aSet.flag );
+        else if( key == "italic" )
+            text->SetItalic( aSet.flag );
+        else if( key == "knockout" )
+            text->SetIsKnockout( aSet.flag );
+        else if( key == "hAlign" )
+        {
+            text->SetHorizJustify( aSet.text == "left"    ? GR_TEXT_H_ALIGN_LEFT
+                                   : aSet.text == "right" ? GR_TEXT_H_ALIGN_RIGHT
+                                                          : GR_TEXT_H_ALIGN_CENTER );
+        }
+    }
+}
+} // namespace
+
+// ───────────────────────────── the exports ─────────────────────────────
+
+// board.preview / board.update (cap boardUpdate). aArgsJson exactly {"run": int >= 0,
+// "dir": "/tmp/cc-update/<n>", "apply": bool, "replaceFootprints": bool, "deleteExtra": bool,
+// "relinkByReference": bool, "token": string} ("" on a preview, 1 to 128 characters on an
+// apply). False (nothing queued) for any other JSON, with no board, or while an open is in
+// flight; true once the run is queued on the apply coroutine (the host waits for the apply
+// queue to empty and <dir>/.cc-update.json).
+bool pcbUpdateBoardFromSchematic( std::string aArgsJson )
+{
+    PCB_EDIT_FRAME* fr = pcbFrame();
+
+    if( !fr || !fr->GetBoard() || pcbjam_open::busy() )
+        return false;
+
+    json args = json::parse( aArgsJson, nullptr, /*allow_exceptions*/ false );
+
+    if( args.is_discarded() || !args.is_object() || args.size() != 7 )
+        return false;
+
+    CC_UPDATE_ARGS a;
+
+    auto flag = [&]( const char* aKey, bool& aOut ) -> bool
+                {
+                    auto it = args.find( aKey );
+
+                    if( it == args.end() || !it->is_boolean() )
+                        return false;
+
+                    aOut = it->get<bool>();
+                    return true;
+                };
+
+    auto run = args.find( "run" );
+    auto dir = args.find( "dir" );
+    auto token = args.find( "token" );
+
+    if( run == args.end() || !run->is_number_integer() || run->get<long long>() < 0
+            || dir == args.end() || !dir->is_string() || token == args.end()
+            || !token->is_string() || !flag( "apply", a.apply )
+            || !flag( "replaceFootprints", a.replaceFootprints )
+            || !flag( "deleteExtra", a.deleteExtra )
+            || !flag( "relinkByReference", a.relinkByReference ) )
+    {
+        return false;
+    }
+
+    a.run = run->get<long long>();
+    a.dir = dir->get<std::string>();
+    a.token = token->get<std::string>();
+
+    if( !ccIsRunDir( a.dir, "/tmp/cc-update/" ) )
+        return false;
+
+    if( a.apply ? ( a.token.empty() || a.token.size() > 128 ) : !a.token.empty() )
+        return false;
+
+    pcbjam_collab::runOnCoroutine( fr, [a]() { ccRunBoardUpdate( a ); } );
+    return true;
+}
+
+// board.check (cap drc). aArgsJson exactly {"run": int >= 0, "dir": "/tmp/cc-drc/<n>",
+// "fill": bool, "parity": bool, "allTrackErrors": bool}. False (nothing queued) for any
+// other JSON, with no board, or while an open is in flight; true once queued (the host waits
+// for the apply queue to empty and <dir>/.cc-drc.json).
+bool pcbCheckBoard( std::string aArgsJson )
+{
+    PCB_EDIT_FRAME* fr = pcbFrame();
+
+    if( !fr || !fr->GetBoard() || pcbjam_open::busy() )
+        return false;
+
+    json args = json::parse( aArgsJson, nullptr, /*allow_exceptions*/ false );
+
+    if( args.is_discarded() || !args.is_object() || args.size() != 5 )
+        return false;
+
+    auto run = args.find( "run" );
+    auto dir = args.find( "dir" );
+    auto fill = args.find( "fill" );
+    auto parity = args.find( "parity" );
+    auto all = args.find( "allTrackErrors" );
+
+    if( run == args.end() || !run->is_number_integer() || run->get<long long>() < 0
+            || dir == args.end() || !dir->is_string() || fill == args.end()
+            || !fill->is_boolean() || parity == args.end() || !parity->is_boolean()
+            || all == args.end() || !all->is_boolean() )
+    {
+        return false;
+    }
+
+    const std::string d = dir->get<std::string>();
+
+    if( !ccIsRunDir( d, "/tmp/cc-drc/" ) )
+        return false;
+
+    const bool withFill = fill->get<bool>();
+    const bool withParity = parity->get<bool>();
+    const bool withAll = all->get<bool>();
+
+    pcbjam_collab::runOnCoroutine( fr, [d, withFill, withParity, withAll]() {
+        ccRunBoardCheck( d, withFill, withParity, withAll );
+    } );
+
+    return true;
+}
+
+// board.explain (cap explain): why the mark aMarkerUuid's rule applies, as the island's
+// ExplainResult JSON; "" when the board has no such mark (or no board, or an open in
+// flight). A read: synchronous, no coroutine, nothing changed.
+std::string pcbExplainViolation( std::string aMarkerUuid )
+{
+    PCB_EDIT_FRAME* fr = pcbFrame();
+
+    if( !fr || !fr->GetBoard() || pcbjam_open::busy() || !ccIsLowerUuid( aMarkerUuid ) )
+        return "";
+
+    for( PCB_MARKER* marker : fr->GetBoard()->Markers() )
+    {
+        if( marker && toUtf8( marker->m_Uuid.AsString() ) == aMarkerUuid )
+        {
+            try
+            {
+                return ccExplain( fr, marker );
+            }
+            catch( ... )
+            {
+                return "";
+            }
+        }
+    }
+
+    return "";
+}
+
+// board.item.get (cap boardItem): aUuidsJson a JSON array of 1 to 512 lowercase uuids;
+// answers {"items": [...]}, each uuid the board holds as the island's BoardItemSheet in the
+// order asked (a field or a text of a footprint answers its footprint, once); a uuid the
+// board does not hold is left out. "" for args of any other shape. A read: synchronous.
+std::string pcbBoardItemGet( std::string aUuidsJson )
+{
+    PCB_EDIT_FRAME* fr = pcbFrame();
+
+    if( !fr || !fr->GetBoard() || pcbjam_open::busy() )
+        return "";
+
+    json uuids = json::parse( aUuidsJson, nullptr, /*allow_exceptions*/ false );
+
+    if( uuids.is_discarded() || !uuids.is_array() || uuids.empty() || uuids.size() > 512 )
+        return "";
+
+    for( const json& u : uuids )
+    {
+        if( !u.is_string() || !ccIsLowerUuid( u.get<std::string>() ) )
+            return "";
+    }
+
+    BOARD*                board = fr->GetBoard();
+    json                  items = json::array();
+    std::set<std::string> answered;
+
+    for( const json& u : uuids )
+    {
+        BOARD_ITEM* item = ccResolve( board, u.get<std::string>() );
+
+        if( !item )
+            continue;
+
+        if( ( item->Type() == PCB_FIELD_T || item->Type() == PCB_TEXT_T )
+                && item->GetParentFootprint() )
+        {
+            item = item->GetParentFootprint();
+        }
+
+        const std::string uuid = toUtf8( item->m_Uuid.AsString() );
+
+        if( !answered.insert( uuid ).second )
+            continue;
+
+        items.push_back( ccItemSheet( board, item ) );
+    }
+
+    json out = json::object();
+    out["items"] = std::move( items );
+    return out.dump( -1, ' ', false, json::error_handler_t::replace );
+}
+
+// board.item.set (cap boardItem): aArgsJson exactly {"uuid": string, "set": {one key}}, the
+// set read whole against the item first (ccReadItemSet). False (nothing queued) for anything
+// else; true once ONE commit is queued on the apply coroutine, the item re-resolved there:
+// BOARD_COMMIT Modify, the change through the item's own setters (the ones KiCad's properties
+// panel and dialogs call; a side change is KiCad's Flip with the editor's flip direction),
+// Push "Edit properties": one undo step.
+bool pcbBoardItemSet( std::string aArgsJson )
+{
+    PCB_EDIT_FRAME* fr = pcbFrame();
+
+    if( !fr || !fr->GetBoard() || pcbjam_open::busy() )
+        return false;
+
+    json args = json::parse( aArgsJson, nullptr, /*allow_exceptions*/ false );
+
+    if( args.is_discarded() || !args.is_object() || args.size() != 2 )
+        return false;
+
+    auto uuid = args.find( "uuid" );
+    auto set = args.find( "set" );
+
+    if( uuid == args.end() || !uuid->is_string() || set == args.end() )
+        return false;
+
+    const std::string id = uuid->get<std::string>();
+
+    if( !ccIsLowerUuid( id ) )
+        return false;
+
+    BOARD_ITEM* item = ccResolve( fr->GetBoard(), id );
+    CC_ITEM_SET parsed;
+
+    if( !item || !ccReadItemSet( fr->GetBoard(), item, *set, parsed ) )
+        return false;
+
+    pcbjam_collab::runOnCoroutine( fr, [fr, id, parsed]() {   // re-resolve on the coroutine (S4)
+        BOARD_ITEM* live = ccResolve( fr->GetBoard(), id );
+
+        if( !live || ccEditableKind( live ).empty() )
+            return;
+
+        BOARD_COMMIT commit( fr );
+        commit.Modify( live );
+        ccApplyItemSet( fr, live, parsed );
+        commit.Push( _( "Edit properties" ) );
+    } );
+
+    return true;
+}
+
 EMSCRIPTEN_BINDINGS(pcbnew) {
     // Register vector types for iteration
     register_vector<FOOTPRINT*>("FootprintVector");
@@ -3343,6 +5699,14 @@ EMSCRIPTEN_BINDINGS(pcbnew) {
     function("kicadFootprintSetModels", &pcbFootprintSetModels);
     // Circuit Center (island cc13): the board's Gerbers and drill files, no dialog (project.plot).
     function("kicadPlotBoard", &pcbPlotBoard);
+    // Circuit Center (island cc18, engine run 12): Update the board (board.preview, board.update),
+    // the board check (board.check), why a mark's rule applies (board.explain) and the
+    // selected board item's properties (board.item.get, board.item.set); no dialog on any.
+    function("kicadUpdateBoardFromSchematic", &pcbUpdateBoardFromSchematic);
+    function("kicadCheckBoard", &pcbCheckBoard);
+    function("kicadExplainViolation", &pcbExplainViolation);
+    function("kicadBoardItemGet", &pcbBoardItemGet);
+    function("kicadBoardItemSet", &pcbBoardItemSet);
 
 #ifndef KICAD_MERGED_EMBIND
     // JS names ALSO registered by eeschema_embind.cpp — in the merged image these are
