@@ -88,8 +88,7 @@
 #include <erc/erc_item.h>
 #include <erc/erc_report.h>
 #include <erc/erc_settings.h>
-#include <advanced_config.h>
-#include <netlist_exporters/netlist_exporter_kicad.h>
+#include <mail_type.h>
 
 using namespace emscripten;
 using json = nlohmann::json;
@@ -4125,8 +4124,9 @@ static bool kicadCheckSheet( std::string aArgsJson )
 // Annotate dialog): a part with no number is an "unannotated" problem, a designator used
 // twice (or units that disagree) a "duplicate_designator" problem, and with any of them no
 // netlist is made; duplicate sheet names a "duplicate_sheet_names" warning (never IsOK);
-// the connections recalculated when incremental connectivity is on; KiCad's own netlist
-// (NETLIST_EXPORTER_KICAD, GNL_ALL | GNL_OPT_KICAD). Last, every screen is marked
+// then KiCad's own MAIL_SCH_GET_NETLIST handler with an empty payload (the connections
+// recalculated when incremental connectivity is on, NETLIST_EXPORTER_KICAD with GNL_ALL |
+// GNL_OPT_KICAD). Last, every screen is marked
 // unmodified, so the next run's re-open raises no Save Changes prompt.
 // Answers JSON (the two include roots stay apart, so plain strings cross):
 // {"text", "blocked": [{code, ref, message}], "warnings": [{code, message}],
@@ -4190,14 +4190,12 @@ std::string ccSchNetlistForBoard( KIWAY_PLAYER* aPlayer )
 
         if( blocked.empty() )
         {
-            if( ADVANCED_CFG::GetCfg().m_IncrementalConnectivity )
-                sf->RecalculateConnections( nullptr, GLOBAL_CLEANUP );
-
-            NETLIST_EXPORTER_KICAD exporter( &sch );
-            STRING_FORMATTER       formatter;
-
-            exporter.Format( &formatter, GNL_ALL | GNL_OPT_KICAD );
-            out["text"] = formatter.GetString();
+            // KiCad's own handler with an empty payload (no ReadyToNetlist, checked above):
+            // the connections recalculated when incremental connectivity is on, then
+            // NETLIST_EXPORTER_KICAD with GNL_ALL | GNL_OPT_KICAD into the payload.
+            std::string payload;
+            sf->Kiway().ExpressMail( FRAME_SCH, MAIL_SCH_GET_NETLIST, payload, nullptr );
+            out["text"] = payload;
         }
 
         out["blocked"] = std::move( blocked );
