@@ -9,6 +9,8 @@
 // schematic or an Altium project through SCH_EDIT_FRAME's own import path.
 // Modified by Chirichella Inc. on 2026-11-07: kicadSymbolGet, kicadSymbolSet, kicadAnnotate
 // and kicadCheckSheet, the Editing window's symbol properties, numbering and check.
+// Modified by Chirichella Inc. on 2026-11-16: kicadSymbolForEditor and
+// kicadSymbolPushToSchematic, a placed symbol to the Symbol Editor and back (engine run 14).
 
 #ifdef __EMSCRIPTEN__
 #include <emscripten.h>
@@ -73,6 +75,7 @@
 #include "pcbjam_theme.h"
 #include "pcbjam_libs_reload.h"
 #include "pcbjam_async_policy.h"
+#include "symedit_common.h"
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
@@ -4114,6 +4117,263 @@ static bool kicadCheckSheet( std::string aArgsJson )
     return true;
 }
 
+namespace
+{
+/**
+ * SCH_EDIT_FRAME::SaveSymbolToSchematic's body for the placed symbol aPrincipal on aPath:
+ * every unit of the part (the principal and every unit sharing its designator) takes a
+ * flattened copy of aSymbol, and with aRelink each unit's lib id becomes aLibId (the part now
+ * names the design's own copy), all as ONE commit pushed as "Edit symbol" (one undo step).
+ */
+void pushSymbolToSchematic( SCH_EDIT_FRAME* aFrame, SCH_SYMBOL* aPrincipal,
+                            const SCH_SHEET_PATH& aPath, const LIB_SYMBOL& aSymbol,
+                            bool aRelink, const LIB_ID& aLibId )
+{
+    SCH_SHEET_LIST sheets = aFrame->Schematic().Hierarchy();
+    SCH_COMMIT     commit( aFrame );
+    wxString       principalRef;
+
+    if( aPrincipal->IsAnnotated( &aPath ) )
+        principalRef = aPrincipal->GetRef( &aPath, false );
+
+    std::vector<std::pair<SCH_SYMBOL*, SCH_SHEET_PATH>> allUnits;
+
+    for( const SCH_SHEET_PATH& path : sheets )
+    {
+        for( SCH_ITEM* candidate : path.LastScreen()->Items().OfType( SCH_SYMBOL_T ) )
+        {
+            SCH_SYMBOL* candidateSymbol = static_cast<SCH_SYMBOL*>( candidate );
+
+            if( candidateSymbol == aPrincipal
+                    || ( !principalRef.IsEmpty() && candidateSymbol->IsAnnotated( &path )
+                         && candidateSymbol->GetRef( &path, false ) == principalRef ) )
+            {
+                allUnits.emplace_back( candidateSymbol, path );
+            }
+        }
+    }
+
+    for( auto& [unit, path] : allUnits )
+    {
+        // Removed first so the screen's cached library symbols never keep a stale copy.
+        path.LastScreen()->Remove( unit );
+
+        if( !unit->IsNew() )
+            commit.Modify( unit, path.LastScreen() );
+
+        if( aRelink )
+        {
+            unit->SetLibId( aLibId );
+            unit->SetSchSymbolLibraryName( wxEmptyString );
+        }
+
+        std::unique_ptr<LIB_SYMBOL> copy = aSymbol.Flatten();
+
+        if( copy )
+        {
+            copy->SetLibId( unit->GetLibId() );
+            unit->SetLibSymbol( copy.release() );
+        }
+
+        unit->UpdateFields( &aFrame->GetCurrentSheet(),
+                            true,  /* update style */
+                            true,  /* update ref */
+                            true,  /* update other fields */
+                            false, /* reset ref */
+                            false  /* reset other fields */ );
+
+        path.LastScreen()->Append( unit );
+        aFrame->GetCanvas()->GetView()->Update( unit );
+    }
+
+    // Clear any orphaned alternate pins.
+    for( SCH_PIN* pin : aPrincipal->GetPins() )
+    {
+        wxString altName = pin->GetAlt();
+
+        if( altName.IsEmpty() )
+            continue;
+
+        if( pin->GetAlternates().count( altName ) == 0 )
+            pin->SetAlt( wxEmptyString );
+    }
+
+    if( !commit.Empty() )
+        commit.Push( wxS( "Edit symbol" ) );
+}
+} // namespace
+
+// symbol.forEditor: {uuid, sheetPath}, those two keys only (symbol.get's rules). The placed
+// symbol exactly as SYMBOL_EDIT_FRAME::LoadSymbolFromSchematic builds it (its library copy
+// flattened, the instance's fields carried back through its rotation and mirror), formatted
+// as a kicad_symbol_lib document: {name, libId, text}. A read; "" for any other shape or no
+// such symbol.
+static std::string kicadSymbolForEditor( std::string aArgsJson )
+{
+    SCH_EDIT_FRAME* fr = schFrame();
+
+    if( !fr || pcbjam_open::busy() )
+        return "";
+
+    json args = json::parse( aArgsJson, nullptr, /*allow_exceptions*/ false );
+
+    if( args.is_discarded() || !args.is_object() || args.size() != 2 || !args.contains( "uuid" )
+            || !args.contains( "sheetPath" ) || !args["uuid"].is_string()
+            || !args["sheetPath"].is_string() )
+    {
+        return "";
+    }
+
+    SYMBOL_HIT hit = resolveSymbol( fr, args["uuid"].get<std::string>(),
+                                    args["sheetPath"].get<std::string>(), /*aStrict*/ false );
+
+    if( !hit.symbol || !hit.symbol->GetLibSymbolRef() )
+        return "";
+
+    std::unique_ptr<LIB_SYMBOL> symbol = hit.symbol->GetLibSymbolRef()->Flatten();
+
+    if( !symbol )
+        return "";
+
+    symbol->SetLibId( hit.symbol->GetLibId() );
+
+    // Take in account the symbol orientation and mirroring to calculate the field positions
+    // in the symbol editor (i.e. no rotation, no mirroring): LoadSymbolFromSchematic's lines.
+    int orientation = hit.symbol->GetOrientation() & ~( SYM_MIRROR_X | SYM_MIRROR_Y );
+    int mirror = hit.symbol->GetOrientation() & ( SYM_MIRROR_X | SYM_MIRROR_Y );
+
+    std::vector<SCH_FIELD> fullSetOfFields;
+
+    for( const SCH_FIELD& field : hit.symbol->GetFields() )
+    {
+        VECTOR2I  pos = field.GetPosition() - hit.symbol->GetPosition();
+        SCH_FIELD libField( symbol.get(), field.GetId() );
+
+        libField = field;
+
+        // The inverse transform is mirroring before, rotate after
+        switch( mirror )
+        {
+        case SYM_MIRROR_X: pos.y = -pos.y; break;
+        case SYM_MIRROR_Y: pos.x = -pos.x; break;
+        default:                           break;
+        }
+
+        switch( orientation )
+        {
+        case SYM_ORIENT_90:
+            std::swap( pos.x, pos.y );
+            pos.x = - pos.x;
+            break;
+        case SYM_ORIENT_270:
+            std::swap( pos.x, pos.y );
+            pos.y = - pos.y;
+            break;
+        case SYM_ORIENT_180:
+            pos.x = - pos.x;
+            pos.y = - pos.y;
+            break;
+        default:
+            break;
+        }
+
+        libField.SetPosition( pos );
+
+        fullSetOfFields.emplace_back( std::move( libField ) );
+    }
+
+    symbol->SetFields( fullSetOfFields );
+
+    const std::string text = cc_symedit::formatSymbol( symbol.get() );
+
+    if( text.empty() )
+        return "";
+
+    json out = json::object();
+    out["name"] = std::string( symbol->GetLibId().GetLibItemName().c_str() );
+    out["libId"] = std::string( hit.symbol->GetLibId().Format().c_str() );
+    out["text"] = text;
+    return out.dump( -1, ' ', false, json::error_handler_t::replace );
+}
+
+// symbol.push: {uuid, sheetPath, text, name, libId, token}, those six keys only. text a
+// kicad_symbol_lib document (at most 4 MB) holding name, read by KiCad's own reader and
+// flattened; SaveSymbolToSchematic's body on the placed symbol (every unit of the part by its
+// designator) as ONE commit "Edit symbol"; libId "" keeps each unit's lib id, else (lib:name)
+// sets it in the same commit. False (nothing queued) for any other shape.
+static bool kicadSymbolPushToSchematic( std::string aArgsJson )
+{
+    SCH_EDIT_FRAME* fr = schFrame();
+
+    if( !fr || pcbjam_open::busy() )
+        return false;
+
+    json args = json::parse( aArgsJson, nullptr, /*allow_exceptions*/ false );
+
+    if( args.is_discarded() || !args.is_object() || args.size() != 6 )
+        return false;
+
+    for( const char* key : { "uuid", "sheetPath", "text", "name", "libId", "token" } )
+    {
+        if( !args.contains( key ) || !args[key].is_string() )
+            return false;
+    }
+
+    const std::string id = args["uuid"].get<std::string>();
+    const std::string path = args["sheetPath"].get<std::string>();
+    const std::string& text = args["text"].get_ref<const std::string&>();
+    const std::string& token = args["token"].get_ref<const std::string&>();
+
+    if( !isLowerUuid( id ) || text.empty() || text.size() > cc_symedit::DOC_MAX_BYTES
+            || token.empty() || token.size() > 64 )
+    {
+        return false;
+    }
+
+    for( char c : token )
+    {
+        if( c < 0x20 || c > 0x7e )
+            return false;
+    }
+
+    std::optional<wxString> name = boundedText( args["name"], 1, 1024 );
+    std::optional<wxString> libIdText = boundedText( args["libId"], 0, 1024 );
+
+    if( !name || hasControlChar( *name ) || !libIdText || !isFootprintId( *libIdText ) )
+        return false;
+
+    LIB_ID     libId;
+    const bool relink = !libIdText->IsEmpty();
+
+    if( relink )
+        libId.Parse( UTF8( *libIdText ) );
+
+    if( !resolveSymbol( fr, id, path, /*aStrict*/ true ).symbol )
+        return false;
+
+    cc_symedit::SYMBOL_CHAIN chain = cc_symedit::readSymbol( text, *name );
+
+    if( !chain.symbol() )
+        return false;
+
+    std::shared_ptr<LIB_SYMBOL> flat( chain.symbol()->Flatten().release() );
+
+    if( !flat )
+        return false;
+
+    pcbjam_collab::runOnCoroutine( fr, [id, path, flat, relink, libId]() {   // re-resolve (S4)
+        SCH_EDIT_FRAME* frame = schFrame();
+        SYMBOL_HIT      live = resolveSymbol( frame, id, path, /*aStrict*/ true );
+
+        if( !live.symbol )
+            return;
+
+        pushSymbolToSchematic( frame, live.symbol, live.path, *flat, relink, libId );
+    } );
+
+    return true;
+}
+
 #ifdef KICAD_MERGED_EMBIND
 // Circuit Center (engine run 12): the eeschema half of the board engine's schematic
 // netlist, shared by Update the board (kicadUpdateBoardFromSchematic) and the board
@@ -4254,6 +4514,9 @@ EMSCRIPTEN_BINDINGS(eeschema) {
     function("kicadSymbolSet", &kicadSymbolSet);
     function("kicadAnnotate", &kicadAnnotate);
     function("kicadCheckSheet", &kicadCheckSheet);
+    // A placed symbol to the Symbol Editor and back (engine run 14, cap symbolEdit).
+    function("kicadSymbolForEditor", &kicadSymbolForEditor);
+    function("kicadSymbolPushToSchematic", &kicadSymbolPushToSchematic);
 
 #ifndef KICAD_MERGED_EMBIND
     // JS names ALSO registered by pcbnew_embind.cpp — in the merged image these are
