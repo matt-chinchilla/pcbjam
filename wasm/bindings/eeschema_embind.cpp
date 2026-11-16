@@ -9,6 +9,8 @@
 // schematic or an Altium project through SCH_EDIT_FRAME's own import path.
 // Modified by Chirichella Inc. on 2026-11-07: kicadSymbolGet, kicadSymbolSet, kicadAnnotate
 // and kicadCheckSheet, the Editing window's symbol properties, numbering and check.
+// Modified by Chirichella Inc. on 2026-11-16: kicadExportSchematicOutput, a schematic output
+// through KiCad's own job or the symbol export beneath its dialog (engine run 14).
 
 #ifdef __EMSCRIPTEN__
 #include <emscripten.h>
@@ -89,6 +91,12 @@
 #include <erc/erc_report.h>
 #include <erc/erc_settings.h>
 #include <mail_type.h>
+#include <pgm_base.h>
+#include <settings/settings_manager.h>
+#include <ki_exception.h>
+#include <jobs/job_export_sch_plot.h>
+#include <wx/log.h>
+#include "cc_output_common.h"
 
 using namespace emscripten;
 using json = nlohmann::json;
@@ -4227,6 +4235,281 @@ std::string ccSchNetlistForBoard( KIWAY_PLAYER* aPlayer )
 }
 #endif // KICAD_MERGED_EMBIND
 
+// ════════════════════════ Circuit Center, engine run 14 (outputs) ════════════════════════
+//
+// The schematic half of the island's project.export (cap export), from the outputs spec
+// (2026-11-16): kicadExportSchematicOutput runs ONE schematic output, a KiCad job by its registry
+// name with KiCad's own settings JSON (6.2's merge, cc_output_common.h) or our cc_symbols, into
+// /tmp/cc-out/<n>, its record <dir>/.cc-export.json {code, lines, dropped} written LAST. In this
+// GUI build EESCHEMA_JOBS_HANDLER::getSchematic answers the editor's own schematic, unsaved edits
+// included. Nothing in the design changes: no commit, no undo step, every sheet's modified flag
+// as it was; no KiCad window opens (wxLogNull keeps wx's log window shut too).
+namespace
+{
+/** One schematic output, read and checked before anything is queued. */
+struct CC_SCH_OUTPUT
+{
+    std::string              dir;
+    std::string              job;
+    std::shared_ptr<JOB>     kicadJob;   // null for ours
+    std::vector<wxString>    pages;      // the plot jobs only; empty: every sheet
+    cc_output::MERGE_RESULT  merge;
+};
+
+/**
+ * cc_symbols: SCH_EDITOR_CONTROL::ExportSymbolsToLibrary without its library chooser and table,
+ * at its own defaults (power symbols left out, the schematic left linked as it is): each symbol
+ * the design places, by its library id, flattened and written by the KiCad S-expression writer
+ * into <root sheet's name>.kicad_sym. The file is made first.
+ */
+int ccRunSymbolsOutput( SCH_EDIT_FRAME* aFrame, const std::string& aDir,
+                        cc_output::LINES_REPORTER& aLines )
+{
+    SCHEMATIC&       sch = aFrame->Schematic();
+    const wxString   stem = wxFileName( sch.GetFileName() ).GetName();
+    const wxString   path = wxFileName( wxString::FromUTF8( aDir.c_str() ), stem,
+                                        wxS( "kicad_sym" ) ).GetFullPath();
+    SCH_SHEET_LIST     sheets = sch.BuildSheetListSortedByPageNumbers();
+    SCH_REFERENCE_LIST symbols;
+
+    sheets.GetSymbols( symbols, SYMBOL_FILTER_NON_POWER );
+
+    std::map<LIB_ID, LIB_SYMBOL*> libSymbols;
+
+    for( size_t i = 0; i < symbols.GetCount(); ++i )
+    {
+        SCH_SYMBOL* symbol = symbols[i].GetSymbol();
+        LIB_SYMBOL* libSymbol = symbol ? symbol->GetLibSymbolRef().get() : nullptr;
+
+        if( libSymbol )
+            libSymbols.emplace( libSymbol->GetLibId(), libSymbol );   // the first of an id kept
+    }
+
+    SCH_IO_KICAD_SEXPR io;
+    io.CreateLibrary( path );   // throws IO_ERROR, an error line in the caller
+
+    for( const auto& [id, origSym] : libSymbols )
+    {
+        std::unique_ptr<LIB_SYMBOL> flat = origSym->Flatten();
+        io.SaveSymbol( path, flat.release() );   // the library cache owns it from here
+    }
+
+    if( libSymbols.empty() )
+        aLines.Report( _( "No symbols to export." ), RPT_SEVERITY_WARNING );
+
+    return 0;
+}
+
+/** One schematic output, on the apply coroutine; the record last. */
+void ccRunSchematicOutput( const CC_SCH_OUTPUT& aArgs )
+{
+    cc_output::LINES_REPORTER lines;
+    int                       code = -1;
+
+    cc_output::EnsureDir( aArgs.dir );
+
+    for( const std::string& warning : aArgs.merge.warnings )
+        lines.Report( wxString::FromUTF8( warning.c_str() ), RPT_SEVERITY_WARNING );
+
+    auto finish = [&]()
+                  {
+                      json done = json::object();
+                      done["code"] = code;
+                      done["lines"] = cc_output::LinesJson( lines );
+                      done["dropped"] = aArgs.merge.dropped;
+                      cc_output::WriteRecord( aArgs.dir, cc_output::RecordName(), done );
+                  };
+
+    SCH_EDIT_FRAME* fr = schFrame();   // re-resolved on the coroutine (S4)
+
+    if( !fr || !fr->Kiway().KiFACE( KIWAY::FACE_SCH, false ) )
+    {
+        lines.Report( wxS( "no schematic editor to export" ), RPT_SEVERITY_ERROR );
+        finish();
+        return;
+    }
+
+    if( aArgs.kicadJob && ( !Pgm().IsGUI() || !Pgm().GetSettingsManager().IsProjectOpen() ) )
+    {
+        // getSchematic would load the saved files instead of the editor's schematic.
+        lines.Report( wxS( "the job handler would not export the editor's schematic" ),
+                      RPT_SEVERITY_ERROR );
+        finish();
+        return;
+    }
+
+    if( !aArgs.merge.refusal.empty() )
+    {
+        lines.Report( wxString::FromUTF8( aArgs.merge.refusal.c_str() ), RPT_SEVERITY_ERROR );
+        finish();
+        return;
+    }
+
+    wxLogNull   noLog;
+    SCH_SCREENS screens( fr->Schematic().Root() );
+
+    std::map<SCH_SCREEN*, bool> modified;
+
+    for( SCH_SCREEN* screen = screens.GetFirst(); screen; screen = screens.GetNext() )
+        modified[screen] = screen->IsContentModified();
+
+    try
+    {
+        if( aArgs.kicadJob )
+        {
+            if( !aArgs.pages.empty() )
+            {
+                if( JOB_EXPORT_SCH_PLOT* plot = dynamic_cast<JOB_EXPORT_SCH_PLOT*>( aArgs.kicadJob.get() ) )
+                {
+                    plot->m_plotAll = false;
+                    plot->m_plotPages = aArgs.pages;
+                }
+            }
+
+            // As KiCad's jobset runner (kicad/jobs_runner.cpp): the run folder is the job's
+            // temporary output directory and its own output path stays empty, so the job's
+            // handler names the files as kicad-cli jobset run names them.
+            aArgs.kicadJob->SetTempOutputDirectory( wxString::FromUTF8( aArgs.dir.c_str() ) );
+            code = fr->Kiway().ProcessJob( KIWAY::FACE_SCH, aArgs.kicadJob.get(), &lines );
+        }
+        else if( aArgs.job == "cc_symbols" )
+        {
+            code = ccRunSymbolsOutput( fr, aArgs.dir, lines );
+        }
+        else
+        {
+            lines.Report( wxS( "this engine does not run that output" ), RPT_SEVERITY_ERROR );
+        }
+    }
+    catch( const IO_ERROR& ioe )
+    {
+        lines.Report( ioe.What(), RPT_SEVERITY_ERROR );
+        code = -1;
+    }
+    catch( const std::exception& e )
+    {
+        lines.Report( wxString::Format( wxS( "the %s output failed: %s" ),
+                                        wxString::FromUTF8( aArgs.job.c_str() ),
+                                        wxString::FromUTF8( e.what() ) ),
+                      RPT_SEVERITY_ERROR );
+        code = -1;
+    }
+    catch( ... )
+    {
+        lines.Report( wxString::Format( wxS( "the %s output failed" ),
+                                        wxString::FromUTF8( aArgs.job.c_str() ) ),
+                      RPT_SEVERITY_ERROR );
+        code = -1;
+    }
+
+    // An output never marks a sheet changed.
+    for( SCH_SCREEN* screen = screens.GetFirst(); screen; screen = screens.GetNext() )
+    {
+        auto was = modified.find( screen );
+
+        if( was != modified.end() && !was->second && screen->IsContentModified() )
+            screen->SetContentModified( false );
+    }
+
+    // A plot walks every sheet and puts the shown one back (SCH_PLOTTER's restore); the view
+    // is asked to draw again, as the plot dialog's closing does.
+    if( fr->GetCanvas() )
+        fr->GetCanvas()->Refresh();
+
+    finish();
+}
+} // namespace
+
+// project.export, a schematic output (cap export). aArgsJson exactly {"run": int >= 0, "dir":
+// "/tmp/cc-out/<n>", "job": one of cc_output::SchematicJobs(), "settings": object} and,
+// optionally, "pages": [string] (0 to 1,024 page numbers as the sheets print them, each 1 to 32
+// characters; empty means every sheet; non-empty only for a plot job, which then plots those
+// pages). A KiCad job's settings are KiCad's own job JSON (a jobset's), merged by the outputs
+// spec's 6.2; cc_symbols takes no settings. False (nothing queued) for anything else, with no
+// schematic frame, or while an open is in flight; true once the run is queued (the host waits
+// for the apply queue to empty and <dir>/.cc-export.json {"code", "lines", "dropped"}).
+static bool kicadExportSchematicOutput( std::string aArgsJson )
+{
+    SCH_EDIT_FRAME* fr = schFrame();
+
+    if( !fr || pcbjam_open::busy() )
+        return false;
+
+    json args = json::parse( aArgsJson, nullptr, /*allow_exceptions*/ false );
+
+    if( args.is_discarded() || !args.is_object() || ( args.size() != 4 && args.size() != 5 ) )
+        return false;
+
+    auto run = args.find( "run" );
+    auto dir = args.find( "dir" );
+    auto job = args.find( "job" );
+    auto settings = args.find( "settings" );
+    auto pages = args.find( "pages" );
+
+    if( run == args.end() || !run->is_number_integer() || run->get<long long>() < 0
+            || dir == args.end() || !dir->is_string() || job == args.end() || !job->is_string()
+            || settings == args.end() || !settings->is_object()
+            || ( args.size() == 5 && pages == args.end() ) )
+    {
+        return false;
+    }
+
+    CC_SCH_OUTPUT a;
+    a.dir = dir->get<std::string>();
+    a.job = job->get<std::string>();
+
+    if( !cc_output::IsRunDir( a.dir, cc_output::OutputRoot() )
+            || !cc_output::Lists( cc_output::SchematicJobs(), a.job ) )
+    {
+        return false;
+    }
+
+    if( pages != args.end() )
+    {
+        if( !pages->is_array() || pages->size() > 1024 )
+            return false;
+
+        for( const json& page : *pages )
+        {
+            if( !page.is_string() )
+                return false;
+
+            const std::string number = page.get<std::string>();
+
+            if( number.empty() || number.size() > 32 )
+                return false;
+
+            a.pages.push_back( wxString::FromUTF8( number.c_str() ) );
+        }
+
+        if( !a.pages.empty() && !cc_output::IsSchematicPlot( a.job ) )
+            return false;
+    }
+
+    if( cc_output::IsOurs( a.job ) )
+    {
+        cc_output::OURS_SETTINGS ours;
+
+        if( !cc_output::ReadOurs( a.job, *settings, ours ) )
+            return false;
+    }
+    else
+    {
+        const wxString name = wxString::FromUTF8( a.job.c_str() );
+
+        if( JOB_REGISTRY::GetKifaceType( name ) != KIWAY::FACE_SCH )
+            return false;
+
+        a.kicadJob.reset( JOB_REGISTRY::CreateInstance<JOB>( name ) );
+
+        if( !a.kicadJob || !cc_output::MergeSettings( *a.kicadJob, a.job, *settings, a.merge ) )
+            return false;
+    }
+
+    pcbjam_collab::runOnCoroutine( fr, [a]() { ccRunSchematicOutput( a ); } );
+    return true;
+}
+
 EMSCRIPTEN_BINDINGS(eeschema) {
     // Programmatic save of the in-memory schematic (round-trip tests, README §A).
     function("kicadSaveSchematic", &kicadSaveSchematic);
@@ -4254,6 +4537,9 @@ EMSCRIPTEN_BINDINGS(eeschema) {
     function("kicadSymbolSet", &kicadSymbolSet);
     function("kicadAnnotate", &kicadAnnotate);
     function("kicadCheckSheet", &kicadCheckSheet);
+    // Circuit Center (island cc23, engine run 14): one schematic output through KiCad's own job
+    // or our symbol export, no dialog (project.export).
+    function("kicadExportSchematicOutput", &kicadExportSchematicOutput);
 
 #ifndef KICAD_MERGED_EMBIND
     // JS names ALSO registered by pcbnew_embind.cpp — in the merged image these are
