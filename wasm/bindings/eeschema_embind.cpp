@@ -89,6 +89,26 @@
 #include <erc/erc_report.h>
 #include <erc/erc_settings.h>
 #include <mail_type.h>
+// The simulator's exports (engine run 14, caps simModel and sim).
+#include <advanced_config.h>
+#include <deque>
+#include <functional>
+#include <project/project_file.h>
+#include <string_utils.h>
+#include <wildcards_and_files_ext.h>
+#include <wx/arrstr.h>
+#include <wx/regex.h>
+#include <sim/sim_lib_mgr.h>
+#include <sim/sim_library.h>
+#include <sim/sim_library_ibis.h>
+#include <sim/sim_model.h>
+#include <sim/sim_model_ibis.h>
+#include <sim/simulator_reporter.h>
+#include <sim/spice_circuit_model.h>
+#include <sim/spice_generator.h>
+#include <sim/spice_settings.h>
+#include <sim/spice_simulator.h>
+#include <sim/spice_value.h>
 
 using namespace emscripten;
 using json = nlohmann::json;
@@ -4114,6 +4134,2156 @@ static bool kicadCheckSheet( std::string aArgsJson )
     return true;
 }
 
+// Modified by Chirichella Inc. on 2026-11-16: the simulator's exports (engine run 14, island
+// cc23, caps simModel and sim): the model catalog, one symbol's model read and written by
+// uuid, a model file read, the SPICE netlist, a run, Stop, and KiCad's operating point
+// labels on the drawing. All through KiCad's own classes (SIM_MODEL and its tables,
+// SIM_LIB_MGR, SIM_LIBRARY, SPICE_CIRCUIT_MODEL, the NGSPICE client bound to the
+// ngspice_service worker by wasm/stubs/sharedspice_client.cpp), with no KiCad window,
+// dialog or menu on any road: SIMULATOR_FRAME and DIALOG_SIM_MODEL are never made. Each
+// takes closed JSON args; a refusal ("" or false) queues nothing. Registered outside the
+// KICAD_MERGED_EMBIND guard: the names are eeschema-only.
+
+// The ngspice client's two plot lists (wasm/stubs/sharedspice_client.cpp, declared in its
+// sharedspice.h; NGSPICE keeps its pointers private). Each is an RPC to the service:
+// callers run on the apply coroutine. At global scope: C linkage, the client's symbols.
+extern "C" char** pcbjam_ngSpice_AllPlots( void );
+extern "C" char** pcbjam_ngSpice_AllVecs( char* plotname );
+
+namespace
+{
+/** The Sim.* fields a model write owns (Sim.Enable, KiCad 7's exclusion flag, is not one). */
+const char* const SIM_OWNED_FIELDS[] = { "Sim.Device",    "Sim.Type",      "Sim.Pins",
+                                         "Sim.Params",    "Sim.Library",   "Sim.Name",
+                                         "Sim.Ibis.Pin",  "Sim.Ibis.Model", "Sim.Ibis.Diff",
+                                         "Sim.NodesFormat" };
+
+bool isSimOwnedField( const wxString& aName )
+{
+    for( const char* name : SIM_OWNED_FIELDS )
+    {
+        if( aName == wxString::FromUTF8( name ) )
+            return true;
+    }
+
+    return false;
+}
+
+/**
+ * A model type's key: the Sim.Device word, then "." and the Sim.Type word when the type
+ * has one ("R", "R.POT", "V.PULSE", "NMOS.BSIM4"), the pair KiCad itself reads the type
+ * from (SIM_MODEL::ReadTypeFromFields), so each key names one type.
+ */
+std::string simTypeKey( SIM_MODEL::TYPE aType )
+{
+    const SIM_MODEL::INFO info = SIM_MODEL::TypeInfo( aType );
+    const std::string     device = SIM_MODEL::DeviceInfo( info.deviceType ).fieldValue;
+
+    return info.fieldValue.empty() ? device : device + "." + info.fieldValue;
+}
+
+std::optional<SIM_MODEL::TYPE> simTypeOfKey( const std::string& aKey )
+{
+    if( aKey.empty() )
+        return std::nullopt;
+
+    for( SIM_MODEL::TYPE type : SIM_MODEL::TYPE_ITERATOR() )
+    {
+        if( type != SIM_MODEL::TYPE::NONE && simTypeKey( type ) == aKey )
+            return type;
+    }
+
+    return std::nullopt;
+}
+
+const char* simCategoryName( SIM_MODEL::PARAM::CATEGORY aCategory )
+{
+    using CATEGORY = SIM_MODEL::PARAM::CATEGORY;
+
+    switch( aCategory )
+    {
+    case CATEGORY::PRINCIPAL:              return "principal";
+    case CATEGORY::GEOMETRY:               return "geometry";
+    case CATEGORY::AC:                     return "ac";
+    case CATEGORY::DC:                     return "dc";
+    case CATEGORY::CAPACITANCE:            return "capacitance";
+    case CATEGORY::TEMPERATURE:            return "temperature";
+    case CATEGORY::NOISE:                  return "noise";
+    case CATEGORY::DISTRIBUTED_QUANTITIES: return "distributed_quantities";
+    case CATEGORY::LIMITING_VALUES:        return "limiting_values";
+    case CATEGORY::S_PARAM:                return "s_param";
+    case CATEGORY::ADVANCED:               return "advanced";
+    case CATEGORY::FLAGS:                  return "flags";
+    case CATEGORY::WAVEFORM:               return "waveform";
+    case CATEGORY::INITIAL_CONDITIONS:     return "initial_conditions";
+    case CATEGORY::SUPERFLUOUS:            return "superfluous";
+    }
+
+    return "advanced";
+}
+
+const char* simKindName( SIM_TYPE aType )
+{
+    switch( aType )
+    {
+    case ST_OP:    return "op";
+    case ST_DC:    return "dc";
+    case ST_AC:    return "ac";
+    case ST_TRAN:  return "tran";
+    case ST_NOISE: return "noise";
+    case ST_PZ:    return "pz";
+    case ST_SP:    return "sp";
+    case ST_FFT:   return "fft";
+    default:       return "other";
+    }
+}
+
+/** The symbol's library pins sorted by number, the order SIM_LIB_MGR::CreateModel gives a model. */
+std::vector<SCH_PIN*> sortedSimPins( SCH_SYMBOL* aSymbol )
+{
+    std::vector<SCH_PIN*> pins = aSymbol->GetAllLibPins();
+
+    std::sort( pins.begin(), pins.end(),
+               []( const SCH_PIN* lhs, const SCH_PIN* rhs )
+               {
+                   return StrNumCmp( lhs->GetNumber(), rhs->GetNumber(), true ) < 0;
+               } );
+
+    return pins;
+}
+
+/**
+ * The embedded files a model may name (kicad-embed://), as SCH_EDIT_FRAME::
+ * RefreshOperatingPointDisplay stacks them: the schematic's, then the symbol's own and its
+ * library parents'.
+ */
+std::vector<EMBEDDED_FILES*> simFilesStack( SCHEMATIC& aSch, SCH_SYMBOL* aSymbol )
+{
+    std::vector<EMBEDDED_FILES*> stack;
+    stack.push_back( aSch.GetEmbeddedFiles() );
+
+    if( aSymbol )
+    {
+        if( EMBEDDED_FILES* own = aSymbol->GetEmbeddedFiles() )
+        {
+            stack.push_back( own );
+
+            if( const std::unique_ptr<LIB_SYMBOL>& lib = aSymbol->GetLibSymbolRef() )
+                lib->AppendParentEmbeddedFiles( stack );
+        }
+    }
+
+    return stack;
+}
+
+bool isErrorSeverity( SEVERITY aSeverity )
+{
+    return aSeverity == RPT_SEVERITY_ERROR || aSeverity == RPT_SEVERITY_UNDEFINED;
+}
+
+/** A Problem record (spec 8.2); text is KiCad's own English. */
+json simProblem( const char* aCode, SEVERITY aSeverity, const wxString& aText )
+{
+    json problem = json::object();
+    problem["code"] = aCode;
+    problem["severity"] = isErrorSeverity( aSeverity ) ? "error" : "warning";
+    problem["text"] = toUtf8( aText );
+    return problem;
+}
+
+bool mentionsNotFound( const wxString& aText )
+{
+    return aText.Lower().Contains( wxS( "not found" ) );
+}
+
+/** Error and warning lines of aReporter as problems; aErrorCode for errors, a miss as file_missing. */
+void appendProblems( const RUN_LINES_REPORTER& aReporter, const char* aErrorCode, json& aOut,
+                     const std::function<void( json& )>& aStamp = nullptr )
+{
+    for( const auto& [severity, text] : aReporter.m_lines )
+    {
+        if( !isErrorSeverity( severity ) && severity != RPT_SEVERITY_WARNING )
+            continue;
+
+        const char* code = "other";
+
+        if( mentionsNotFound( text ) )
+            code = "file_missing";
+        else if( isErrorSeverity( severity ) )
+            code = aErrorCode;
+
+        json problem = simProblem( code, severity, text );
+
+        if( aStamp )
+            aStamp( problem );
+
+        aOut.push_back( std::move( problem ) );
+    }
+}
+
+/**
+ * A model file's path as the island names it: relative to the project folder (no "..", no
+ * absolute path, no backslash, no variable), or kicad-embed://<name>. Answers the text
+ * KiCad stores in Sim.Library and resolves (SIM_LIB_MGR::ResolveLibraryPath), or nothing.
+ */
+std::optional<wxString> simModelPath( const json& aValue )
+{
+    std::optional<wxString> path = boundedText( aValue, 1, 512 );
+
+    if( !path || hasControlChar( *path ) || path->Contains( wxS( "\\" ) )
+            || path->Contains( wxS( "$" ) ) )
+    {
+        return std::nullopt;
+    }
+
+    const wxString embedPrefix = wxString::FromUTF8( FILEEXT::KiCadUriPrefix.c_str() ) + wxS( "://" );
+
+    if( path->StartsWith( embedPrefix ) )
+    {
+        const wxString name = path->Mid( embedPrefix.length() );
+
+        if( name.IsEmpty() || name.Contains( wxS( "/" ) ) || name.Contains( wxS( ".." ) ) )
+            return std::nullopt;
+
+        return path;
+    }
+
+    if( path->StartsWith( wxS( "/" ) ) || path->StartsWith( wxS( "~" ) ) || path->Contains( wxS( ":" ) ) )
+        return std::nullopt;
+
+    wxArrayString parts = wxSplit( *path, '/' );
+
+    for( const wxString& part : parts )
+    {
+        if( part.IsEmpty() || part == wxS( "." ) || part == wxS( ".." ) )
+            return std::nullopt;
+    }
+
+    return path;
+}
+
+wxString symbolFieldText( SCH_SYMBOL* aSymbol, const wxString& aName )
+{
+    SCH_FIELD* field = fieldNamed( aSymbol, aName );
+    return field ? field->GetText() : wxString();
+}
+
+/** The island's SimModelSheet (spec 8.2) for one instance. */
+json simModelSheetJson( SCH_EDIT_FRAME* aFrame, SCH_SYMBOL* aSymbol, const SCH_SHEET_PATH& aPath )
+{
+    SCHEMATIC&         sch = aFrame->Schematic();
+    RUN_LINES_REPORTER reporter;
+    SIM_LIB_MGR        mgr( &aFrame->Prj() );
+
+    mgr.SetFilesStack( simFilesStack( sch, aSymbol ) );
+
+    const wxString library = symbolFieldText( aSymbol, SIM_LIBRARY_FIELD );
+    const wxString device = symbolFieldText( aSymbol, SIM_DEVICE_FIELD );
+
+    json out = json::object();
+    out["uuid"] = toUtf8( aSymbol->m_Uuid.AsString() );
+    out["sheetPath"] = toUtf8( aPath.PathAsString() );
+    out["ref"] = toUtf8( aSymbol->GetRef( &aPath, false ) );
+    out["enabled"] = !aSymbol->GetExcludedFromSim( &aPath, wxEmptyString );
+    out["source"] = "none";
+    out["device"] = "";
+    out["type"] = "";
+    out["typeName"] = "";
+    out["file"] = nullptr;
+    out["pins"] = json::array();
+    out["params"] = json::array();
+    out["problems"] = json::array();
+
+    try
+    {
+        SIM_LIBRARY::MODEL libModel = mgr.CreateModel( &aPath, *aSymbol, /*aResolve*/ true, 0,
+                                                       wxEmptyString, reporter );
+        SIM_MODEL&         model = libModel.model;
+        const SIM_MODEL::TYPE type = model.GetType();
+
+        if( !library.IsEmpty() )
+            out["source"] = "file";
+        else if( !device.IsEmpty() )
+            out["source"] = "builtin";
+        else if( type != SIM_MODEL::TYPE::NONE )
+            out["source"] = "inferred";
+
+        if( type != SIM_MODEL::TYPE::NONE )
+        {
+            out["device"] = SIM_MODEL::DeviceInfo( model.GetDeviceType() ).fieldValue;
+            out["type"] = simTypeKey( type );
+            out["typeName"] = SIM_MODEL::TypeInfo( type ).description;
+        }
+
+        if( !library.IsEmpty() )
+        {
+            json file = json::object();
+            file["path"] = toUtf8( library );
+            file["model"] = toUtf8( symbolFieldText( aSymbol, SIM_NAME_FIELD ) );
+            out["file"] = std::move( file );
+        }
+
+        for( const SIM_MODEL_PIN& pin : model.GetPins() )
+        {
+            json p = json::object();
+            p["symbolPin"] = toUtf8( pin.symbolPinNumber );
+            p["modelPin"] = pin.modelPinName;
+            out["pins"].push_back( std::move( p ) );
+        }
+
+        for( int i = 0; i < model.GetParamCount(); ++i )
+        {
+            const SIM_MODEL::PARAM& param = model.GetParam( i );
+
+            if( param.info.dir == SIM_MODEL::PARAM::DIR_OUT )
+                continue;   // an output of the simulator, never set
+
+            json p = json::object();
+            p["name"] = param.info.name;
+            p["value"] = param.value;
+            p["default"] = param.info.defaultValue;
+            p["unit"] = param.info.unit;
+            p["given"] = !model.GetParamOverride( i ).value.empty();
+            out["params"].push_back( std::move( p ) );
+        }
+
+        if( model.GetDeviceType() == SIM_MODEL::DEVICE_T::KIBIS )
+        {
+            json ibis = json::object();
+            ibis["pin"] = toUtf8( symbolFieldText( aSymbol, SIM_LIBRARY_IBIS::PIN_FIELD ) );
+            ibis["model"] = toUtf8( symbolFieldText( aSymbol, SIM_LIBRARY_IBIS::MODEL_FIELD ) );
+            ibis["diff"] = symbolFieldText( aSymbol, SIM_LIBRARY_IBIS::DIFF_FIELD ) == wxS( "1" );
+            ibis["type"] = SIM_MODEL::TypeInfo( type ).fieldValue;
+            out["ibis"] = std::move( ibis );
+        }
+    }
+    catch( const IO_ERROR& e )
+    {
+        reporter.Report( e.What(), RPT_SEVERITY_ERROR );
+    }
+    catch( const std::exception& e )
+    {
+        reporter.Report( wxString::FromUTF8( e.what() ), RPT_SEVERITY_ERROR );
+    }
+
+    const std::string uuid = out["uuid"].get<std::string>();
+    const std::string path = out["sheetPath"].get<std::string>();
+    const std::string ref = out["ref"].get<std::string>();
+
+    appendProblems( reporter, "model_error", out["problems"],
+                    [&]( json& aProblem )
+                    {
+                        aProblem["ref"] = ref;
+                        aProblem["uuid"] = uuid;
+                        aProblem["sheetPath"] = path;
+                    } );
+
+    return out;
+}
+
+/** One read sim.model.set, ready for the apply coroutine. */
+struct SIM_MODEL_SET
+{
+    bool                                     remove = false;
+    std::vector<std::pair<wxString, wxString>> fields;   // the owned Sim.* fields to hold
+};
+
+/** Reads the pins array of a set against the symbol's pins and the model's. */
+bool readSimPins( const json& aPins, const std::vector<SCH_PIN*>& aSymbolPins, SIM_MODEL& aModel )
+{
+    if( !aPins.is_array() || aPins.size() > 1024 )
+        return false;
+
+    if( aPins.empty() )
+        return true;   // the model's own default map (model pin n on symbol pin n)
+
+    std::set<wxString>    symbolPins;
+    std::set<std::string> modelPins;
+
+    for( SCH_PIN* pin : aSymbolPins )
+        symbolPins.insert( pin->GetNumber() );
+
+    for( int i = 0; i < aModel.GetPinCount(); ++i )
+        modelPins.insert( aModel.GetPin( i ).modelPinName );
+
+    std::set<wxString>    seenSymbol;
+    std::set<std::string> seenModel;
+
+    std::vector<std::pair<std::string, wxString>> pairs;
+
+    for( const json& entry : aPins )
+    {
+        if( !entry.is_object() || entry.size() != 2 )
+            return false;
+
+        auto symbolPin = entry.find( "symbolPin" );
+        auto modelPin = entry.find( "modelPin" );
+
+        if( symbolPin == entry.end() || modelPin == entry.end() )
+            return false;
+
+        std::optional<wxString> s = boundedText( *symbolPin, 1, 64 );
+        std::optional<wxString> m = boundedText( *modelPin, 1, 64 );
+
+        if( !s || !m )
+            return false;
+
+        const std::string model = toUtf8( *m );
+
+        if( !symbolPins.count( *s ) || !modelPins.count( model ) || seenSymbol.count( *s )
+                || seenModel.count( model ) )
+        {
+            return false;
+        }
+
+        seenSymbol.insert( *s );
+        seenModel.insert( model );
+        pairs.emplace_back( model, *s );
+    }
+
+    // The dialog's way: every model pin starts unconnected, then each row is assigned.
+    for( int i = 0; i < aModel.GetPinCount(); ++i )
+        aModel.AssignSymbolPinNumberToModelPin( i, wxEmptyString );
+
+    for( const auto& [model, symbol] : pairs )
+        aModel.AssignSymbolPinNumberToModelPin( model, symbol );
+
+    return true;
+}
+
+/** Sets each param of a set on aModel; false for an unknown name or a refused value. */
+bool readSimParams( const json& aParams, SIM_MODEL& aModel, const std::set<std::string>& aReserved )
+{
+    if( !aParams.is_object() || aParams.size() > 1024 )
+        return false;
+
+    for( auto it = aParams.begin(); it != aParams.end(); ++it )
+    {
+        const std::string& name = it.key();
+
+        if( aReserved.count( name ) )
+            continue;
+
+        std::optional<wxString> value = boundedText( it.value(), 0, 1024 );
+
+        if( name.empty() || name.size() > 64 || !value || hasControlChar( *value )
+                || !aModel.FindParam( name ) )
+        {
+            return false;
+        }
+
+        const SIM_MODEL::PARAM* param = aModel.FindParam( name );
+
+        if( param->info.dir == SIM_MODEL::PARAM::DIR_OUT )
+            return false;
+
+        aModel.SetParamValue( name, toUtf8( *value ) );   // throws IO_ERROR on refusal
+    }
+
+    return true;
+}
+
+/**
+ * Reads a sim.model.set's model whole on a scratch model (spec 6.2), and answers the owned
+ * Sim.* fields SIM_MODEL::WriteFields gives it. False for any key, type, name or value
+ * outside the contract; nothing is touched.
+ */
+bool readSimModelSet( SCH_EDIT_FRAME* aFrame, SCH_SYMBOL* aSymbol, const json& aModel,
+                      SIM_MODEL_SET& aOut )
+{
+    if( aModel.is_null() )
+    {
+        aOut.remove = true;
+        return true;
+    }
+
+    if( !aModel.is_object() )
+        return false;
+
+    auto source = aModel.find( "source" );
+
+    if( source == aModel.end() || !source->is_string() )
+        return false;
+
+    const std::string     kind = source->get<std::string>();
+    std::vector<SCH_PIN*> pins = sortedSimPins( aSymbol );
+
+    // The symbol's fields less the ones a model write owns: the copy DIALOG_SIM_MODEL edits.
+    std::vector<SCH_FIELD> fields;
+
+    for( const SCH_FIELD& field : aSymbol->GetFields() )
+    {
+        if( !isSimOwnedField( field.GetName() ) )
+            fields.push_back( field );
+    }
+
+    if( fields.empty() )
+        return false;   // never: a symbol carries its mandatory fields
+
+    RUN_LINES_REPORTER reporter;
+
+    if( kind == "builtin" )
+    {
+        if( aModel.size() != 4 || !aModel.contains( "type" ) || !aModel.contains( "params" )
+                || !aModel.contains( "pins" ) || !aModel["type"].is_string() )
+        {
+            return false;
+        }
+
+        std::optional<SIM_MODEL::TYPE> type = simTypeOfKey( aModel["type"].get<std::string>() );
+
+        if( !type )
+            return false;
+
+        const SIM_MODEL::DEVICE_T device = SIM_MODEL::TypeInfo( *type ).deviceType;
+
+        // Only what the model dialog's Built-in tab offers: a file's subcircuit, an IBIS part
+        // and a device the dialog never lists are not built in.
+        if( !SIM_MODEL::DeviceInfo( device ).showInMenu || device == SIM_MODEL::DEVICE_T::SUBCKT
+                || device == SIM_MODEL::DEVICE_T::KIBIS )
+        {
+            return false;
+        }
+
+        std::unique_ptr<SIM_MODEL> model = SIM_MODEL::Create( *type, pins, reporter );
+
+        if( !model || reporter.HasMessageOfSeverity( RPT_SEVERITY_UNDEFINED | RPT_SEVERITY_ERROR ) )
+            return false;
+
+        if( !readSimParams( aModel["params"], *model, {} )
+                || !readSimPins( aModel["pins"], pins, *model ) )
+        {
+            return false;
+        }
+
+        model->SetIsStoredInValue( false );
+        model->WriteFields( fields );
+    }
+    else if( kind == "file" )
+    {
+        if( aModel.size() != 5 || !aModel.contains( "path" ) || !aModel.contains( "model" )
+                || !aModel.contains( "params" ) || !aModel.contains( "pins" ) )
+        {
+            return false;
+        }
+
+        std::optional<wxString> path = simModelPath( aModel["path"] );
+        std::optional<wxString> name = boundedText( aModel["model"], 1, 256 );
+        const json&             params = aModel["params"];
+
+        if( !path || !name || hasControlChar( *name ) || !params.is_object() )
+            return false;
+
+        SetFieldValue( fields, SIM_LIBRARY_FIELD, toUtf8( *path ), false );
+        SetFieldValue( fields, SIM_NAME_FIELD, toUtf8( *name ), false );
+
+        // An IBIS file's part takes its pin, its pin model, the differential flag and the
+        // driver kind as fields (DIALOG_SIM_MODEL's IBIS rows), carried in params under
+        // four reserved keys.
+        const bool ibisFile = path->Lower().EndsWith( wxS( ".ibs" ) );
+        const std::set<std::string> reserved = { "ibis.pin", "ibis.model", "ibis.diff", "ibis.type" };
+
+        if( ibisFile )
+        {
+            std::string ibisType = "DEVICE";
+
+            for( const std::string& key : reserved )
+            {
+                auto it = params.find( key );
+
+                if( it == params.end() )
+                    continue;
+
+                std::optional<wxString> text = boundedText( *it, 0, 256 );
+
+                if( !text || hasControlChar( *text ) )
+                    return false;
+
+                const std::string value = toUtf8( *text );
+
+                if( key == "ibis.pin" )
+                    SetFieldValue( fields, SIM_LIBRARY_IBIS::PIN_FIELD, value, false );
+                else if( key == "ibis.model" )
+                    SetFieldValue( fields, SIM_LIBRARY_IBIS::MODEL_FIELD, value, false );
+                else if( key == "ibis.diff" )
+                {
+                    if( value != "" && value != "1" )
+                        return false;
+
+                    SetFieldValue( fields, SIM_LIBRARY_IBIS::DIFF_FIELD, value, false );
+                }
+                else if( key == "ibis.type" )
+                {
+                    if( value != "DEVICE" && value != "DCDRIVER" && value != "RECTDRIVER"
+                            && value != "PRBSDRIVER" )
+                    {
+                        return false;
+                    }
+
+                    ibisType = value;
+                }
+            }
+
+            SetFieldValue( fields, SIM_DEVICE_FIELD, "IBIS", false );
+            SetFieldValue( fields, SIM_DEVICE_SUBTYPE_FIELD, ibisType, false );
+        }
+        else
+        {
+            for( const std::string& key : reserved )
+            {
+                if( params.contains( key ) )
+                    return false;
+            }
+        }
+
+        SIM_LIB_MGR mgr( &aFrame->Prj() );
+        mgr.SetForceFullParse();
+        mgr.SetFilesStack( simFilesStack( aFrame->Schematic(), aSymbol ) );
+
+        SIM_LIBRARY::MODEL libModel = mgr.CreateModel( fields, /*aResolve*/ false, 0, pins, reporter );
+
+        if( reporter.HasMessageOfSeverity( RPT_SEVERITY_UNDEFINED | RPT_SEVERITY_ERROR ) )
+            return false;
+
+        // The file was read and holds the named model (else CreateModel made a fallback).
+        bool found = false;
+
+        for( const auto& [libPath, library] : mgr.GetLibraries() )
+        {
+            if( library.get().FindModel( toUtf8( *name ) ) )
+                found = true;
+        }
+
+        if( !found )
+            return false;
+
+        if( !readSimParams( params, libModel.model, ibisFile ? reserved : std::set<std::string>() )
+                || !readSimPins( aModel["pins"], pins, libModel.model ) )
+        {
+            return false;
+        }
+
+        libModel.model.SetIsStoredInValue( false );
+        libModel.model.WriteFields( fields );
+    }
+    else
+    {
+        return false;
+    }
+
+    for( const SCH_FIELD& field : fields )
+    {
+        if( isSimOwnedField( field.GetName() ) && !field.GetText().IsEmpty() )
+            aOut.fields.emplace_back( field.GetName(), field.GetText() );
+    }
+
+    return true;
+}
+
+/** Applies a read set on the apply coroutine, as ONE commit (one undo step). */
+void applySimModelSet( SCH_EDIT_FRAME* aFrame, SCH_SYMBOL* aSymbol, const SCH_SHEET_PATH& aPath,
+                       const SIM_MODEL_SET& aSet )
+{
+    SCHEMATIC&  sch = aFrame->Schematic();
+    SCH_SCREEN* screen = aPath.LastScreen();
+    SCH_COMMIT  commit( aFrame );
+
+    commit.Modify( aSymbol, screen );
+
+    std::set<wxString> kept;
+
+    for( const auto& [name, text] : aSet.fields )
+        kept.insert( name );
+
+    for( const char* owned : SIM_OWNED_FIELDS )
+    {
+        const wxString name = wxString::FromUTF8( owned );
+
+        if( !kept.count( name ) && fieldNamed( aSymbol, name ) )
+            aSymbol->RemoveField( name );
+    }
+
+    for( const auto& [name, text] : aSet.fields )
+    {
+        if( SCH_FIELD* field = fieldNamed( aSymbol, name ) )
+        {
+            field->SetText( text );
+            continue;
+        }
+
+        // As the symbol properties dialog adds a row, hidden (KiCad writes Sim.* fields
+        // hidden): the symbol's anchor, the reference's angle, the default text size.
+        SCH_FIELD        added( aSymbol, FIELD_T::USER, name );
+        const int        size = sch.Settings().m_DefaultTextSize;
+        const SCH_FIELD* reference = aSymbol->GetField( FIELD_T::REFERENCE );
+
+        added.SetText( text );
+        added.SetVisible( false );
+        added.SetTextSize( VECTOR2I( size, size ) );
+
+        if( reference )
+            added.SetTextAngle( reference->GetTextAngle() );
+
+        added.SetPosition( aSymbol->GetPosition() );
+        added.SetOrdinal( aSymbol->GetNextFieldOrdinal() );
+
+        if( SCH_FIELD* placed = aSymbol->AddField( added ) )
+            placed->SetParent( aSymbol );
+    }
+
+    if( aSymbol->IsMultiUnit() )
+        aSymbol->SyncOtherUnits( aPath, commit, nullptr, wxEmptyString );
+
+    commit.Push( wxT( "Edit simulation model" ) );
+}
+
+/** A SIM_LIBRARY's models (spec 6.2 kicadSimFileRead). */
+json simFileJson( SCH_EDIT_FRAME* aFrame, const wxString& aPath )
+{
+    RUN_LINES_REPORTER reporter;
+    SIM_LIB_MGR        mgr( &aFrame->Prj() );
+
+    mgr.SetForceFullParse();
+    mgr.SetFilesStack( simFilesStack( aFrame->Schematic(), nullptr ) );
+
+    json out = json::object();
+    out["kind"] = aPath.Lower().EndsWith( wxS( ".ibs" ) ) ? "ibis" : "spice";
+    out["models"] = json::array();
+    out["problems"] = json::array();
+
+    try
+    {
+        mgr.SetLibrary( aPath, reporter );
+
+        for( const auto& [libPath, library] : mgr.GetLibraries() )
+        {
+            const bool ibis = dynamic_cast<const SIM_LIBRARY_IBIS*>( &library.get() ) != nullptr;
+            out["kind"] = ibis ? "ibis" : "spice";
+
+            for( const SIM_LIBRARY::MODEL& entry : library.get().GetModels() )
+            {
+                const SIM_MODEL& model = entry.model;
+                json             m = json::object();
+                json             pinNames = json::array();
+
+                m["name"] = entry.name;
+                m["type"] = simTypeKey( model.GetType() );
+
+                if( ibis )
+                {
+                    m["kind"] = "ibis";
+
+                    if( const SIM_MODEL_IBIS* part = dynamic_cast<const SIM_MODEL_IBIS*>( &model ) )
+                    {
+                        for( const auto& [pin, pinName] : part->GetIbisPins() )
+                            pinNames.push_back( pin );
+                    }
+                }
+                else
+                {
+                    m["kind"] = model.GetType() == SIM_MODEL::TYPE::SUBCKT ? "subckt" : "model";
+
+                    for( const std::string& pin : model.GetPinNames() )
+                        pinNames.push_back( pin );
+                }
+
+                m["pins"] = std::move( pinNames );
+                out["models"].push_back( std::move( m ) );
+            }
+        }
+    }
+    catch( const IO_ERROR& e )
+    {
+        reporter.Report( e.What(), RPT_SEVERITY_ERROR );
+    }
+    catch( const std::exception& e )
+    {
+        reporter.Report( wxString::FromUTF8( e.what() ), RPT_SEVERITY_ERROR );
+    }
+
+    const std::string path = toUtf8( aPath );
+
+    appendProblems( reporter, "file_error", out["problems"],
+                    [&]( json& aProblem ) { aProblem["path"] = path; } );
+
+    return out;
+}
+
+// Runs
+
+std::vector<std::string> simAllPlots()
+{
+    std::vector<std::string> plots;
+
+    if( char** names = pcbjam_ngSpice_AllPlots() )
+    {
+        for( char** name = names; *name; ++name )
+            plots.emplace_back( *name );
+    }
+
+    return plots;
+}
+
+std::vector<std::string> simAllVecs( const std::string& aPlot )
+{
+    std::vector<std::string> vecs;
+    std::string              plot = aPlot;
+
+    if( char** names = pcbjam_ngSpice_AllVecs( plot.data() ) )
+    {
+        for( char** name = names; *name; ++name )
+            vecs.emplace_back( *name );
+    }
+
+    return vecs;
+}
+
+/** The run in flight: one at a time per engine. */
+struct SIM_LIVE_RUN
+{
+    long long                run = -1;
+    std::string              dir;
+    SIM_TYPE                 kind = ST_UNKNOWN;
+    std::vector<std::string> plotsBefore;
+    int                      depth = 0;
+    bool                     started = false;         // bg_run asked: an idle event now ends it
+    bool                     stopRequested = false;
+    bool                     finishQueued = false;
+    json                     problems = json::array();
+    json                     lines = json::array();
+};
+
+std::optional<SIM_LIVE_RUN>& simLive()
+{
+    static std::optional<SIM_LIVE_RUN> live;
+    return live;
+}
+
+/** The circuit model of the last run: its signal map names the vectors until the next run. */
+std::shared_ptr<SPICE_CIRCUIT_MODEL>& simCircuit()
+{
+    static std::shared_ptr<SPICE_CIRCUIT_MODEL> circuit;
+    return circuit;
+}
+
+/** The plots each finished run made, by run number (an FFT names its transient's). */
+std::map<long long, std::vector<std::string>>& simRunPlots()
+{
+    static std::map<long long, std::vector<std::string>> plots;
+    return plots;
+}
+
+/** The plots the last run of each kind made: destroyed when that kind runs again. */
+std::map<int, std::vector<std::string>>& simKindPlots()
+{
+    static std::map<int, std::vector<std::string>> plots;
+    return plots;
+}
+
+void finishSimRun();
+
+/**
+ * NGSPICE's reporter: the console lines (the last 2,000), and the finish queued on the
+ * apply coroutine when the simulator goes idle. Report and OnSimStateChange are called
+ * from pcbjam_ngspice_event, a fresh wasm entry that must never suspend: they only store
+ * and queue (no vector is read here).
+ */
+class SIM_RUN_REPORTER : public SIMULATOR_REPORTER
+{
+public:
+    using REPORTER::Report;
+
+    REPORTER& Report( const wxString& aText, SEVERITY aSeverity = RPT_SEVERITY_UNDEFINED ) override
+    {
+        REPORTER::Report( aText, aSeverity );
+
+        for( wxString line : wxSplit( aText, '\n', '\0' ) )
+        {
+            line.Trim( true );
+
+            if( line.IsEmpty() )
+                continue;
+
+            m_console.push_back( toUtf8( line ) );
+
+            while( m_console.size() > 2000 )
+                m_console.pop_front();
+        }
+
+        return *this;
+    }
+
+    void OnSimStateChange( SIMULATOR* aObject, SIM_STATE aNewState ) override
+    {
+        std::optional<SIM_LIVE_RUN>& live = simLive();
+
+        if( aNewState != SIM_IDLE || !live || !live->started || live->finishQueued )
+            return;
+
+        SCH_EDIT_FRAME* fr = schFrame();
+
+        if( !fr )
+            return;
+
+        live->finishQueued = true;
+        pcbjam_collab::runOnCoroutine( fr, []() { finishSimRun(); } );
+    }
+
+    std::deque<std::string> m_console;
+};
+
+SIM_RUN_REPORTER& simReporter()
+{
+    static SIM_RUN_REPORTER reporter;
+    return reporter;
+}
+
+/** The one simulator (SIMULATOR::CreateInstance answers a process-wide NGSPICE). */
+std::shared_ptr<SPICE_SIMULATOR> simEngine( SCH_EDIT_FRAME* aFrame )
+{
+    static std::shared_ptr<SPICE_SIMULATOR> engine;
+
+    if( !engine )
+    {
+        // NGSPICE's constructor binds the client and asks the service to init: the worker
+        // boots here, on the first run of the engine's life.
+        engine = SIMULATOR::CreateInstance( "ngspice" );
+
+        if( !engine )
+            return nullptr;
+
+        engine->SetReporter( &simReporter() );
+        engine->Settings() = aFrame->Prj().GetProjectFile().m_SchematicSettings->m_NgspiceSettings;
+        engine->Init();
+    }
+    else
+    {
+        // A design opened since: its own settings (SIMULATOR_FRAME::LoadSettings).
+        engine->Settings() = aFrame->Prj().GetProjectFile().m_SchematicSettings->m_NgspiceSettings;
+    }
+
+    return engine;
+}
+
+/**
+ * Does any symbol name an IBIS model? Its netlist line is made by KIBIS through the shared
+ * simulator (SIMULATOR::CreateInstance's one NGSPICE), whose Init reads the simulator's
+ * settings: those must be set first (simEngine), as SIMULATOR_FRAME sets them.
+ */
+bool designHasIbis( SCH_EDIT_FRAME* aFrame )
+{
+    for( const SCH_SHEET_PATH& path : aFrame->Schematic().Hierarchy() )
+    {
+        SCH_SCREEN* screen = path.LastScreen();
+
+        if( !screen )
+            continue;
+
+        for( SCH_ITEM* item : screen->Items().OfType( SCH_SYMBOL_T ) )
+        {
+            SCH_SYMBOL* symbol = static_cast<SCH_SYMBOL*>( item );
+
+            if( symbolFieldText( symbol, SIM_DEVICE_FIELD ).Upper() == wxS( "IBIS" )
+                    || symbolFieldText( symbol, SIM_LIBRARY_FIELD ).Lower().EndsWith( wxS( ".ibs" ) ) )
+            {
+                return true;
+            }
+        }
+    }
+
+    return false;
+}
+
+/** The netlist options (spec 8.1 SimOptions) as NETLIST_EXPORTER_SPICE flags, SIM_TAB's base. */
+std::optional<unsigned> simOptionFlags( const json& aOptions )
+{
+    if( !aOptions.is_object() || aOptions.size() != 4 )
+        return std::nullopt;
+
+    static const char* const keys[] = { "voltages", "currents", "dissipations", "events" };
+
+    for( const char* key : keys )
+    {
+        auto it = aOptions.find( key );
+
+        if( it == aOptions.end() || !it->is_boolean() )
+            return std::nullopt;
+    }
+
+    unsigned flags = NETLIST_EXPORTER_SPICE::OPTION_ADJUST_INCLUDE_PATHS
+                     | NETLIST_EXPORTER_SPICE::OPTION_ADJUST_PASSIVE_VALS;
+
+    if( aOptions["voltages"].get<bool>() )
+        flags |= NETLIST_EXPORTER_SPICE::OPTION_SAVE_ALL_VOLTAGES;
+
+    if( aOptions["currents"].get<bool>() )
+        flags |= NETLIST_EXPORTER_SPICE::OPTION_SAVE_ALL_CURRENTS;
+
+    if( aOptions["dissipations"].get<bool>() )
+        flags |= NETLIST_EXPORTER_SPICE::OPTION_SAVE_ALL_DISSIPATIONS;
+
+    if( aOptions["events"].get<bool>() )
+        flags |= NETLIST_EXPORTER_SPICE::OPTION_SAVE_ALL_EVENTS;
+
+    return flags;
+}
+
+/** Printable ASCII with no ';', quote or backslash: nothing of SPICE beyond the analysis words. */
+bool isPlainCommandText( const std::string& aText )
+{
+    for( char c : aText )
+    {
+        const unsigned char u = static_cast<unsigned char>( c );
+
+        if( u < 0x20 || u > 0x7e || c == ';' || c == '"' || c == '\'' || c == '\\' || c == '`' )
+            return false;
+    }
+
+    return true;
+}
+
+/**
+ * An analysis line the island wrote (bridge/sim.ts commandOf): one line, one of the seven
+ * analyses KiCad runs with bg_run; "" for the sheet's own directive.
+ */
+bool isAnalysisCommand( const std::string& aCommand )
+{
+    if( aCommand.empty() )
+        return true;
+
+    if( aCommand.size() > 4096 || !isPlainCommandText( aCommand ) )
+        return false;
+
+    switch( SPICE_CIRCUIT_MODEL::CommandToSimType( wxString::FromUTF8( aCommand.c_str() ) ) )
+    {
+    case ST_OP: case ST_DC: case ST_AC: case ST_TRAN: case ST_NOISE: case ST_PZ: case ST_SP:
+        return aCommand[0] == '.';
+    default:
+        return false;
+    }
+}
+
+/** An FFT's lines (DIALOG_SIM_COMMAND's: "linearize <vectors>", "fft <vectors>", the window). */
+bool readFftLines( const std::string& aCommand, std::vector<std::string>& aLines )
+{
+    if( aCommand.empty() || aCommand.size() > 16384 )
+        return false;
+
+    bool hasFft = false;
+
+    for( const wxString& raw : wxSplit( wxString::FromUTF8( aCommand.c_str() ), '\n', '\0' ) )
+    {
+        std::string line = toUtf8( raw );
+
+        if( line.empty() )
+            continue;
+
+        if( !isPlainCommandText( line ) || aLines.size() >= 16 )
+            return false;
+
+        if( line.rfind( "fft ", 0 ) == 0 )
+            hasFft = true;
+        else if( line.rfind( "linearize ", 0 ) != 0 && line.rfind( "set specwindow=", 0 ) != 0
+                 && line.rfind( "set specwindoworder=", 0 ) != 0 )
+            return false;
+
+        aLines.push_back( line );
+    }
+
+    return hasFft;
+}
+
+/** A SPICE number (spec 7.2's grammar), the tuner overrides' values. */
+bool isSpiceNumber( const std::string& aText )
+{
+    static const wxRegEx number( wxS( "^[+-]?([0-9]+\\.?[0-9]*|\\.[0-9]+)([eE][+-]?[0-9]+)?"
+                                      "(f|p|n|u|m|k|meg|g|t)?$" ),
+                                 wxRE_ADVANCED | wxRE_ICASE );
+
+    return !aText.empty() && aText.size() <= 64 && number.Matches( wxString::FromUTF8( aText.c_str() ) );
+}
+
+struct SIM_OVERRIDE
+{
+    wxString ref;
+    double   value = 0.0;
+};
+
+/**
+ * The annotation check every netlist needs (SCH_EDIT_FRAME::ReadyToNetlist with a
+ * COLLECTING handler, never the Annotate dialog): a part with no number or a designator
+ * used twice is an error problem.
+ */
+void collectAnnotationProblems( SCH_EDIT_FRAME* aFrame, json& aOut )
+{
+    aFrame->CheckAnnotate(
+            [&]( ERCE_T aType, const wxString& aMsg, SCH_REFERENCE* aItemA, SCH_REFERENCE* )
+            {
+                json problem = simProblem( "other", RPT_SEVERITY_ERROR, aMsg );
+
+                if( aItemA )
+                {
+                    problem["ref"] = toUtf8( aItemA->GetSymbol()->GetRef( &aItemA->GetSheetPath(), true ) );
+                    problem["uuid"] = toUtf8( aItemA->GetSymbol()->m_Uuid.AsString() );
+                    problem["sheetPath"] = toUtf8( aItemA->GetSheetPath().PathAsString() );
+                }
+
+                aOut.push_back( std::move( problem ) );
+            },
+            ANNOTATE_ALL, true, SYMBOL_FILTER_NON_POWER );
+}
+
+/**
+ * Each simulated symbol's model made once (one SIM_LIB_MGR, so a file is read once), its
+ * failures as problems carrying the symbol: model_error, a missing file as file_missing.
+ */
+void collectModelProblems( SCH_EDIT_FRAME* aFrame, json& aOut )
+{
+    SCHEMATIC&         sch = aFrame->Schematic();
+    SIM_LIB_MGR        mgr( &aFrame->Prj() );
+    std::set<wxString> seenRefs;
+
+    for( const SCH_SHEET_PATH& path : sch.Hierarchy() )
+    {
+        SCH_SCREEN* screen = path.LastScreen();
+
+        if( !screen )
+            continue;
+
+        for( SCH_ITEM* item : screen->Items().OfType( SCH_SYMBOL_T ) )
+        {
+            SCH_SYMBOL* symbol = static_cast<SCH_SYMBOL*>( item );
+
+            if( symbol->ResolveExcludedFromSim( &path, wxEmptyString ) )
+                continue;
+
+            const wxString ref = symbol->GetRef( &path, true );
+
+            if( !seenRefs.insert( ref ).second )
+                continue;   // a later unit of a part already made
+
+            RUN_LINES_REPORTER reporter;
+
+            try
+            {
+                mgr.SetFilesStack( simFilesStack( sch, symbol ) );
+                mgr.CreateModel( &path, *symbol, /*aResolve*/ true, 0, wxEmptyString, reporter );
+            }
+            catch( const IO_ERROR& e )
+            {
+                reporter.Report( e.What(), RPT_SEVERITY_ERROR );
+            }
+            catch( const std::exception& e )
+            {
+                reporter.Report( wxString::FromUTF8( e.what() ), RPT_SEVERITY_ERROR );
+            }
+
+            const std::string r = toUtf8( ref );
+            const std::string uuid = toUtf8( symbol->m_Uuid.AsString() );
+            const std::string sheetPath = toUtf8( path.PathAsString() );
+
+            appendProblems( reporter, "model_error", aOut,
+                            [&]( json& aProblem )
+                            {
+                                aProblem["ref"] = r;
+                                aProblem["uuid"] = uuid;
+                                aProblem["sheetPath"] = sheetPath;
+                            } );
+        }
+    }
+}
+
+/** The circuit read's own lines not already said per symbol (same text), as problems. */
+void appendCircuitProblems( const RUN_LINES_REPORTER& aReporter, json& aOut )
+{
+    std::set<std::string> said;
+
+    for( const json& problem : aOut )
+        said.insert( problem.value( "text", "" ) );
+
+    json more = json::array();
+    appendProblems( aReporter, "other", more );
+
+    for( json& problem : more )
+    {
+        if( !said.count( problem.value( "text", "" ) ) )
+            aOut.push_back( std::move( problem ) );
+    }
+}
+
+bool hasErrorProblem( const json& aProblems )
+{
+    for( const json& problem : aProblems )
+    {
+        if( problem.value( "severity", "" ) == "error" )
+            return true;
+    }
+
+    return false;
+}
+
+json consoleJson()
+{
+    json lines = json::array();
+
+    for( const std::string& line : simReporter().m_console )
+        lines.push_back( line );
+
+    return lines;
+}
+
+/** The record .cc-sim.json, written LAST, after which the run is over. */
+void writeSimRecord( const std::string& aDir, long long aRun, const char* aError,
+                     const std::string& aMessage, const json& aLines, const json& aProblems )
+{
+    json record = json::object();
+    record["run"] = aRun;
+    record["error"] = aError;
+    record["message"] = aMessage;
+    record["lines"] = aLines;
+    record["problems"] = aProblems;
+    writeRunDone( aDir, ".cc-sim.json", record );
+}
+
+/** A plot's x vector: KiCad's own reading (NGSPICE::GetXAxis), or none (op, pz). */
+std::optional<std::string> simScaleOf( const std::vector<std::string>& aVecs )
+{
+    for( const std::string& vec : aVecs )
+    {
+        if( vec == "time" || vec == "frequency" )
+            return vec;
+    }
+
+    for( const std::string& vec : aVecs )
+    {
+        if( wxString::FromUTF8( vec.c_str() ).Lower().EndsWith( wxS( "-sweep" ) ) )
+            return vec;
+    }
+
+    for( const std::string& vec : aVecs )
+    {
+        if( vec == "sweep" )
+            return vec;
+    }
+
+    return std::nullopt;
+}
+
+const char* simTraceName( SIM_TRACE_TYPE aType )
+{
+    switch( aType & SPT_Y_AXIS_MASK )
+    {
+    case SPT_VOLTAGE: return "voltage";
+    case SPT_CURRENT: return "current";
+    case SPT_POWER:   return "power";
+    default:          return "other";
+    }
+}
+
+/**
+ * The finish of a run, on the apply coroutine: every plot the run made with its vectors'
+ * signal map, the operating point's values handed to the schematic as KiCad's frame hands
+ * them (SCHEMATIC::SetOperatingPoint), then result.json, then the record last.
+ */
+void finishSimRun()
+{
+    std::optional<SIM_LIVE_RUN>& live = simLive();
+
+    if( !live )
+        return;
+
+    // A copy: the run stays live (a netlist or a second run refused) until its record.
+    SIM_LIVE_RUN run = *live;
+
+    SCH_EDIT_FRAME*                       fr = schFrame();
+    std::shared_ptr<SPICE_CIRCUIT_MODEL>& circuit = simCircuit();
+    std::shared_ptr<SPICE_SIMULATOR>      engine = fr ? simEngine( fr ) : nullptr;
+
+    json        result = json::object();
+    json        plotsOut = json::array();
+    json        op = nullptr;
+    const char* error = "";
+    std::string message;
+
+    std::vector<std::string> made;
+
+    try
+    {
+        if( engine )
+        {
+            // SIMULATOR_FRAME::onSimFinished's grace: the simulator may report idle while
+            // it still writes; IsRunning is the client's own mirror, never an RPC.
+            const std::set<std::string> before( run.plotsBefore.begin(), run.plotsBefore.end() );
+
+            for( const std::string& plot : simAllPlots() )
+            {
+                if( !before.count( plot ) && plot != "const" )
+                    made.push_back( plot );
+            }
+
+            for( const std::string& plot : made )
+            {
+                std::vector<std::string>   vecs = simAllVecs( plot );
+                std::optional<std::string> scale = simScaleOf( vecs );
+                const bool                 complex = run.kind == ST_AC || run.kind == ST_SP
+                                                     || run.kind == ST_PZ || run.kind == ST_FFT;
+
+                engine->Command( "setplot " + plot );
+
+                // One vector's length stands for the plot's (ngspice keeps every vector of
+                // an analysis plot the same length); read through the client's arena, then
+                // freed by the next read.
+                int length = 0;
+
+                if( !vecs.empty() )
+                {
+                    const std::string& probe = scale ? *scale : vecs.front();
+                    length = static_cast<int>( engine->GetRealVector( probe ).size() );
+                }
+
+                json vectors = json::array();
+
+                for( const std::string& vec : vecs )
+                {
+                    wxString       signal;
+                    SIM_TRACE_TYPE type = SPT_UNKNOWN;
+
+                    if( circuit && ( !scale || vec != *scale ) )
+                        type = circuit->VectorToSignal( vec, signal );
+
+                    json v = json::object();
+                    v["name"] = vec;
+                    v["signal"] = signal.IsEmpty() ? vec : toUtf8( signal );
+
+                    if( scale && vec == *scale )
+                        v["trace"] = "other";
+                    else if( run.kind == ST_NOISE )
+                        v["trace"] = "noise";
+                    else
+                        v["trace"] = simTraceName( type );
+
+                    v["complex"] = complex;
+                    v["length"] = length;
+                    vectors.push_back( std::move( v ) );
+                }
+
+                json p = json::object();
+                p["name"] = plot;
+                p["x"] = scale ? json( *scale ) : json( nullptr );
+                p["vectors"] = std::move( vectors );
+                plotsOut.push_back( std::move( p ) );
+
+                if( run.kind == ST_OP && op.is_null() && circuit && fr )
+                {
+                    // SIMULATOR_FRAME_UI::OnSimRefresh's operating point, value by value.
+                    SCHEMATIC& schematic = fr->Schematic();
+                    schematic.ClearOperatingPoints();
+                    op = json::array();
+
+                    for( const std::string& vec : vecs )
+                    {
+                        std::vector<double> values = engine->GetRealVector( vec, 1 );
+
+                        if( values.empty() )
+                            continue;
+
+                        wxString       signal;
+                        SIM_TRACE_TYPE type = circuit->VectorToSignal( vec, signal );
+
+                        if( type != SPT_VOLTAGE && type != SPT_CURRENT && type != SPT_POWER )
+                            continue;
+
+                        json entry = json::object();
+                        entry["signal"] = toUtf8( signal );
+                        entry["trace"] = simTraceName( type );
+                        entry["value"] = values[0];
+                        op.push_back( std::move( entry ) );
+
+                        wxString key = signal.SubString( 2, signal.Length() - 2 );
+
+                        if( type == SPT_POWER )
+                            key += wxS( ":power" );
+
+                        schematic.SetOperatingPoint( key, values[0] );
+                    }
+
+                    fr->RefreshOperatingPointDisplay();
+                    fr->GetCanvas()->Refresh();
+                }
+            }
+        }
+    }
+    catch( const std::exception& e )
+    {
+        error = "sim_failed";
+        message = e.what();
+    }
+    catch( ... )
+    {
+        error = "sim_failed";
+        message = "the run's results could not be read";
+    }
+
+    std::string ended = "done";
+
+    if( run.stopRequested )
+    {
+        ended = "stopped";
+        error = "stopped";
+    }
+    else if( *error == '\0' && made.empty() )
+    {
+        // ngspice made no plot: the run failed. Its first error line says why.
+        error = "sim_failed";
+
+        for( const std::string& line : simReporter().m_console )
+        {
+            if( wxString::FromUTF8( line.c_str() ).Lower().Contains( wxS( "error" ) ) )
+            {
+                message = line;
+                break;
+            }
+        }
+    }
+
+    if( *error && std::string( error ) == "sim_failed" )
+        ended = "failed";
+
+    simRunPlots()[run.run] = made;
+    simKindPlots()[run.kind] = made;
+
+    result["run"] = run.run;
+    result["kind"] = simKindName( run.kind );
+    result["ended"] = ended;
+    result["depth"] = run.depth;
+    result["plots"] = std::move( plotsOut );
+    result["op"] = std::move( op );
+    result["console"] = consoleJson();
+    result["problems"] = run.problems;
+    writeRunDone( run.dir, "result.json", result );
+
+    writeSimRecord( run.dir, run.run, error, message, run.lines, run.problems );
+    simLive().reset();
+}
+
+/** The run's body on the apply coroutine (spec 6.3 steps 1 to 7). */
+void startSimRun( long long aRun, const std::string& aDir, const std::string& aCommand,
+                  unsigned aFlags, const std::vector<std::pair<wxString, std::string>>& aOverrides,
+                  std::optional<long long> aFftOf, const std::vector<std::string>& aFftLines )
+{
+    ensureRunDir( aDir );
+
+    RUN_LINES_REPORTER reporter;
+    json               problems = json::array();
+    SCH_EDIT_FRAME*    fr = schFrame();   // re-resolved on the coroutine (S4)
+
+    auto refuse =
+            [&]( const char* aError, const std::string& aMessage )
+            {
+                simLive().reset();
+                writeSimRecord( aDir, aRun, aError, aMessage, reporter.Lines(), problems );
+            };
+
+    if( !fr )
+    {
+        refuse( "circuit", "no schematic editor" );
+        return;
+    }
+
+    try
+    {
+        simReporter().m_console.clear();
+
+        std::shared_ptr<SPICE_SIMULATOR> engine = simEngine( fr );
+
+        if( !engine )
+        {
+            refuse( "service_failed", "the simulator could not be made" );
+            return;
+        }
+
+        const bool fft = !aFftLines.empty();
+        SIM_TYPE   kind = ST_FFT;
+
+        // kicadSimRun made the run live; a Stop asked before this body ran is kept.
+        SIM_LIVE_RUN& live = simLive() ? *simLive() : simLive().emplace();
+        live.run = aRun;
+        live.dir = aDir;
+        live.depth = pcbjam_collab::testUndoDepth( fr );
+
+        if( fft )
+        {
+            auto source = simRunPlots().find( aFftOf.value_or( -1 ) );
+            std::vector<std::string> plots = simAllPlots();
+
+            if( source == simRunPlots().end() || source->second.empty()
+                    || std::find( plots.begin(), plots.end(), source->second.front() ) == plots.end() )
+            {
+                refuse( "no_simulation", "the transient this transform reads is gone" );
+                return;
+            }
+
+            for( const std::string& plot : simKindPlots()[ST_FFT] )
+                engine->Command( "destroy " + plot );
+
+            live.kind = ST_FFT;
+            live.plotsBefore = simAllPlots();
+
+            // SIMULATOR_FRAME::StartSimulation's FFT: setplot the transient, then each line;
+            // ngspice answers synchronously, so the finish follows at once.
+            engine->Command( "setplot " + source->second.front() );
+
+            for( const std::string& line : aFftLines )
+                engine->Command( line );
+
+            json accepted = json::object();
+            accepted["run"] = aRun;
+            accepted["plot"] = toUtf8( engine->CurrentPlotName() );
+            accepted["problems"] = problems;
+            writeRunDone( aDir, "accepted.json", accepted );
+
+            simLive()->finishQueued = true;
+            finishSimRun();
+            return;
+        }
+
+        // SIMULATOR_FRAME::LoadSimulator without its dialogs: the annotation as problems,
+        // the connections rebuilt as KiCad does before a simulation, each model made.
+        collectAnnotationProblems( fr, problems );
+
+        if( hasErrorProblem( problems ) )
+        {
+            refuse( "circuit", "the schematic is not fully numbered" );
+            return;
+        }
+
+        if( ADVANCED_CFG::GetCfg().m_IncrementalConnectivity )
+            fr->RecalculateConnections( nullptr, GLOBAL_CLEANUP );
+
+        collectModelProblems( fr, problems );
+
+        std::shared_ptr<SPICE_CIRCUIT_MODEL> circuit =
+                std::make_shared<SPICE_CIRCUIT_MODEL>( &fr->Schematic() );
+
+        wxString command = wxString::FromUTF8( aCommand.c_str() );
+
+        if( command.IsEmpty() )
+        {
+            command = circuit->GetSchTextSimCommand();
+
+            if( command.IsEmpty() )
+            {
+                refuse( "no_directive", "the schematic carries no simulation directive" );
+                return;
+            }
+
+            // The sheet's own directives may hold several analyses: KiCad runs the first.
+            command = command.BeforeFirst( '\n' ).Trim( true ).Trim( false );
+        }
+
+        kind = SPICE_CIRCUIT_MODEL::CommandToSimType( command );
+
+        if( kind == ST_UNKNOWN || kind == ST_FFT || kind == ST_DISTO || kind == ST_SENS
+                || kind == ST_TF )
+        {
+            refuse( "circuit", "the directive is not an analysis this simulator runs" );
+            return;
+        }
+
+        live.kind = kind;
+
+        // One plot per analysis kind lives in the service: the kind's last plots go first
+        // (a transient an FFT reads stays until the next transient).
+        for( const std::string& plot : simKindPlots()[kind] )
+            engine->Command( "destroy " + plot );
+
+        simKindPlots().erase( kind );
+        live.plotsBefore = simAllPlots();
+
+        // SIMULATOR_FRAME's ngspice settings: an LTspice and PSpice reading when the project
+        // has no workbook, put back after the attach (the project file is not changed).
+        std::shared_ptr<NGSPICE_SETTINGS> settings =
+                fr->Prj().GetProjectFile().m_SchematicSettings->m_NgspiceSettings;
+        const NGSPICE_COMPATIBILITY_MODE mode = settings->GetCompatibilityMode();
+
+        if( settings->GetWorkbookFilename().IsEmpty() )
+            settings->SetCompatibilityMode( NGSPICE_COMPATIBILITY_MODE::LT_PSPICE );
+
+        const bool attached = engine->Attach( circuit, command, aFlags, fr->Prj().GetProjectPath(),
+                                              reporter );
+
+        settings->SetCompatibilityMode( mode );
+
+        appendCircuitProblems( reporter, problems );
+        simCircuit() = circuit;
+
+        if( !attached || hasErrorProblem( problems ) )
+        {
+            refuse( "circuit", "the netlist could not be made" );
+            return;
+        }
+
+        // The tuner overrides, as SIMULATOR_FRAME_UI::applyTuners sends each one.
+        for( const auto& [ref, value] : aOverrides )
+        {
+            const SPICE_ITEM* item = circuit->FindItem( ref );
+
+            if( !item || !item->model || !item->model->GetTunerParam() )
+            {
+                json problem = simProblem( "other", RPT_SEVERITY_WARNING,
+                                           wxString::Format( wxS( "%s is not tunable" ), ref ) );
+                problem["ref"] = toUtf8( ref );
+                problems.push_back( std::move( problem ) );
+                continue;
+            }
+
+            const double number = SPICE_VALUE( wxString::FromUTF8( value.c_str() ) ).ToDouble();
+            engine->Command( item->model->SpiceGenerator().TunerCommand( *item, number ) );
+        }
+
+        live.problems = problems;
+        live.lines = reporter.Lines();
+        live.started = true;
+
+        if( !engine->Run() )
+        {
+            refuse( "sim_failed", "the simulator did not start the run" );
+            return;
+        }
+
+        // The run is live in the service. Its idle event may already have queued the finish
+        // (it runs after this body): the acceptance is written first either way.
+        json accepted = json::object();
+        accepted["run"] = aRun;
+        accepted["plot"] = toUtf8( engine->CurrentPlotName() );
+        accepted["problems"] = problems;
+        writeRunDone( aDir, "accepted.json", accepted );
+    }
+    catch( const IO_ERROR& e )
+    {
+        refuse( "circuit", toUtf8( e.What() ) );
+    }
+    catch( const std::exception& e )
+    {
+        refuse( "sim_failed", e.what() );
+    }
+    catch( ... )
+    {
+        refuse( "sim_failed", "the run failed" );
+    }
+}
+
+/** Reads {command, options}: the analysis line ("" for the sheet's own) and the flags. */
+bool readSimCommand( const json& aArgs, std::string& aCommand, unsigned& aFlags )
+{
+    auto command = aArgs.find( "command" );
+    auto options = aArgs.find( "options" );
+
+    if( command == aArgs.end() || !command->is_string() || options == aArgs.end() )
+        return false;
+
+    std::optional<unsigned> flags = simOptionFlags( *options );
+
+    if( !flags )
+        return false;
+
+    aCommand = command->get<std::string>();
+    aFlags = *flags;
+    return true;
+}
+} // namespace
+
+// sim.catalog: "{}" answers {"devices": [{device, description, types: [{type, name,
+// description}]}]}, every device the model dialog's Built-in tab lists (DeviceInfo's
+// showInMenu) and each of its types from KiCad's compiled tables; {"type": "<key>"} (a key
+// as simTypeKey writes it: "R", "V.PULSE", "NMOS.BSIM4") answers that type's {type, device,
+// name, description, pins: [{name, symbolPinHint}], params: [{name, unit, default,
+// category, description, kind, tuner}]}. A read; "" for any other args.
+static std::string kicadSimModelCatalog( std::string aArgsJson )
+{
+    json args = json::parse( aArgsJson, nullptr, /*allow_exceptions*/ false );
+
+    if( args.is_discarded() || !args.is_object() )
+        return "";
+
+    try
+    {
+        if( args.empty() )
+        {
+            json devices = json::array();
+
+            for( SIM_MODEL::DEVICE_T device : SIM_MODEL::DEVICE_T_ITERATOR() )
+            {
+                if( device == SIM_MODEL::DEVICE_T::NONE )
+                    continue;
+
+                const SIM_MODEL::DEVICE_INFO info = SIM_MODEL::DeviceInfo( device );
+
+                if( !info.showInMenu )
+                    continue;
+
+                json types = json::array();
+
+                for( SIM_MODEL::TYPE type : SIM_MODEL::TYPE_ITERATOR() )
+                {
+                    if( type == SIM_MODEL::TYPE::NONE || SIM_MODEL::TypeInfo( type ).deviceType != device )
+                        continue;
+
+                    json t = json::object();
+                    t["type"] = simTypeKey( type );
+                    t["name"] = SIM_MODEL::TypeInfo( type ).fieldValue;
+                    t["description"] = SIM_MODEL::TypeInfo( type ).description;
+                    types.push_back( std::move( t ) );
+                }
+
+                if( types.empty() )
+                    continue;
+
+                json d = json::object();
+                d["device"] = info.fieldValue;
+                d["description"] = info.description;
+                d["types"] = std::move( types );
+                devices.push_back( std::move( d ) );
+            }
+
+            json out = json::object();
+            out["devices"] = std::move( devices );
+            return out.dump( -1, ' ', false, json::error_handler_t::replace );
+        }
+
+        if( args.size() != 1 || !args.contains( "type" ) || !args["type"].is_string() )
+            return "";
+
+        std::optional<SIM_MODEL::TYPE> type = simTypeOfKey( args["type"].get<std::string>() );
+
+        if( !type )
+            return "";
+
+        NULL_REPORTER              devnull;
+        std::unique_ptr<SIM_MODEL> model = SIM_MODEL::Create( *type, std::vector<SCH_PIN*>(),
+                                                                devnull );
+
+        if( !model )
+            return "";
+
+        const SIM_MODEL::PARAM* tuner = model->GetTunerParam();
+
+        json pins = json::array();
+
+        for( int i = 0; i < model->GetPinCount(); ++i )
+        {
+            json p = json::object();
+            p["name"] = model->GetPin( i ).modelPinName;
+            p["symbolPinHint"] = std::to_string( i + 1 );   // the default map: pin n on symbol pin n
+            pins.push_back( std::move( p ) );
+        }
+
+        json params = json::array();
+
+        for( int i = 0; i < model->GetParamCount(); ++i )
+        {
+            const SIM_MODEL::PARAM& param = model->GetParam( i );
+            json                    p = json::object();
+
+            p["name"] = param.info.name;
+            p["unit"] = param.info.unit;
+            p["default"] = param.info.defaultValue;
+            p["category"] = simCategoryName( param.info.category );
+            p["description"] = param.info.description;
+
+            if( param.info.dir == SIM_MODEL::PARAM::DIR_OUT )
+                p["kind"] = "other";
+            else if( param.info.isInstanceParam )
+                p["kind"] = "instance";
+            else
+                p["kind"] = "model";
+
+            p["tuner"] = tuner && tuner->info.name == param.info.name;
+            params.push_back( std::move( p ) );
+        }
+
+        json out = json::object();
+        out["type"] = simTypeKey( *type );
+        out["device"] = SIM_MODEL::DeviceInfo( SIM_MODEL::TypeInfo( *type ).deviceType ).fieldValue;
+        out["name"] = SIM_MODEL::TypeInfo( *type ).fieldValue;
+        out["description"] = SIM_MODEL::TypeInfo( *type ).description;
+        out["pins"] = std::move( pins );
+        out["params"] = std::move( params );
+        return out.dump( -1, ' ', false, json::error_handler_t::replace );
+    }
+    catch( ... )
+    {
+        return "";
+    }
+}
+
+// sim.model.get: {"uuid", "sheetPath"}, those two keys only (symbol.get's grammar: a path
+// that does not hold the symbol falls back to the shown sheet, then the first holding it).
+// The symbol's model as SIM_LIB_MGR::CreateModel resolves it for the netlist, with the
+// schematic's and the symbol's embedded files: SimModelSheet (spec 8.2), plus "ibis":
+// {pin, model, diff, type} for an IBIS part. "" for no such symbol (or no schematic frame,
+// or an open in flight). A read: synchronous.
+static std::string kicadSimModelGet( std::string aArgsJson )
+{
+    SCH_EDIT_FRAME* fr = schFrame();
+
+    if( !fr || pcbjam_open::busy() )
+        return "";
+
+    json args = json::parse( aArgsJson, nullptr, /*allow_exceptions*/ false );
+
+    if( args.is_discarded() || !args.is_object() || args.size() != 2 || !args.contains( "uuid" )
+            || !args["uuid"].is_string() || !args.contains( "sheetPath" )
+            || !args["sheetPath"].is_string() )
+    {
+        return "";
+    }
+
+    SYMBOL_HIT hit = resolveSymbol( fr, args["uuid"].get<std::string>(),
+                                    args["sheetPath"].get<std::string>(), /*aStrict*/ false );
+
+    if( !hit.symbol )
+        return "";
+
+    return simModelSheetJson( fr, hit.symbol, hit.path )
+            .dump( -1, ' ', false, json::error_handler_t::replace );
+}
+
+// sim.model.set: {"uuid", "sheetPath", "model": SimModelSet | null}, those three keys only;
+// a non-empty sheetPath must hold the symbol. The model is read whole on a scratch model
+// first: the type known, every param the type's (an IBIS file's part also takes ibis.pin,
+// ibis.model, ibis.diff and ibis.type), every value taken by SetParamValue, the pin map
+// naming the symbol's pins and the model's, the file inside the project folder (or
+// kicad-embed://) and holding the named model. False (nothing queued) on any failure;
+// true once ONE commit is queued (one undo step, "Edit simulation model"): the symbol's
+// Sim.* fields as SIM_MODEL::WriteFields writes them, or, for null, removed (the model is
+// inferred again). The host waits for kicadCollabBusy to clear, then reads back.
+static bool kicadSimModelSet( std::string aArgsJson )
+{
+    SCH_EDIT_FRAME* fr = schFrame();
+
+    if( !fr || pcbjam_open::busy() )
+        return false;
+
+    json args = json::parse( aArgsJson, nullptr, /*allow_exceptions*/ false );
+
+    if( args.is_discarded() || !args.is_object() || args.size() != 3 || !args.contains( "uuid" )
+            || !args["uuid"].is_string() || !args.contains( "sheetPath" )
+            || !args["sheetPath"].is_string() || !args.contains( "model" ) )
+    {
+        return false;
+    }
+
+    const std::string id = args["uuid"].get<std::string>();
+    SYMBOL_HIT        hit = resolveSymbol( fr, id, args["sheetPath"].get<std::string>(),
+                                           /*aStrict*/ true );
+
+    if( !hit.symbol )
+        return false;
+
+    SIM_MODEL_SET set;
+
+    try
+    {
+        if( !readSimModelSet( fr, hit.symbol, args["model"], set ) )
+            return false;
+    }
+    catch( ... )
+    {
+        return false;   // SetParamValue's IO_ERROR among them: a refused value
+    }
+
+    const std::string path = toUtf8( hit.path.PathAsString() );
+
+    pcbjam_collab::runOnCoroutine( fr, [id, path, set]() {   // re-resolve on the coroutine (S4)
+        SCH_EDIT_FRAME* frame = schFrame();
+        SYMBOL_HIT      live = resolveSymbol( frame, id, path, /*aStrict*/ true );
+
+        if( !live.symbol )
+            return;
+
+        applySimModelSet( frame, live.symbol, live.path, set );
+    } );
+
+    return true;
+}
+
+// sim.file: {"path"}, that key only: a path relative to the project folder or
+// kicad-embed://<name>. Answers {kind: "spice" | "ibis", models: [{name, kind: "model" |
+// "subckt" | "ibis", type, pins: [string]}], problems: [Problem]} through SIM_LIBRARY (a
+// missing file is a file_missing problem and no models). "" for a path outside the folder
+// (or any other args). A read: synchronous.
+static std::string kicadSimFileRead( std::string aArgsJson )
+{
+    SCH_EDIT_FRAME* fr = schFrame();
+
+    if( !fr || pcbjam_open::busy() )
+        return "";
+
+    json args = json::parse( aArgsJson, nullptr, /*allow_exceptions*/ false );
+
+    if( args.is_discarded() || !args.is_object() || args.size() != 1 || !args.contains( "path" ) )
+        return "";
+
+    std::optional<wxString> path = simModelPath( args["path"] );
+
+    if( !path )
+        return "";
+
+    return simFileJson( fr, *path ).dump( -1, ' ', false, json::error_handler_t::replace );
+}
+
+// sim.netlist: {"command", "options": {voltages, currents, dissipations, events}}, those
+// two keys only; command is the analysis line ("" writes the sheet's own directives, as
+// KiCad does). A fresh SPICE_CIRCUIT_MODEL over the schematic: answers {netlist, problems,
+// directive, truncated?} (netlist at most 4 MiB; directive is the sheet's own analysis
+// line, "" when it carries none). Registered with the PARKER policy (it answers a
+// Promise): an IBIS part's model is made by KIBIS through the simulator, which waits on the
+// service. "" while a run is live (KIBIS resets the simulator), or for any other args.
+static std::string kicadSimNetlist( std::string aArgsJson )
+{
+    SCH_EDIT_FRAME* fr = schFrame();
+
+    if( !fr || pcbjam_open::busy() || simLive() )
+        return "";
+
+    json args = json::parse( aArgsJson, nullptr, /*allow_exceptions*/ false );
+
+    if( args.is_discarded() || !args.is_object() || args.size() != 2 )
+        return "";
+
+    std::string command;
+    unsigned    flags = 0;
+
+    if( !readSimCommand( args, command, flags ) || !isAnalysisCommand( command ) )
+        return "";
+
+    json out = json::object();
+    out["netlist"] = "";
+    out["problems"] = json::array();
+    out["directive"] = "";
+
+    try
+    {
+        RUN_LINES_REPORTER  reporter;
+        SPICE_CIRCUIT_MODEL circuit( &fr->Schematic() );
+        STRING_FORMATTER    formatter;
+
+        collectAnnotationProblems( fr, out["problems"] );
+        collectModelProblems( fr, out["problems"] );
+
+        if( designHasIbis( fr ) && !simEngine( fr ) )
+        {
+            out["problems"].push_back( simProblem( "other", RPT_SEVERITY_ERROR,
+                                                   wxS( "the simulator could not be made" ) ) );
+        }
+
+        circuit.GetNetlist( wxString::FromUTF8( command.c_str() ), flags, &formatter, reporter );
+        appendCircuitProblems( reporter, out["problems"] );
+
+        out["directive"] = toUtf8( circuit.GetSchTextSimCommand() );
+
+        std::string text = formatter.GetString();
+        constexpr size_t NETLIST_MAX = 4u << 20;
+
+        if( text.size() > NETLIST_MAX )
+        {
+            text.resize( NETLIST_MAX );
+            out["truncated"] = true;
+        }
+
+        out["netlist"] = std::move( text );
+    }
+    catch( const IO_ERROR& e )
+    {
+        out["problems"].push_back( simProblem( "other", RPT_SEVERITY_ERROR, e.What() ) );
+    }
+    catch( const std::exception& e )
+    {
+        out["problems"].push_back( simProblem( "other", RPT_SEVERITY_ERROR,
+                                               wxString::FromUTF8( e.what() ) ) );
+    }
+
+    return out.dump( -1, ' ', false, json::error_handler_t::replace );
+}
+
+// sim.run: {"run": int, "dir": "/tmp/cc-sim/<n>", "command", "options", "overrides":
+// [{ref, value}] (at most 64; value a SPICE number), "fftOf": int | null}, those six keys
+// only. command is the island's analysis line ("" for the sheet's own directive); with
+// fftOf set it is the FFT's lines instead and fftOf names the transient run it reads.
+// Queued on the apply coroutine: the annotation and every model checked, the circuit read
+// (an error problem ends the run, error "circuit"), the simulator made on the first run of
+// the engine's life (the service boots there), the kind's last plots destroyed, the attach,
+// each override as KiCad's tuner sends it, then bg_run; <dir>/accepted.json {run, plot,
+// problems} once the run is accepted. On idle the finish is QUEUED (never read in the
+// callback): <dir>/result.json (SimResult, spec 8.3) and then <dir>/.cc-sim.json {run,
+// error: "" | "circuit" | "no_directive" | "no_simulation" | "sim_failed" | "stopped" |
+// "service_failed", message, lines, problems} last. False (nothing queued) while a run is
+// live, or for any other JSON.
+static bool kicadSimRun( std::string aArgsJson )
+{
+    SCH_EDIT_FRAME* fr = schFrame();
+
+    if( !fr || pcbjam_open::busy() || simLive() )
+        return false;
+
+    json args = json::parse( aArgsJson, nullptr, /*allow_exceptions*/ false );
+
+    if( args.is_discarded() || !args.is_object() || args.size() != 6 )
+        return false;
+
+    auto run = args.find( "run" );
+    auto dir = args.find( "dir" );
+    auto overrides = args.find( "overrides" );
+    auto fftOf = args.find( "fftOf" );
+
+    if( run == args.end() || !run->is_number_integer() || run->get<long long>() < 0
+            || dir == args.end() || !dir->is_string() || overrides == args.end()
+            || !overrides->is_array() || overrides->size() > 64 || fftOf == args.end()
+            || !( fftOf->is_null() || ( fftOf->is_number_integer() && fftOf->get<long long>() >= 0 ) ) )
+    {
+        return false;
+    }
+
+    const std::string d = dir->get<std::string>();
+
+    if( !isRunDir( d, "/tmp/cc-sim/" ) )
+        return false;
+
+    std::string command;
+    unsigned    flags = 0;
+
+    if( !readSimCommand( args, command, flags ) )
+        return false;
+
+    std::optional<long long> source;
+    std::vector<std::string> fftLines;
+
+    if( !fftOf->is_null() )
+    {
+        source = fftOf->get<long long>();
+
+        if( !readFftLines( command, fftLines ) || !overrides->empty() )
+            return false;
+    }
+    else if( !isAnalysisCommand( command ) )
+    {
+        return false;
+    }
+
+    std::vector<std::pair<wxString, std::string>> tuned;
+
+    for( const json& entry : *overrides )
+    {
+        if( !entry.is_object() || entry.size() != 2 || !entry.contains( "ref" )
+                || !entry.contains( "value" ) || !entry["value"].is_string() )
+        {
+            return false;
+        }
+
+        std::optional<wxString> ref = boundedText( entry["ref"], 1, 64 );
+        const std::string       value = entry["value"].get<std::string>();
+
+        if( !ref || hasControlChar( *ref ) || !isSpiceNumber( value ) )
+            return false;
+
+        tuned.emplace_back( *ref, value );
+    }
+
+    // Live from here: a second run is refused until this one's record is written.
+    SIM_LIVE_RUN& live = simLive().emplace();
+    live.run = run->get<long long>();
+    live.dir = d;
+
+    const long long n = run->get<long long>();
+
+    pcbjam_collab::runOnCoroutine( fr, [n, d, command, flags, tuned, source, fftLines]() {
+        startSimRun( n, d, command, flags, tuned, source, fftLines );
+    } );
+
+    return true;
+}
+
+// sim.stop: halts the live run (NGSPICE::Stop, bg_halt), queued on the apply coroutine; the
+// finish then records "stopped". When the service has no run to halt (its worker died), the
+// run is finished at once, so a dead service never leaves the engine holding a live run.
+// False when no run is live (or its finish is already queued).
+static bool kicadSimStop()
+{
+    SCH_EDIT_FRAME*              fr = schFrame();
+    std::optional<SIM_LIVE_RUN>& live = simLive();
+
+    if( !fr || !live || live->finishQueued )
+        return false;
+
+    live->stopRequested = true;
+
+    pcbjam_collab::runOnCoroutine( fr, []() {
+        SCH_EDIT_FRAME* frame = schFrame();
+
+        if( !frame || !simLive() || simLive()->finishQueued )
+            return;
+
+        std::shared_ptr<SPICE_SIMULATOR> engine = simEngine( frame );
+
+        // bg_halt accepted: ngspice's thread ends and its idle event queues the finish.
+        // Refused (no run in the service: the worker died, and the next request booted a
+        // fresh one): no idle event will come, so the run is finished here.
+        if( !engine || !engine->Stop() )
+        {
+            simLive()->finishQueued = true;
+            finishSimRun();
+        }
+    } );
+
+    return true;
+}
+
+// sim.opOnSheet: {"voltages": bool, "currents": bool}, those two keys only. KiCad's own
+// operating point labels on the drawing, from the last operating point's values (the run's
+// finish handed them to the schematic): the two eeschema appearance settings set and the
+// display refreshed, as SCH_EDITOR_CONTROL::ToggleOPVoltages and ToggleOPCurrents do. No
+// commit, no undo step, nothing modified.
+static bool kicadSimOpOnSheet( std::string aArgsJson )
+{
+    SCH_EDIT_FRAME* fr = schFrame();
+
+    if( !fr || pcbjam_open::busy() || !fr->eeconfig() )
+        return false;
+
+    json args = json::parse( aArgsJson, nullptr, /*allow_exceptions*/ false );
+
+    if( args.is_discarded() || !args.is_object() || args.size() != 2 || !args.contains( "voltages" )
+            || !args["voltages"].is_boolean() || !args.contains( "currents" )
+            || !args["currents"].is_boolean() )
+    {
+        return false;
+    }
+
+    const bool voltages = args["voltages"].get<bool>();
+    const bool currents = args["currents"].get<bool>();
+
+    pcbjam_collab::runOnCoroutine( fr, [voltages, currents]() {
+        SCH_EDIT_FRAME* frame = schFrame();
+
+        if( !frame || !frame->eeconfig() )
+            return;
+
+        EESCHEMA_SETTINGS* cfg = frame->eeconfig();
+        cfg->m_Appearance.show_op_voltages = voltages;
+        cfg->m_Appearance.show_op_currents = currents;
+
+        auto* view = frame->GetCanvas()->GetView();
+        view->SetLayerVisible( LAYER_OP_VOLTAGES, voltages );
+        view->SetLayerVisible( LAYER_OP_CURRENTS, currents );
+
+        frame->RefreshOperatingPointDisplay();
+        frame->GetCanvas()->Refresh();
+    } );
+
+    return true;
+}
+
 #ifdef KICAD_MERGED_EMBIND
 // Circuit Center (engine run 12): the eeschema half of the board engine's schematic
 // netlist, shared by Update the board (kicadUpdateBoardFromSchematic) and the board
@@ -4254,6 +6424,18 @@ EMSCRIPTEN_BINDINGS(eeschema) {
     function("kicadSymbolSet", &kicadSymbolSet);
     function("kicadAnnotate", &kicadAnnotate);
     function("kicadCheckSheet", &kicadCheckSheet);
+    // The simulator (engine run 14, island cc23): caps simModel (the catalog, a symbol's
+    // model read and written, a model file read) and sim (the netlist, a run, Stop, the
+    // operating point labels). The netlist answers a Promise: an IBIS part's model waits on
+    // the simulator service (KIBIS), hence the PARKER policy.
+    function("kicadSimModelCatalog", &kicadSimModelCatalog);
+    function("kicadSimModelGet", &kicadSimModelGet);
+    function("kicadSimModelSet", &kicadSimModelSet);
+    function("kicadSimFileRead", &kicadSimFileRead);
+    function("kicadSimNetlist", &kicadSimNetlist PCBJAM_PARKER_POLICY);
+    function("kicadSimRun", &kicadSimRun);
+    function("kicadSimStop", &kicadSimStop);
+    function("kicadSimOpOnSheet", &kicadSimOpOnSheet);
 
 #ifndef KICAD_MERGED_EMBIND
     // JS names ALSO registered by pcbnew_embind.cpp — in the merged image these are
