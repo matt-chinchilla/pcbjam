@@ -44,6 +44,7 @@
 #include "pcbjam_async_policy.h"
 #include "open_gate.h"
 #include "timer_park.h"
+#include "cc_output_common.h"
 
 using namespace emscripten;
 
@@ -434,6 +435,24 @@ static bool kicadHostBoardProperties()
 static bool kicadHostActions()
 {
     return true;
+}
+
+// A marker and a read (engine run 14, the island's project.export, cap export): every output
+// this engine runs, by face, each with its own settings keys and defaults (a fresh KiCad job's
+// ToJson; our cc_* outputs their closed keys): {"board": {job: settings}, "schematic": {...}}.
+// A KiCad job the registry does not hold is left out, so the island's check against its own
+// list names it.
+static std::string kicadOutputJobs()
+{
+    try
+    {
+        return cc_output::JobsWithDefaults().dump( -1, ' ', false,
+                                                   nlohmann::json::error_handler_t::replace );
+    }
+    catch( ... )
+    {
+        return "";
+    }
 }
 
 static bool kicadSetChrome( bool aShow )
@@ -876,6 +895,8 @@ EMSCRIPTEN_BINDINGS(kicad_editor) {
     // The board properties request and every hotkey's action go to the page first (run 12).
     function("kicadHostBoardProperties", &kicadHostBoardProperties);
     function("kicadHostActions", &kicadHostActions);
+    // The outputs this engine runs and their settings (engine run 14, project.export).
+    function("kicadOutputJobs", &kicadOutputJobs);
 
     // Read-only viewer lock (read-only-viewer).
     function("kicadSetReadOnly", &kicadSetReadOnly);
