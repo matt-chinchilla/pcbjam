@@ -35,12 +35,12 @@
 
 namespace
 {
-constexpr size_t CC_ROWS_MAX = 4096;
-constexpr size_t CC_FIELDS_MAX = 256;
-constexpr size_t CC_TEXT_MAX = 1024;
+constexpr size_t CC_RULES_ROWS_MAX = 4096;
+constexpr size_t CC_RULES_FIELDS_MAX = 256;
+constexpr size_t CC_RULES_TEXT_MAX = 1024;
 
 /** A string of the records: KiCad's text cut to aMax bytes, never inside a UTF-8 sequence. */
-std::string ccCut( const wxString& aText, size_t aMax = CC_TEXT_MAX )
+std::string ccRulesCut( const wxString& aText, size_t aMax = CC_RULES_TEXT_MAX )
 {
     std::string s = toUtf8( aText );
 
@@ -70,13 +70,13 @@ struct CC_INSTANCE
     SCH_SHEET_PATH path;
 };
 
-std::string ccInstanceKey( const wxString& aSheetPath, const wxString& aUuid )
+std::string ccRulesInstanceKey( const wxString& aSheetPath, const wxString& aUuid )
 {
     return toUtf8( aSheetPath.Lower() ) + "|" + toUtf8( aUuid.Lower() );
 }
 
 /** Every symbol instance in hierarchy order (power symbols included), with an index by key. */
-void ccInstances( SCH_EDIT_FRAME* aFrame, std::vector<CC_INSTANCE>& aOrdered,
+void ccRulesInstances( SCH_EDIT_FRAME* aFrame, std::vector<CC_INSTANCE>& aOrdered,
                   std::map<std::string, size_t>& aIndex )
 {
     aOrdered.clear();
@@ -96,7 +96,7 @@ void ccInstances( SCH_EDIT_FRAME* aFrame, std::vector<CC_INSTANCE>& aOrdered,
             CC_INSTANCE inst;
             inst.symbol = static_cast<SCH_SYMBOL*>( item );
             inst.path = path;
-            aIndex[ccInstanceKey( sheetPath, item->m_Uuid.AsString() )] = aOrdered.size();
+            aIndex[ccRulesInstanceKey( sheetPath, item->m_Uuid.AsString() )] = aOrdered.size();
             aOrdered.push_back( std::move( inst ) );
         }
     }
@@ -121,7 +121,7 @@ json ccVariantNames( SCH_EDIT_FRAME* aFrame )
     json names = json::array();
 
     for( const wxString& name : aFrame->Schematic().GetVariantNames() )
-        names.push_back( ccCut( name, 128 ) );
+        names.push_back( ccRulesCut( name, 128 ) );
 
     return names;
 }
@@ -135,15 +135,15 @@ json ccSymbolRow( SCH_EDIT_FRAME* aFrame, SCH_SYMBOL* aSymbol, const SCH_SHEET_P
 
     row["uuid"] = toUtf8( aSymbol->m_Uuid.AsString() );
     row["sheetPath"] = toUtf8( aPath.PathAsString() );
-    row["sheetName"] = ccCut( sheetNameOf( aPath ) );
-    row["ref"] = ccCut( aSymbol->GetRef( &aPath, false ), 64 );
+    row["sheetName"] = ccRulesCut( sheetNameOf( aPath ) );
+    row["ref"] = ccRulesCut( aSymbol->GetRef( &aPath, false ), 64 );
     row["unit"] = std::max( 1, aSymbol->GetUnitSelection( &aPath ) );
     row["units"] = unitsOf( aSymbol );
-    row["libId"] = ccCut( wxString::FromUTF8( aSymbol->GetLibId().Format().c_str() ) );
-    row["value"] = ccCut( aSymbol->GetValue( false, &aPath, false, aVariant ) );
+    row["libId"] = ccRulesCut( wxString::FromUTF8( aSymbol->GetLibId().Format().c_str() ) );
+    row["value"] = ccRulesCut( aSymbol->GetValue( false, &aPath, false, aVariant ) );
 
     SCH_FIELD* fpField = aSymbol->GetField( FIELD_T::FOOTPRINT );
-    row["footprint"] = fpField ? ccCut( aSymbol->GetFieldText( fpField->GetName(), &aPath, aVariant ) )
+    row["footprint"] = fpField ? ccRulesCut( aSymbol->GetFieldText( fpField->GetName(), &aPath, aVariant ) )
                                : std::string();
 
     std::vector<SCH_FIELD*> ordered;
@@ -159,12 +159,12 @@ json ccSymbolRow( SCH_EDIT_FRAME* aFrame, SCH_SYMBOL* aSymbol, const SCH_SHEET_P
             continue;
         }
 
-        if( fields.size() >= CC_FIELDS_MAX )
+        if( fields.size() >= CC_RULES_FIELDS_MAX )
             break;
 
         json f = json::object();
-        f["name"] = ccCut( field->GetCanonicalName(), 128 );
-        f["value"] = ccCut( sch.ConvertKIIDsToRefs(
+        f["name"] = ccRulesCut( field->GetCanonicalName(), 128 );
+        f["value"] = ccRulesCut( sch.ConvertKIIDsToRefs(
                 aSymbol->GetFieldText( field->GetName(), &aPath, aVariant ) ) );
         f["shown"] = field->IsVisible();
         fields.push_back( std::move( f ) );
@@ -232,7 +232,7 @@ json ccSymbolRow( SCH_EDIT_FRAME* aFrame, SCH_SYMBOL* aSymbol, const SCH_SHEET_P
                 else if( fpField && name == fpField->GetName() )
                     overrides.push_back( "footprint" );
                 else
-                    overrides.push_back( ccCut( name, 128 ) );
+                    overrides.push_back( ccRulesCut( name, 128 ) );
             }
 
             if( v->m_ExcludedFromBOM != aSymbol->GetExcludedFromBOM() )
@@ -263,10 +263,10 @@ json ccSymbolRow( SCH_EDIT_FRAME* aFrame, SCH_SYMBOL* aSymbol, const SCH_SHEET_P
     {
         for( const wxString& filter : lib->GetFPFilters() )
         {
-            if( filters.size() >= CC_FIELDS_MAX )
+            if( filters.size() >= CC_RULES_FIELDS_MAX )
                 break;
 
-            filters.push_back( ccCut( filter, 256 ) );
+            filters.push_back( ccRulesCut( filter, 256 ) );
         }
     }
 
@@ -286,7 +286,7 @@ json ccSymbolRow( SCH_EDIT_FRAME* aFrame, SCH_SYMBOL* aSymbol, const SCH_SHEET_P
 /** One instance's change of a symbols.set, read whole before anything is queued. */
 struct CC_SYMBOLS_CHANGE
 {
-    std::string              key;        // ccInstanceKey
+    std::string              key;        // ccRulesInstanceKey
     std::string              uuid;
     std::string              sheetPath;
     SYMBOL_SET               set;        // ref, value, footprint, fields, addField, removeField, flags
@@ -607,7 +607,7 @@ void ccRunSymbolsSet( const std::string& aDir, const wxString& aVariant,
         {
             std::vector<CC_INSTANCE>      ordered;
             std::map<std::string, size_t> index;
-            ccInstances( fr, ordered, index );
+            ccRulesInstances( fr, ordered, index );
 
             const bool variantLive = aVariant.IsEmpty()
                                      || fr->Schematic().GetVariantNames().count( aVariant );
@@ -920,7 +920,7 @@ void ccRunSchExchange( const CC_SCH_EXCHANGE_ARGS& aArgs )
         {
             std::vector<CC_INSTANCE>      ordered;
             std::map<std::string, size_t> index;
-            ccInstances( fr, ordered, index );
+            ccRulesInstances( fr, ordered, index );
 
             // The targets grouped by symbol (a reused sheet's instances share one SCH_SYMBOL),
             // in the order asked.
@@ -987,7 +987,7 @@ void ccRunSchExchange( const CC_SCH_EXCHANGE_ARGS& aArgs )
 
                 for( const SCH_SHEET_PATH& path : instances[symbol] )
                 {
-                    if( rows.size() >= CC_ROWS_MAX )
+                    if( rows.size() >= CC_RULES_ROWS_MAX )
                     {
                         truncated = true;
                         break;
@@ -996,9 +996,9 @@ void ccRunSchExchange( const CC_SCH_EXCHANGE_ARGS& aArgs )
                     json row = json::object();
                     row["uuid"] = toUtf8( symbol->m_Uuid.AsString() );
                     row["sheetPath"] = toUtf8( path.PathAsString() );
-                    row["ref"] = ccCut( symbol->GetRef( &path, false ), 64 );
-                    row["from"] = ccCut( wxString::FromUTF8( from.c_str() ) );
-                    row["to"] = ccCut( wxString::FromUTF8( to.c_str() ) );
+                    row["ref"] = ccRulesCut( symbol->GetRef( &path, false ), 64 );
+                    row["from"] = ccRulesCut( wxString::FromUTF8( from.c_str() ) );
+                    row["to"] = ccRulesCut( wxString::FromUTF8( to.c_str() ) );
                     row["status"] = status;
                     rows.push_back( std::move( row ) );
                 }
@@ -1251,7 +1251,7 @@ bool ccReadSchTextSet( const json& aValue, CC_SCH_TEXT_SET& aOut )
     return true;
 }
 
-/** The rows a run collects: the first CC_ROWS_MAX kept, every one counted. */
+/** The rows a run collects: the first CC_RULES_ROWS_MAX kept, every one counted. */
 struct CC_EDIT_ROWS
 {
     json rows = json::array();
@@ -1262,7 +1262,7 @@ struct CC_EDIT_ROWS
     {
         count++;
 
-        if( rows.size() < CC_ROWS_MAX )
+        if( rows.size() < CC_RULES_ROWS_MAX )
             rows.push_back( std::move( aRow ) );
         else
             truncated = true;
@@ -1469,7 +1469,7 @@ void ccSchProcessText( SCH_COMMIT* aCommit, const SCH_SHEET_PATH& aPath, SCH_ITE
     else if( SCH_LABEL_BASE* label = dynamic_cast<SCH_LABEL_BASE*>( aItem ) )
         name = label->GetText();
 
-    row["words"] = ccCut( name.IsEmpty() ? wxString::FromUTF8( joined.c_str() )
+    row["words"] = ccRulesCut( name.IsEmpty() ? wxString::FromUTF8( joined.c_str() )
                                          : name + wxS( ": " ) + wxString::FromUTF8( joined.c_str() ),
                           256 );
 
@@ -1595,7 +1595,7 @@ void ccSchVisit( SCH_COMMIT* aCommit, const SCH_SHEET_PATH& aPath, SCH_ITEM* aIt
             json row = json::object();
             row["uuid"] = toUtf8( sheet->m_Uuid.AsString() );
             row["kind"] = "sheet";
-            row["words"] = ccCut( sheet->GetName() + wxS( ": lineWidth" ), 256 );
+            row["words"] = ccRulesCut( sheet->GetName() + wxS( ": lineWidth" ), 256 );
             row["from"] = std::to_string( ccSchMm( sheet->GetBorderWidth() ) );
             row["to"] = std::to_string( ccSchMm( *aSet.lineWidth ) );
             aRows.Add( std::move( row ) );
@@ -1765,7 +1765,7 @@ struct CC_JSON_SECTION
 };
 
 /** Patch values must not delete keys: a null anywhere inside is refused. */
-bool ccHasNull( const json& aValue )
+bool ccRulesHasNull( const json& aValue )
 {
     if( aValue.is_null() )
         return true;
@@ -1774,7 +1774,7 @@ bool ccHasNull( const json& aValue )
     {
         for( const json& child : aValue )
         {
-            if( ccHasNull( child ) )
+            if( ccRulesHasNull( child ) )
                 return true;
         }
     }
@@ -1783,7 +1783,7 @@ bool ccHasNull( const json& aValue )
 }
 
 /** The two JSON values hold the same kind (number counts as one kind). */
-bool ccSameKind( const json& aA, const json& aB )
+bool ccRulesSameKind( const json& aA, const json& aB )
 {
     if( aA.is_number() && aB.is_number() )
         return true;
@@ -1815,7 +1815,7 @@ json ccJsonSectionGet( const CC_JSON_SECTION& aSection )
  */
 bool ccJsonSectionSet( const CC_JSON_SECTION& aSection, const json& aPatch )
 {
-    if( !aPatch.is_object() || aPatch.empty() || ccHasNull( aPatch ) )
+    if( !aPatch.is_object() || aPatch.empty() || ccRulesHasNull( aPatch ) )
         return false;
 
     aSection.settings->Store();
@@ -1836,7 +1836,7 @@ bool ccJsonSectionSet( const CC_JSON_SECTION& aSection, const json& aPatch )
         {
             json& target = next[ptr];
 
-            if( !ccSameKind( target, value ) )
+            if( !ccRulesSameKind( target, value ) )
                 return false;
 
             if( target.is_object() )
@@ -1913,18 +1913,18 @@ json ccPageJson( const PAGE_INFO& aPage, const TITLE_BLOCK& aTitle, const wxStri
     page["width"] = std::round( aPage.GetWidthMM() * 1000.0 ) / 1000.0;
     page["height"] = std::round( aPage.GetHeightMM() * 1000.0 ) / 1000.0;
     page["portrait"] = aPage.IsPortrait();
-    page["title"] = ccCut( aTitle.GetTitle() );
-    page["date"] = ccCut( aTitle.GetDate() );
-    page["revision"] = ccCut( aTitle.GetRevision() );
-    page["company"] = ccCut( aTitle.GetCompany() );
+    page["title"] = ccRulesCut( aTitle.GetTitle() );
+    page["date"] = ccRulesCut( aTitle.GetDate() );
+    page["revision"] = ccRulesCut( aTitle.GetRevision() );
+    page["company"] = ccRulesCut( aTitle.GetCompany() );
 
     json comments = json::array();
 
     for( int i = 0; i < 9; ++i )
-        comments.push_back( ccCut( aTitle.GetComment( i ) ) );
+        comments.push_back( ccRulesCut( aTitle.GetComment( i ) ) );
 
     page["comments"] = std::move( comments );
-    page["drawingSheet"] = ccCut( aSheetFile );
+    page["drawingSheet"] = ccRulesCut( aSheetFile );
     return page;
 }
 
@@ -1987,7 +1987,7 @@ bool ccReadPagePatch( const json& aValue, bool aSchematic, CC_PAGE_PATCH& aOut )
         else if( key == "title" || key == "date" || key == "revision" || key == "company"
                  || key == "drawingSheet" )
         {
-            std::optional<wxString> text = boundedText( value, 0, CC_TEXT_MAX );
+            std::optional<wxString> text = boundedText( value, 0, CC_RULES_TEXT_MAX );
 
             if( !text || hasControlChar( *text ) )
                 return false;
@@ -2013,7 +2013,7 @@ bool ccReadPagePatch( const json& aValue, bool aSchematic, CC_PAGE_PATCH& aOut )
                 if( value[i].is_null() )
                     continue;
 
-                std::optional<wxString> text = boundedText( value[i], 0, CC_TEXT_MAX );
+                std::optional<wxString> text = boundedText( value[i], 0, CC_RULES_TEXT_MAX );
 
                 if( !text || hasControlChar( *text ) )
                     return false;
@@ -2092,14 +2092,14 @@ json ccSchVariantsJson( SCH_EDIT_FRAME* aFrame )
     for( const wxString& name : sch.GetVariantNames() )
     {
         json entry = json::object();
-        entry["name"] = ccCut( name, 128 );
-        entry["description"] = ccCut( sch.GetVariantDescription( name ) );
+        entry["name"] = ccRulesCut( name, 128 );
+        entry["description"] = ccRulesCut( sch.GetVariantDescription( name ) );
         names.push_back( std::move( entry ) );
     }
 
     json out = json::object();
     out["names"] = std::move( names );
-    out["current"] = ccCut( sch.GetCurrentVariant(), 128 );
+    out["current"] = ccRulesCut( sch.GetCurrentVariant(), 128 );
     return out;
 }
 
@@ -2122,7 +2122,7 @@ json ccSchSettingsGet( SCH_EDIT_FRAME* aFrame, const std::string& aSection )
         json out = json::object();
 
         for( const auto& [name, text] : aFrame->Prj().GetTextVars() )
-            out[toUtf8( name )] = ccCut( text );
+            out[toUtf8( name )] = ccRulesCut( text );
 
         return out;
     }
@@ -2140,9 +2140,9 @@ json ccSchSettingsGet( SCH_EDIT_FRAME* aFrame, const std::string& aSection )
             json members = json::array();
 
             for( const wxString& member : alias->Members() )
-                members.push_back( ccCut( member, 256 ) );
+                members.push_back( ccRulesCut( member, 256 ) );
 
-            entry["name"] = ccCut( alias->GetName(), 256 );
+            entry["name"] = ccRulesCut( alias->GetName(), 256 );
             entry["members"] = std::move( members );
             aliases.push_back( std::move( entry ) );
         }
@@ -2167,7 +2167,7 @@ json ccSchSettingsGet( SCH_EDIT_FRAME* aFrame, const std::string& aSection )
         {
             json entry = json::object();
             entry["sheetPath"] = toUtf8( path.PathAsString() );
-            entry["page"] = ccCut( path.GetPageNumber(), 64 );
+            entry["page"] = ccRulesCut( path.GetPageNumber(), 64 );
             numbers.push_back( std::move( entry ) );
         }
 
@@ -2303,7 +2303,7 @@ bool ccSchVariantAction( SCH_EDIT_FRAME* aFrame, const json& aValue, bool aDryRu
             return false;
 
         std::optional<wxString> name = nameOf( value[0] );
-        std::optional<wxString> text = boundedText( value[1], 0, CC_TEXT_MAX );
+        std::optional<wxString> text = boundedText( value[1], 0, CC_RULES_TEXT_MAX );
 
         if( !name || !text || !names.count( *name ) || hasControlChar( *text ) )
             return false;
@@ -2416,7 +2416,7 @@ void ccRunSchSettingsSet( const CC_SETTINGS_ARGS& aArgs )
                     {
                         next.erase( key );
                     }
-                    else if( std::optional<wxString> t = boundedText( text, 0, CC_TEXT_MAX ) )
+                    else if( std::optional<wxString> t = boundedText( text, 0, CC_RULES_TEXT_MAX ) )
                     {
                         next[key] = *t;
                     }
@@ -2652,7 +2652,7 @@ static std::string kicadSymbolsGet( std::string aArgsJson )
 
         std::vector<CC_INSTANCE>      ordered;
         std::map<std::string, size_t> index;
-        ccInstances( fr, ordered, index );
+        ccRulesInstances( fr, ordered, index );
 
         std::vector<size_t> picked;
 
@@ -2668,7 +2668,7 @@ static std::string kicadSymbolsGet( std::string aArgsJson )
         {
             const json& items = args["items"];
 
-            if( !items.is_array() || items.empty() || items.size() > CC_ROWS_MAX )
+            if( !items.is_array() || items.empty() || items.size() > CC_RULES_ROWS_MAX )
                 return "";
 
             std::set<size_t> seen;
@@ -2683,7 +2683,7 @@ static std::string kicadSymbolsGet( std::string aArgsJson )
                     return "";
                 }
 
-                auto it = index.find( ccInstanceKey(
+                auto it = index.find( ccRulesInstanceKey(
                         wxString::FromUTF8( item["sheetPath"].get<std::string>().c_str() ),
                         wxString::FromUTF8( item["uuid"].get<std::string>().c_str() ) ) );
 
@@ -2710,7 +2710,7 @@ static std::string kicadSymbolsGet( std::string aArgsJson )
                 continue;
             }
 
-            if( rows.size() >= CC_ROWS_MAX )
+            if( rows.size() >= CC_RULES_ROWS_MAX )
             {
                 truncated = true;
                 continue;
@@ -2720,7 +2720,7 @@ static std::string kicadSymbolsGet( std::string aArgsJson )
         }
 
         json out = json::object();
-        out["variant"] = ccCut( *variant, 128 );
+        out["variant"] = ccRulesCut( *variant, 128 );
         out["variants"] = ccVariantNames( fr );
         out["rows"] = std::move( rows );
         out["power"] = power;
@@ -2764,7 +2764,7 @@ static bool kicadSymbolsSet( std::string aArgsJson )
         if( run == args.end() || !run->is_number_integer() || run->get<long long>() < 0
                 || dir == args.end() || !dir->is_string() || variantArg == args.end()
                 || changes == args.end() || !changes->is_array() || changes->empty()
-                || changes->size() > CC_ROWS_MAX )
+                || changes->size() > CC_RULES_ROWS_MAX )
         {
             return false;
         }
@@ -2781,7 +2781,7 @@ static bool kicadSymbolsSet( std::string aArgsJson )
 
         std::vector<CC_INSTANCE>      ordered;
         std::map<std::string, size_t> index;
-        ccInstances( fr, ordered, index );
+        ccRulesInstances( fr, ordered, index );
 
         std::vector<CC_SYMBOLS_CHANGE> read;
         std::set<std::string>          keys;
@@ -2799,7 +2799,7 @@ static bool kicadSymbolsSet( std::string aArgsJson )
             CC_SYMBOLS_CHANGE c;
             c.uuid = change["uuid"].get<std::string>();
             c.sheetPath = change["sheetPath"].get<std::string>();
-            c.key = ccInstanceKey( wxString::FromUTF8( c.sheetPath.c_str() ),
+            c.key = ccRulesInstanceKey( wxString::FromUTF8( c.sheetPath.c_str() ),
                                    wxString::FromUTF8( c.uuid.c_str() ) );
 
             auto it = index.find( c.key );
@@ -2858,7 +2858,7 @@ static bool kicadSymbolsExchange( std::string aArgsJson )
         if( !args["run"].is_number_integer() || args["run"].get<long long>() < 0
                 || !args["dir"].is_string() || !args["mode"].is_string()
                 || !args["targets"].is_array() || args["targets"].empty()
-                || args["targets"].size() > CC_ROWS_MAX || !args["preview"].is_boolean() )
+                || args["targets"].size() > CC_RULES_ROWS_MAX || !args["preview"].is_boolean() )
         {
             return false;
         }
@@ -2911,7 +2911,7 @@ static bool kicadSymbolsExchange( std::string aArgsJson )
 
         std::vector<CC_INSTANCE>      ordered;
         std::map<std::string, size_t> index;
-        ccInstances( fr, ordered, index );
+        ccRulesInstances( fr, ordered, index );
         std::set<std::string> seen;
 
         for( const json& target : args["targets"] )
@@ -2924,7 +2924,7 @@ static bool kicadSymbolsExchange( std::string aArgsJson )
                 return false;
             }
 
-            const std::string key = ccInstanceKey(
+            const std::string key = ccRulesInstanceKey(
                     wxString::FromUTF8( target["sheetPath"].get<std::string>().c_str() ),
                     wxString::FromUTF8( target["uuid"].get<std::string>().c_str() ) );
 
