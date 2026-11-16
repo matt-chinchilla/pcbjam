@@ -9,6 +9,9 @@
 // schematic or an Altium project through SCH_EDIT_FRAME's own import path.
 // Modified by Chirichella Inc. on 2026-11-07: kicadSymbolGet, kicadSymbolSet, kicadAnnotate
 // and kicadCheckSheet, the Editing window's symbol properties, numbering and check.
+// Modified by Chirichella Inc. on 2026-11-16: kicadSymbolsGet, kicadSymbolsSet,
+// kicadSymbolsExchange, kicadSchEdit and the schematic half of kicadSettingsGet and
+// kicadSettingsSet (engine run 14, cc_rules_sch.inc).
 
 #ifdef __EMSCRIPTEN__
 #include <emscripten.h>
@@ -4114,6 +4117,10 @@ static bool kicadCheckSheet( std::string aArgsJson )
     return true;
 }
 
+// Circuit Center (engine run 14): properties, numbering and rules (the fields table, the
+// symbol exchange, the global text edit and the settings sections), in their own file.
+#include "cc_rules_sch.inc"
+
 #ifdef KICAD_MERGED_EMBIND
 // Circuit Center (engine run 12): the eeschema half of the board engine's schematic
 // netlist, shared by Update the board (kicadUpdateBoardFromSchematic) and the board
@@ -4254,6 +4261,12 @@ EMSCRIPTEN_BINDINGS(eeschema) {
     function("kicadSymbolSet", &kicadSymbolSet);
     function("kicadAnnotate", &kicadAnnotate);
     function("kicadCheckSheet", &kicadCheckSheet);
+    // Properties, numbering and rules (island cc23, engine run 14): every part's fields under
+    // a variant, Change and Update Symbols, the global text and graphics edit.
+    function("kicadSymbolsGet", &kicadSymbolsGet);
+    function("kicadSymbolsSet", &kicadSymbolsSet);
+    function("kicadSymbolsExchange", &kicadSymbolsExchange);
+    function("kicadSchEdit", &kicadSchEdit);
 
 #ifndef KICAD_MERGED_EMBIND
     // JS names ALSO registered by pcbnew_embind.cpp — in the merged image these are
@@ -4315,6 +4328,9 @@ EMSCRIPTEN_BINDINGS(eeschema) {
     function("kicadLibsSymbolUsage", &schLibsSymbolUsage);
     // Update placed symbols from the library (libs 0017 §2c).
     function("kicadUpdateFromLibrary", &schUpdateFromLibraryShim);
+    // Settings sections (engine run 14); the merged image dispatches these two names.
+    function("kicadSettingsGet", &schSettingsGet);
+    function("kicadSettingsSet", &schSettingsSet);
 #endif // !KICAD_MERGED_EMBIND
 }
 #endif
