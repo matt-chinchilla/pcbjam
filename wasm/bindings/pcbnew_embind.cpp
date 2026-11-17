@@ -5965,6 +5965,25 @@ void ccRunBoardOutput( const CC_BOARD_OUTPUT& aArgs )
     if( screen && !wasModified && screen->IsContentModified() )
         screen->SetContentModified( false );
 
+    // The VRML output: on the first run 14 build KiCad's exporter answered success on Glasgow
+    // and wrote only the 16 byte "#VRML V2.0 utf8" header (kicad-cli 10.0.4 writes 18 MB from
+    // the same board). Until that is found, a header-only file is a failed output with its own
+    // line, never a file the page offers.
+    if( code == 0 && aArgs.job == "pcb_export_3d" )
+    {
+        wxFileName wrl( ccOutputFile( aArgs.dir, brd, wxS( "wrl" ) ) );
+
+        if( !wrl.FileExists() || wrl.GetSize() <= 64 )
+        {
+            if( wrl.FileExists() )
+                wxRemoveFile( wrl.GetFullPath() );
+
+            lines.Report( wxS( "The VRML exporter wrote no board (an empty scene)." ),
+                          RPT_SEVERITY_ERROR );
+            code = -1;
+        }
+    }
+
     finish();
 }
 
