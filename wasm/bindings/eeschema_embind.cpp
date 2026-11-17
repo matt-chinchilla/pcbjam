@@ -6683,6 +6683,20 @@ std::string ccSchNetlistForBoard( KIWAY_PLAYER* aPlayer )
 // as it was; no KiCad window opens (wxLogNull keeps wx's log window shut too).
 namespace
 {
+/**
+ * The four schematic plot jobs and their REGISTER_JOB lines live in
+ * common/jobs/job_export_sch_plot.cpp, whose object nothing else in this image references (the
+ * jobs handler only casts to the base class), so the linker left it out of the archive and the
+ * registry never held sch_export_plot_* (measured on the first run 14 build: refused, and absent
+ * from kicadOutputJobs). These references to its constructors pull the object in.
+ */
+__attribute__( ( used ) ) JOB* ( *const ccSchPlotJobsLinked[] )() = {
+    []() -> JOB* { return new JOB_EXPORT_SCH_PLOT_PDF(); },
+    []() -> JOB* { return new JOB_EXPORT_SCH_PLOT_SVG(); },
+    []() -> JOB* { return new JOB_EXPORT_SCH_PLOT_DXF(); },
+    []() -> JOB* { return new JOB_EXPORT_SCH_PLOT_PS(); },
+};
+
 /** One schematic output, read and checked before anything is queued. */
 struct CC_SCH_OUTPUT
 {
