@@ -351,8 +351,13 @@ inline bool MergeSettings( JOB& aJob, const std::string& aName, const json& aSen
 
         const json& value = it.value();
 
-        if( JsonKind( value ) != JsonKind( *known ) )
+        // A KiCad enum serializes its unset value as null (pcb_export_3d's format on a fresh
+        // job): such a key takes a string, the enum's name, which FromJson maps.
+        if( known->is_null() ? !( value.is_string() || value.is_null() )
+                             : JsonKind( value ) != JsonKind( *known ) )
+        {
             return false;
+        }
 
         if( value.is_array() )
         {
