@@ -59,6 +59,12 @@
 #include <view/view.h>
 #include <view/view_overlay.h>
 #include <pcb_draw_panel_gal.h>
+#include <exporters/place_file_exporter.h>
+#include <exporters/export_hyperlynx.h>
+#include <ki_exception.h>
+#include <zones.h>
+#include <eda_item_flags.h>
+#include <functional>
 #include <jobs/job_export_pcb_gerbers.h>
 #include <jobs/job_export_pcb_drill.h>
 #include <netlist_reader/pcb_netlist.h>
@@ -99,6 +105,7 @@
 #include "collab_presence_style.h"
 #include "pcbjam_theme.h"
 #include "pcbjam_libs_reload.h"
+#include "cc_output_common.h"
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
@@ -2590,36 +2597,13 @@ bool pcbFootprintSetModels( std::string aId, std::string aModelsJson )
 // so pours plot as the board last filled them; EnsurePathExists only reports).
 namespace
 {
-/** Every line a job reports, with its severity, in order (WX_STRING_REPORTER keeps the text alone). */
-class PLOT_LINES_REPORTER : public REPORTER
-{
-public:
-    using REPORTER::Report;
-
-    REPORTER& Report( const wxString& aText, SEVERITY aSeverity = RPT_SEVERITY_UNDEFINED ) override
-    {
-        REPORTER::Report( aText, aSeverity );
-        wxString text = aText;
-        text.Trim( true ).Trim( false );
-
-        if( !text.IsEmpty() )
-            m_lines.emplace_back( aSeverity, text );
-
-        return *this;
-    }
-
-    std::vector<std::pair<SEVERITY, wxString>> m_lines;
-};
+// The lines reporter, its severity words and the record writer live in cc_output_common.h
+// (engine run 14), shared with the board and schematic output exports; the plot is unchanged.
+using PLOT_LINES_REPORTER = cc_output::LINES_REPORTER;
 
 const char* plotSeverityWord( SEVERITY aSeverity )
 {
-    switch( aSeverity )
-    {
-    case RPT_SEVERITY_ERROR:   return "error";
-    case RPT_SEVERITY_WARNING: return "warning";
-    case RPT_SEVERITY_ACTION:  return "action";
-    default:                   return "info";
-    }
+    return cc_output::SeverityWord( aSeverity );
 }
 
 /**
@@ -2630,31 +2614,12 @@ const char* plotSeverityWord( SEVERITY aSeverity )
 void writePlotDone( const std::string& aDir, int aGerbers, const std::optional<int>& aDrill,
                     const PLOT_LINES_REPORTER& aReporter )
 {
-    json lines = json::array();
-
-    for( const auto& [severity, text] : aReporter.m_lines )
-    {
-        json line = json::object();
-        line["severity"] = plotSeverityWord( severity );
-        line["text"] = std::string( text.ToUTF8() );
-        lines.push_back( std::move( line ) );
-    }
-
     json done = json::object();
     done["gerbers"] = aGerbers;
     done["drill"] = aDrill ? json( *aDrill ) : json( nullptr );
-    done["lines"] = std::move( lines );
+    done["lines"] = cc_output::LinesJson( aReporter );
 
-    const std::string body = done.dump( -1, ' ', false, json::error_handler_t::replace );
-    const std::string part = aDir + "/.cc-plot.json.part";
-    const std::string fin = aDir + "/.cc-plot.json";
-
-    if( FILE* f = std::fopen( part.c_str(), "wb" ) )
-    {
-        std::fwrite( body.data(), 1, body.size(), f );
-        std::fclose( f );
-        std::rename( part.c_str(), fin.c_str() );
-    }
+    cc_output::WriteRecord( aDir, ".cc-plot.json", done );
 }
 
 /** One job through the pcbnew kiface's handler; a throw is an error line and exit code -1. */
@@ -2792,15 +2757,10 @@ bool pcbPlotBoard( std::string aArgsJson )
         return false;
     }
 
-    static const std::string root = "/tmp/cc-plot/";
-    const std::string        d = dir->get<std::string>();
+    const std::string d = dir->get<std::string>();
 
-    if( d.size() <= root.size() || d.compare( 0, root.size(), root ) != 0
-            || d.find( ".." ) != std::string::npos || d.back() == '/'
-            || d.find( '\0' ) != std::string::npos )
-    {
+    if( !cc_output::IsRunDir( d, "/tmp/cc-plot/" ) )
         return false;
-    }
 
     const std::string p = preset->get<std::string>();
 
@@ -3338,9 +3298,7 @@ using pcbjam_collab::toUtf8;
 /** A run folder: under aRoot, longer than it, no "..", no trailing slash, no NUL (the plot's rule). */
 bool ccIsRunDir( const std::string& aDir, const std::string& aRoot )
 {
-    return aDir.size() > aRoot.size() && aDir.compare( 0, aRoot.size(), aRoot ) == 0
-           && aDir.find( ".." ) == std::string::npos && aDir.back() != '/'
-           && aDir.find( '\0' ) == std::string::npos;
+    return cc_output::IsRunDir( aDir, aRoot );
 }
 
 void ccEnsureDir( const std::string& aDir )
@@ -5702,6 +5660,1080 @@ bool pcbBoardItemSet( std::string aArgsJson )
     return true;
 }
 
+// ════════════════════════ Circuit Center, engine run 14 (outputs and rules) ════════════════════════
+//
+// The board half of the island's project.export (cap export) and board.rules (cap rules), from
+// the outputs spec (2026-11-16): kicadExportBoardOutput runs ONE board output, a KiCad job by its
+// registry name with KiCad's own settings JSON (6.2's merge, cc_output_common.h) or one of our
+// runners (cc_*) calling the exporter beneath KiCad's dialog, into /tmp/cc-out/<n>, its record
+// <dir>/.cc-export.json {code, lines, dropped} written LAST; kicadResolveRules answers KiCad's
+// Constraints Resolution (one item) and Clearance Resolution (two items) as records, a read.
+// Nothing in the board changes: no commit, no undo step, the modified flag as it was; no KiCad
+// window opens on any of these roads (wxLogNull keeps wx's log window shut too).
+
+// KiCad's free functions beneath the board editor's Export dialogs, declared here: specctra.h
+// includes generated lexer headers outside the bindings' include roots, and RecreateCmpFile has
+// no header (pcbnew/exporters/export_footprint_associations.cpp).
+namespace DSN
+{
+void ExportBoardToSpecctraFile( BOARD* aBoard, const wxString& aFullFilename );
+}
+
+bool RecreateCmpFile( BOARD* aBrd, const wxString& aFullCmpFileName );
+
+namespace
+{
+/** One board output, read and checked before anything is queued. */
+struct CC_BOARD_OUTPUT
+{
+    std::string              dir;
+    std::string              job;
+    std::shared_ptr<JOB>     kicadJob;   // null for ours
+    cc_output::OURS_SETTINGS ours;
+    cc_output::MERGE_RESULT  merge;
+};
+
+/** <dir>/<the board's file name>.<ext>, KiCad's own naming for a board output. */
+wxString ccOutputFile( const std::string& aDir, BOARD* aBoard, const wxString& aExt )
+{
+    const wxString stem = wxFileName( aBoard->GetFileName() ).GetName();
+    return wxFileName( wxString::FromUTF8( aDir.c_str() ), stem, aExt ).GetFullPath();
+}
+
+/**
+ * Ours (the outputs spec's 6.3): each the body of KiCad's own menu command after its dialog,
+ * with no box. Answers the record's code: 0 made, 1 KiCad's exporter refused (its line said).
+ */
+int ccRunOurBoardOutput( PCB_EDIT_FRAME* aFrame, BOARD* aBoard, const CC_BOARD_OUTPUT& aArgs,
+                         cc_output::LINES_REPORTER& aLines )
+{
+    const std::string& job = aArgs.job;
+
+    auto cannotCreate =
+            [&]( const wxString& aPath ) -> int
+            {
+                aLines.Report( wxString::Format( _( "Failed to create file '%s'." ), aPath ),
+                               RPT_SEVERITY_ERROR );
+                return 1;
+            };
+
+    if( job == "cc_footprint_report" )
+    {
+        // BOARD_EDITOR_CONTROL::GenFootprintsReport after its folder dialog.
+        const wxString path = ccOutputFile( aArgs.dir, aBoard, wxS( "rpt" ) );
+        PLACE_FILE_EXPORTER exporter( aBoard, aArgs.ours.units == "mm",
+                                      false,        // aOnlySMD
+                                      false,        // aNoTHItems
+                                      false,        // aExcludeDNP
+                                      false,        // aExcludeBOM
+                                      true, true,   // aTopSide, aBottomSide
+                                      false,        // aFormatCSV
+                                      true,         // aUseAuxOrigin
+                                      false );      // aNegateBottomX
+
+        exporter.SetVariant( aBoard->GetCurrentVariant() );
+
+        const std::string data = exporter.GenReportData();
+        FILE*             f = std::fopen( toUtf8( path ).c_str(), "wt" );
+
+        if( !f )
+            return cannotCreate( path );
+
+        std::fputs( data.c_str(), f );
+        std::fclose( f );
+        return 0;
+    }
+
+    if( job == "cc_idf" )
+    {
+        // DIALOG_EXPORT_IDF3's call with the origin at 0, 0 (absolute), its boxes reported
+        // (kicad cc/main K-O1).
+        const wxString path = ccOutputFile( aArgs.dir, aBoard, wxS( "emn" ) );
+
+        return aFrame->Export_IDF3( aBoard, path, aArgs.ours.units == "thou", 0.0, 0.0,
+                                    aArgs.ours.includeUnspecified, aArgs.ours.includeDnp, &aLines )
+                       ? 0 : 1;
+    }
+
+    if( job == "cc_specctra_dsn" )
+    {
+        // PCB_EDIT_FRAME::ExportSpecctraFile without its error box: the exporter's own line.
+        // Its two footprint flips set the modified flag and cancel out, so the flag is put
+        // back as KiCad's wrapper puts it back.
+        const wxString path = ccOutputFile( aArgs.dir, aBoard, wxS( "dsn" ) );
+        BASE_SCREEN*   screen = aFrame->GetScreen();
+        const bool     wasModified = screen && screen->IsContentModified();
+        int            code = 0;
+
+        try
+        {
+            DSN::ExportBoardToSpecctraFile( aBoard, path );
+        }
+        catch( const IO_ERROR& ioe )
+        {
+            aLines.Report( ioe.What(), RPT_SEVERITY_ERROR );
+            code = 1;
+        }
+
+        if( screen && !wasModified )
+            screen->SetContentModified( false );
+
+        if( code != 0 && wxFileName::FileExists( path ) )
+            wxRemoveFile( path );   // a half written file is no output
+
+        return code;
+    }
+
+    if( job == "cc_hyperlynx" )
+    {
+        // BOARD_EDITOR_CONTROL::ExportHyperlynx after its file dialog (kicad cc/main K-O2).
+        const wxString path = ccOutputFile( aArgs.dir, aBoard, wxS( "hyp" ) );
+
+        if( !ExportBoardToHyperlynx( aBoard, wxFileName( path ) ) )
+        {
+            if( wxFileName::FileExists( path ) )
+                wxRemoveFile( path );
+
+            return cannotCreate( path );
+        }
+
+        return 0;
+    }
+
+    if( job == "cc_footprint_associations" )
+    {
+        // BOARD_EDITOR_CONTROL::ExportCmpFile after its file dialog.
+        const wxString path = ccOutputFile( aArgs.dir, aBoard, wxS( "cmp" ) );
+
+        return RecreateCmpFile( aBoard, path ) ? 0 : cannotCreate( path );
+    }
+
+    if( job == "cc_footprints" )
+    {
+        // PCB_EDIT_FRAME::ExportFootprintsToLibrary without its library chooser, its boxes and
+        // any library table: each footprint copied and reset as KiCad resets it, written by
+        // the KiCad S-expression writer into <board>.pretty/. The folder is made first (a
+        // save into a folder that is missing asks in a box). Two footprints of one name: the
+        // first is kept and the rest are named in one warning line.
+        const wxString   stem = wxFileName( aBoard->GetFileName() ).GetName();
+        wxFileName       lib;
+        lib.AssignDir( wxString::FromUTF8( aArgs.dir.c_str() ) );
+        lib.AppendDir( stem + wxS( ".pretty" ) );
+        const wxString   libPath = lib.GetPath();
+        PCB_IO_KICAD_SEXPR io;
+
+        io.CreateLibrary( libPath );   // throws IO_ERROR, an error line in the caller
+
+        std::set<wxString> saved;
+        wxArrayString      twins;
+
+        for( FOOTPRINT* footprint : aBoard->Footprints() )
+        {
+            if( footprint->GetFPID().GetLibItemName().empty() )   // as KiCad: old boards
+                continue;
+
+            const wxString name = footprint->GetFPID().GetUniStringLibItemName();
+
+            if( !saved.insert( name ).second )
+            {
+                if( twins.Index( name ) == wxNOT_FOUND )
+                    twins.Add( name );
+
+                continue;
+            }
+
+            std::unique_ptr<FOOTPRINT> copy(
+                    static_cast<FOOTPRINT*>( footprint->Duplicate( IGNORE_PARENT_GROUP ) ) );
+
+            // Reset reference designator, group membership, and zone offset before saving.
+            copy->SetReference( wxS( "REF**" ) );
+            copy->SetParentGroup( nullptr );
+
+            for( ZONE* zone : copy->Zones() )
+                zone->Move( -copy->GetPosition() );
+
+            io.FootprintSave( libPath, copy.get() );
+        }
+
+        if( !twins.IsEmpty() )
+        {
+            wxString list;
+
+            for( size_t i = 0; i < twins.GetCount(); ++i )
+                list += ( i ? wxS( ", " ) : wxString() ) + twins[i];
+
+            aLines.Report( wxString::Format( wxS( "More than one footprint is named %s; the "
+                                                  "first of each was kept." ),
+                                             list ),
+                           RPT_SEVERITY_WARNING );
+        }
+
+        return 0;
+    }
+
+    aLines.Report( wxS( "this engine does not run that output" ), RPT_SEVERITY_ERROR );
+    return -1;
+}
+
+/** One board output, on the apply coroutine; the record last. */
+void ccRunBoardOutput( const CC_BOARD_OUTPUT& aArgs )
+{
+    cc_output::LINES_REPORTER lines;
+    int                       code = -1;
+
+    cc_output::EnsureDir( aArgs.dir );
+
+    for( const std::string& warning : aArgs.merge.warnings )
+        lines.Report( wxString::FromUTF8( warning.c_str() ), RPT_SEVERITY_WARNING );
+
+    auto finish = [&]()
+                  {
+                      json done = json::object();
+                      done["code"] = code;
+                      done["lines"] = cc_output::LinesJson( lines );
+                      done["dropped"] = aArgs.merge.dropped;
+                      cc_output::WriteRecord( aArgs.dir, cc_output::RecordName(), done );
+                  };
+
+    PCB_EDIT_FRAME* fr = pcbFrame();   // re-resolved on the coroutine (S4)
+    BOARD*          brd = fr ? fr->GetBoard() : nullptr;
+
+    if( !brd || !fr->Kiway().KiFACE( KIWAY::FACE_PCB, false ) )
+    {
+        lines.Report( wxS( "no board editor to export" ), RPT_SEVERITY_ERROR );
+        finish();
+        return;
+    }
+
+    if( aArgs.kicadJob && ( !Pgm().IsGUI() || !Pgm().GetSettingsManager().IsProjectOpen() ) )
+    {
+        // getBoard would load the saved file instead of the editor's board (and keep it).
+        lines.Report( wxS( "the job handler would not export the editor's board" ),
+                      RPT_SEVERITY_ERROR );
+        finish();
+        return;
+    }
+
+    if( !aArgs.merge.refusal.empty() )
+    {
+        lines.Report( wxString::FromUTF8( aArgs.merge.refusal.c_str() ), RPT_SEVERITY_ERROR );
+        finish();
+        return;
+    }
+
+    wxLogNull    noLog;
+    BASE_SCREEN* screen = fr->GetScreen();
+    const bool   wasModified = screen && screen->IsContentModified();
+
+    try
+    {
+        if( aArgs.kicadJob )
+        {
+            // As KiCad's jobset runner (kicad/jobs_runner.cpp): the run folder is the job's
+            // temporary output directory and its own output path stays empty, so the job's
+            // handler names the files as kicad-cli jobset run names them.
+            aArgs.kicadJob->SetTempOutputDirectory( wxString::FromUTF8( aArgs.dir.c_str() ) );
+            code = fr->Kiway().ProcessJob( KIWAY::FACE_PCB, aArgs.kicadJob.get(), &lines );
+        }
+        else
+        {
+            code = ccRunOurBoardOutput( fr, brd, aArgs, lines );
+        }
+    }
+    catch( const IO_ERROR& ioe )
+    {
+        lines.Report( ioe.What(), RPT_SEVERITY_ERROR );
+        code = -1;
+    }
+    catch( const std::exception& e )
+    {
+        lines.Report( wxString::Format( wxS( "the %s output failed: %s" ),
+                                        wxString::FromUTF8( aArgs.job.c_str() ),
+                                        wxString::FromUTF8( e.what() ) ),
+                      RPT_SEVERITY_ERROR );
+        code = -1;
+    }
+    catch( ... )
+    {
+        lines.Report( wxString::Format( wxS( "the %s output failed" ),
+                                        wxString::FromUTF8( aArgs.job.c_str() ) ),
+                      RPT_SEVERITY_ERROR );
+        code = -1;
+    }
+
+    // An output never marks the board changed.
+    if( screen && !wasModified && screen->IsContentModified() )
+        screen->SetContentModified( false );
+
+    finish();
+}
+
+// ───────────────────────────── the rules for an item and a pair ─────────────────────────────
+
+/** KiCad's rules engine with the assertions ProcessAssertions tests, read one by one. */
+class CC_RULES_ENGINE : public DRC_ENGINE
+{
+public:
+    CC_RULES_ENGINE( BOARD* aBoard, BOARD_DESIGN_SETTINGS* aSettings ) :
+            DRC_ENGINE( aBoard, aSettings )
+    {
+    }
+
+    /**
+     * Each assertion DRC_ENGINE::ProcessAssertions tests on aItem, in its order, with its
+     * verdict: an unconditional rule or one whose condition holds (a rule whose layer does not
+     * match is still tested, as KiCad tests it).
+     */
+    void ForEachAssertion( const BOARD_ITEM* aItem,
+                           const std::function<void( const DRC_CONSTRAINT&, bool )>& aVisit )
+    {
+        auto it = m_constraintMap.find( ASSERTION_CONSTRAINT );
+
+        if( it == m_constraintMap.end() || !it->second )
+            return;
+
+        for( const auto* c : *it->second )
+        {
+            if( !c || !c->constraint.m_Test )
+                continue;
+
+            const bool applies = !c->condition || c->condition->GetExpression().IsEmpty()
+                                 || c->condition->EvaluateFor( aItem, nullptr, c->constraint.m_Type,
+                                                               aItem->GetLayer(), nullptr );
+
+            if( !applies )
+                continue;
+
+            const bool pass = c->constraint.m_Test->EvaluateFor( aItem, nullptr, c->constraint.m_Type,
+                                                                 aItem->GetLayer(), nullptr );
+            aVisit( c->constraint, pass );
+        }
+    }
+};
+
+/** Where a resolved constraint came from, its rule's name and its rule's condition. */
+void ccConstraintOrigin( const DRC_CONSTRAINT& aConstraint, std::string& aSource, std::string& aName,
+                         std::string& aCondition )
+{
+    aSource = "other";
+    aName.clear();
+    aCondition.clear();
+
+    if( const DRC_RULE* rule = aConstraint.GetParentRule() )
+    {
+        std::tie( aSource, aName ) = ccRuleSource( rule );
+
+        if( !rule->IsImplicit() && rule->m_Condition )
+            aCondition = ccText( rule->m_Condition->GetExpression(), 2048 );
+    }
+    else
+    {
+        // A constraint resolved without a rule: DRC_ENGINE::EvalRules names it.
+        const std::string named = toUtf8( aConstraint.GetName() );
+
+        if( named == "board setup" || named == "board minimum" || named.empty() )
+            aSource = "board";
+        else if( named == "net tie" )
+            aSource = "netTie";
+        else
+            aSource = "local";
+
+        aName = aSource == "local" ? ccText( aConstraint.GetName() ) : std::string();
+    }
+
+    if( aSource == "board" )
+        aName.clear();
+}
+
+/** The records of one resolution, in KiCad's report order, at most 128. */
+struct CC_RULES
+{
+    json        rules = json::array();
+    json        notes = json::array();
+    BOARD_ITEM* a = nullptr;
+    BOARD_ITEM* b = nullptr;
+
+    json items() const
+    {
+        json list = json::array();
+
+        for( const BOARD_ITEM* item : { (const BOARD_ITEM*) a, (const BOARD_ITEM*) b } )
+        {
+            if( !item )
+                continue;
+
+            json entry = json::object();
+            entry["uuid"] = toUtf8( item->m_Uuid.AsString() );
+            entry["netclass"] = ccNetclass( item );
+            list.push_back( std::move( entry ) );
+        }
+
+        return list;
+    }
+
+    /** aUnit "mm", "deg", "percent", "count" or "none" (no values). */
+    void add( const char* aConstraint, const char* aUnit, const DRC_CONSTRAINT& aValue,
+              const std::string& aVerdict, PCB_LAYER_ID aLayer )
+    {
+        if( rules.size() >= 128 )
+            return;
+
+        const std::string unit = aUnit;
+
+        auto value = [&]( bool aHas, int aIU ) -> json
+                     {
+                         if( !aHas || unit == "none" )
+                             return nullptr;
+
+                         if( unit == "mm" )
+                             return ccMm( aIU );
+
+                         if( unit == "percent" )   // KiCad keeps the ratio in thousandths
+                             return ccRound( aIU / 10.0, 100.0 );
+
+                         return json( aIU );       // deg, count
+                     };
+
+        const MINOPTMAX<int>& v = aValue.m_Value;
+
+        json r = json::object();
+        r["constraint"] = aConstraint;
+        r["unit"] = unit;
+        r["min"] = value( v.HasMin(), v.HasMin() ? v.Min() : 0 );
+        r["opt"] = value( v.HasOpt(), v.HasOpt() ? v.Opt() : 0 );
+        r["max"] = value( v.HasMax(), v.HasMax() ? v.Max() : 0 );
+        r["verdict"] = aVerdict;
+
+        std::string source, name, condition;
+        ccConstraintOrigin( aValue, source, name, condition );
+
+        r["source"] = source;
+        r["name"] = name;
+        r["condition"] = condition;
+        r["layer"] = ccLayer( aLayer );
+        r["items"] = items();
+        rules.push_back( std::move( r ) );
+    }
+
+    /** Two items on one net: no clearance applies (KiCad's "Min clearance is 0."). */
+    void addSameNet( PCB_LAYER_ID aLayer )
+    {
+        if( rules.size() >= 128 )
+            return;
+
+        json r = json::object();
+        r["constraint"] = "clearance";
+        r["unit"] = "mm";
+        r["min"] = 0.0;
+        r["opt"] = nullptr;
+        r["max"] = nullptr;
+        r["verdict"] = "";
+        r["source"] = "sameNet";
+        r["name"] = "";
+        r["condition"] = "";
+        r["layer"] = ccLayer( aLayer );
+        r["items"] = items();
+        rules.push_back( std::move( r ) );
+    }
+
+    void note( const wxString& aText )
+    {
+        if( notes.size() < 32 )
+            notes.push_back( ccText( aText ) );
+    }
+};
+
+const char* ccZoneConnectionWord( ZONE_CONNECTION aConnection )
+{
+    switch( aConnection )
+    {
+    case ZONE_CONNECTION::FULL:        return "solid";
+    case ZONE_CONNECTION::THERMAL:     return "thermal";
+    case ZONE_CONNECTION::THT_THERMAL: return "thermal_tht";
+    case ZONE_CONNECTION::NONE:        return "none";
+    default:                           return "";
+    }
+}
+
+/** BOARD_INSPECTION_TOOL::InspectConstraints, its pages as records. */
+void ccInspectConstraints( CC_RULES_ENGINE& aEngine, BOARD_ITEM* aItem, bool aCourtyardError,
+                           CC_RULES& aOut )
+{
+    DRC_CONSTRAINT c;
+
+    if( aItem->Type() == PCB_TRACE_T )
+    {
+        c = aEngine.EvalRules( TRACK_WIDTH_CONSTRAINT, aItem, nullptr, aItem->GetLayer(), nullptr );
+        aOut.add( "track_width", "mm", c, "", aItem->GetLayer() );
+    }
+
+    if( aItem->Type() == PCB_VIA_T )
+    {
+        c = aEngine.EvalRules( VIA_DIAMETER_CONSTRAINT, aItem, nullptr, UNDEFINED_LAYER, nullptr );
+        aOut.add( "via_diameter", "mm", c, "", UNDEFINED_LAYER );
+
+        c = aEngine.EvalRules( ANNULAR_WIDTH_CONSTRAINT, aItem, nullptr, UNDEFINED_LAYER, nullptr );
+        aOut.add( "annular_width", "mm", c, "", UNDEFINED_LAYER );
+    }
+
+    if( ( aItem->Type() == PCB_PAD_T && static_cast<PAD*>( aItem )->GetDrillSize().x > 0 )
+            || aItem->Type() == PCB_VIA_T )
+    {
+        c = aEngine.EvalRules( HOLE_SIZE_CONSTRAINT, aItem, nullptr, UNDEFINED_LAYER, nullptr );
+        aOut.add( "hole_size", "mm", c, "", UNDEFINED_LAYER );
+    }
+
+    if( aItem->Type() == PCB_PAD_T || aItem->Type() == PCB_SHAPE_T
+            || dynamic_cast<PCB_TRACK*>( aItem ) )
+    {
+        c = aEngine.EvalRules( SOLDER_MASK_EXPANSION_CONSTRAINT, aItem, nullptr, UNDEFINED_LAYER,
+                               nullptr );
+        aOut.add( "solder_mask_expansion", "mm", c, "", UNDEFINED_LAYER );
+    }
+
+    if( aItem->Type() == PCB_PAD_T )
+    {
+        c = aEngine.EvalRules( SOLDER_PASTE_ABS_MARGIN_CONSTRAINT, aItem, nullptr, UNDEFINED_LAYER,
+                               nullptr );
+        aOut.add( "solder_paste_abs_margin", "mm", c, "", UNDEFINED_LAYER );
+
+        c = aEngine.EvalRules( SOLDER_PASTE_REL_MARGIN_CONSTRAINT, aItem, nullptr, UNDEFINED_LAYER,
+                               nullptr );
+        aOut.add( "solder_paste_rel_margin", "percent", c, "", UNDEFINED_LAYER );
+    }
+
+    if( aItem->Type() == PCB_FIELD_T || aItem->Type() == PCB_TEXT_T
+            || aItem->Type() == PCB_TEXTBOX_T )
+    {
+        c = aEngine.EvalRules( TEXT_HEIGHT_CONSTRAINT, aItem, nullptr, UNDEFINED_LAYER, nullptr );
+        aOut.add( "text_height", "mm", c, "", UNDEFINED_LAYER );
+
+        c = aEngine.EvalRules( TEXT_THICKNESS_CONSTRAINT, aItem, nullptr, UNDEFINED_LAYER, nullptr );
+        aOut.add( "text_thickness", "mm", c, "", UNDEFINED_LAYER );
+    }
+
+    c = aEngine.EvalRules( DISALLOW_CONSTRAINT, aItem, nullptr, aItem->GetLayer(), nullptr );
+    aOut.add( "disallow", "none", c, c.m_DisallowFlags ? "disallowed" : "allowed",
+              aItem->GetLayer() );
+
+    if( aCourtyardError )
+        aOut.note( _( "Report may be incomplete: some footprint courtyards are malformed." ) );
+
+    aEngine.ForEachAssertion( aItem,
+                              [&]( const DRC_CONSTRAINT& aAssertion, bool aPass )
+                              {
+                                  aOut.add( "assertion", "none", aAssertion, aPass ? "pass" : "fail",
+                                            aItem->GetLayer() );
+                              } );
+}
+
+/** BOARD_INSPECTION_TOOL::reportClearance, its pages as records. */
+void ccReportClearance( PCB_EDIT_FRAME* aFrame, CC_RULES_ENGINE& aEngine, BOARD_ITEM* aItemA,
+                        BOARD_ITEM* aItemB, CC_RULES& aOut )
+{
+    BOARD_ITEM* a = aItemA;
+    BOARD_ITEM* b = aItemB;
+
+    // A group is its first item, as KiCad reports it.
+    auto firstOfGroup = [&]( BOARD_ITEM*& aItem ) -> bool
+                        {
+                            if( aItem->Type() != PCB_GROUP_T )
+                                return true;
+
+                            PCB_GROUP* group = static_cast<PCB_GROUP*>( aItem );
+
+                            if( group->GetItems().empty() )
+                                return false;
+
+                            aItem = static_cast<BOARD_ITEM*>( *group->GetItems().begin() );
+                            return aItem != nullptr;
+                        };
+
+    if( !firstOfGroup( a ) || !firstOfGroup( b ) )
+    {
+        aOut.note( _( "Cannot generate clearance report on empty group." ) );
+        return;
+    }
+
+    // A footprint is its pad when all its pads are one logical pad.
+    auto checkFootprint = []( FOOTPRINT* footprint ) -> BOARD_ITEM*
+                          {
+                              PAD* foundPad = nullptr;
+
+                              for( PAD* pad : footprint->Pads() )
+                              {
+                                  if( !foundPad || pad->SameLogicalPadAs( foundPad ) )
+                                      foundPad = pad;
+                                  else
+                                      return footprint;
+                              }
+
+                              if( !foundPad )
+                                  return footprint;
+
+                              return foundPad;
+                          };
+
+    if( a->Type() == PCB_FOOTPRINT_T )
+        a = checkFootprint( static_cast<FOOTPRINT*>( a ) );
+
+    if( b->Type() == PCB_FOOTPRINT_T )
+        b = checkFootprint( static_cast<FOOTPRINT*>( b ) );
+
+    if( !a || !b )
+        return;
+
+    if( a->Type() != PCB_ZONE_T && b->Type() == PCB_ZONE_T )
+        std::swap( a, b );
+    else if( !a->IsConnected() && b->IsConnected() )
+        std::swap( a, b );
+
+    aOut.a = a;
+    aOut.b = b;
+
+    const PCB_LAYER_ID    active = aFrame->GetActiveLayer();
+    const LSET            layerIntersection = a->GetLayerSet() & b->GetLayerSet();
+    const LSET            copperIntersection = layerIntersection & LSET::AllCuMask();
+    BOARD_CONNECTED_ITEM* ac = dynamic_cast<BOARD_CONNECTED_ITEM*>( a );
+    BOARD_CONNECTED_ITEM* bc = dynamic_cast<BOARD_CONNECTED_ITEM*>( b );
+    ZONE*                 zone = dynamic_cast<ZONE*>( a );
+    PAD*                  pad = dynamic_cast<PAD*>( b );
+    FOOTPRINT*            aFP = dynamic_cast<FOOTPRINT*>( a );
+    FOOTPRINT*            bFP = dynamic_cast<FOOTPRINT*>( b );
+    DRC_CONSTRAINT        c;
+
+    if( copperIntersection.any() && zone && pad && zone->GetNetCode() == pad->GetNetCode() )
+    {
+        PCB_LAYER_ID layer = UNDEFINED_LAYER;
+
+        if( zone->IsOnLayer( active ) )
+            layer = active;
+        else if( zone->GetLayerSet().count() > 0 )
+            layer = zone->GetLayerSet().Seq().front();
+
+        c = aEngine.EvalZoneConnection( pad, zone, layer, nullptr );
+        const ZONE_CONNECTION connection = c.m_ZoneConnection;
+        aOut.add( "zone_connection", "none", c, ccZoneConnectionWord( connection ), layer );
+
+        if( connection == ZONE_CONNECTION::THERMAL )
+        {
+            c = aEngine.EvalRules( THERMAL_RELIEF_GAP_CONSTRAINT, pad, zone, layer, nullptr );
+            aOut.add( "thermal_relief_gap", "mm", c, "", layer );
+
+            c = aEngine.EvalRules( THERMAL_SPOKE_WIDTH_CONSTRAINT, pad, zone, layer, nullptr );
+            aOut.add( "thermal_spoke_width", "mm", c, "", layer );
+
+            c = aEngine.EvalRules( MIN_RESOLVED_SPOKES_CONSTRAINT, pad, zone, layer, nullptr );
+            aOut.add( "min_resolved_spokes", "count", c, "", layer );
+        }
+        else if( connection == ZONE_CONNECTION::NONE )
+        {
+            // The zone's own clearance, then a larger physical clearance or physical hole
+            // clearance in its place, as KiCad resolves it.
+            DRC_CONSTRAINT zoneClearance( CLEARANCE_CONSTRAINT, _( "zone" ) );
+            zoneClearance.m_Value.SetMin( zone->GetLocalClearance().value_or( 0 ) );
+            DRC_CONSTRAINT resolved = zoneClearance;
+
+            c = aEngine.EvalRules( PHYSICAL_CLEARANCE_CONSTRAINT, pad, zone, layer, nullptr );
+
+            if( c.m_Value.HasMin() && c.m_Value.Min() > resolved.m_Value.Min() )
+                resolved = c;
+
+            if( !pad->FlashLayer( layer ) )
+            {
+                c = aEngine.EvalRules( PHYSICAL_HOLE_CLEARANCE_CONSTRAINT, pad, zone, layer, nullptr );
+
+                if( c.m_Value.HasMin() && c.m_Value.Min() > resolved.m_Value.Min() )
+                    resolved = c;
+            }
+
+            aOut.add( "clearance", "mm", resolved, "", layer );
+        }
+        else
+        {
+            aOut.addSameNet( layer );
+        }
+    }
+    else if( copperIntersection.any() && !aFP && !bFP )
+    {
+        const bool sameNet = ac && bc && ac->GetNetCode() > 0 && ac->GetNetCode() == bc->GetNetCode();
+        std::vector<PCB_LAYER_ID> layers;
+
+        if( copperIntersection.test( active ) )
+            layers.push_back( active );
+
+        for( PCB_LAYER_ID layer : copperIntersection.Seq() )
+        {
+            if( layer != active )
+                layers.push_back( layer );
+        }
+
+        for( PCB_LAYER_ID layer : layers )
+        {
+            if( sameNet )
+            {
+                aOut.addSameNet( layer );
+                continue;
+            }
+
+            c = aEngine.EvalRules( CLEARANCE_CONSTRAINT, a, b, layer, nullptr );
+
+            if( c.IsNull() )   // KiCad: "Min clearance is 0."
+            {
+                DRC_CONSTRAINT none( CLEARANCE_CONSTRAINT );
+                none.m_Value.SetMin( 0 );
+                aOut.add( "clearance", "mm", none, "", layer );
+            }
+            else
+            {
+                aOut.add( "clearance", "mm", c, "", layer );
+            }
+        }
+    }
+
+    if( ac && bc && ac->GetNet() )
+    {
+        wxString coupledNet;
+        wxString dummy;
+
+        if( DRC_ENGINE::MatchDpSuffix( ac->GetNet()->GetNetname(), coupledNet, dummy )
+                && bc->GetNetname() == coupledNet )
+        {
+            const LSET   dpIntersection = ac->GetLayerSet() & bc->GetLayerSet() & LSET::AllCuMask();
+            PCB_LAYER_ID dpLayer = active;
+
+            if( !dpIntersection.test( dpLayer ) && dpIntersection.any() )
+                dpLayer = dpIntersection.Seq().front();
+
+            c = aEngine.EvalRules( DIFF_PAIR_GAP_CONSTRAINT, ac, bc, dpLayer, nullptr );
+            aOut.add( "diff_pair_gap", "mm", c, "", dpLayer );
+
+            if( aEngine.HasRulesForConstraintType( MAX_UNCOUPLED_CONSTRAINT ) )
+            {
+                c = aEngine.EvalRules( MAX_UNCOUPLED_CONSTRAINT, ac, bc, dpLayer, nullptr );
+                aOut.add( "max_uncoupled", "mm", c, "", dpLayer );
+            }
+            else
+            {
+                aOut.note( _( "No 'diff_pair_uncoupled' constraints defined." ) );
+            }
+        }
+    }
+
+    auto isOnCorrespondingLayer =
+            [&]( BOARD_ITEM* aItem, PCB_LAYER_ID aLayer, bool* aTented ) -> bool
+            {
+                if( aItem->IsOnLayer( aLayer ) )
+                    return true;
+
+                const PCB_LAYER_ID mask = IsFrontLayer( aLayer ) ? F_Mask : B_Mask;
+                const PCB_LAYER_ID copper = IsFrontLayer( aLayer ) ? F_Cu : B_Cu;
+
+                if( aItem->IsOnLayer( mask ) )
+                    return true;
+
+                if( aItem->IsTented( mask ) && aItem->IsOnLayer( copper ) )
+                {
+                    *aTented = true;
+                    return true;
+                }
+
+                return false;
+            };
+
+    for( PCB_LAYER_ID layer : { F_SilkS, B_SilkS } )
+    {
+        bool tentedA = false;
+        bool tentedB = false;
+
+        if( ( a->IsOnLayer( layer ) && isOnCorrespondingLayer( b, layer, &tentedB ) )
+                || ( b->IsOnLayer( layer ) && isOnCorrespondingLayer( a, layer, &tentedA ) ) )
+        {
+            c = aEngine.EvalRules( SILK_CLEARANCE_CONSTRAINT, a, b, layer, nullptr );
+            aOut.add( "silk_clearance", "mm", c, "", layer );
+
+            if( tentedA || tentedB )
+            {
+                aOut.note( wxString::Format( _( "Note: %s is tented; clearance will only be "
+                                                "applied to holes." ),
+                                             ( tentedB ? b : a )->GetItemDescription( aFrame, true ) ) );
+            }
+        }
+    }
+
+    for( PCB_LAYER_ID layer : { F_CrtYd, B_CrtYd } )
+    {
+        const bool aCourtyard = aFP && !aFP->GetCourtyard( layer ).IsEmpty();
+        const bool bCourtyard = bFP && !bFP->GetCourtyard( layer ).IsEmpty();
+
+        if( aCourtyard && bCourtyard )
+        {
+            c = aEngine.EvalRules( COURTYARD_CLEARANCE_CONSTRAINT, a, b, layer, nullptr );
+            aOut.add( "courtyard_clearance", "mm", c, "", layer );
+        }
+    }
+
+    if( a->HasHole() || b->HasHole() )
+    {
+        PCB_LAYER_ID layer = UNDEFINED_LAYER;
+
+        if( a->HasHole() && b->IsOnLayer( active ) && IsCopperLayer( active ) )
+            layer = active;
+        else if( b->HasHole() && a->IsOnLayer( active ) && IsCopperLayer( active ) )
+            layer = active;
+        else if( a->HasHole() && b->IsOnCopperLayer() )
+            layer = b->GetLayer();
+        else if( b->HasHole() && a->IsOnCopperLayer() )
+            layer = a->GetLayer();
+
+        if( layer >= 0 )
+        {
+            c = aEngine.EvalRules( HOLE_CLEARANCE_CONSTRAINT, a, b, layer, nullptr );
+            aOut.add( "hole_clearance", "mm", c, "", layer );
+        }
+
+        if( a->HasDrilledHole() || b->HasDrilledHole() )
+        {
+            c = aEngine.EvalRules( HOLE_TO_HOLE_CONSTRAINT, a, b, UNDEFINED_LAYER, nullptr );
+            aOut.add( "hole_to_hole", "mm", c, "", UNDEFINED_LAYER );
+        }
+    }
+
+    for( PCB_LAYER_ID edgeLayer : { Edge_Cuts, Margin } )
+    {
+        PCB_LAYER_ID layer = UNDEFINED_LAYER;
+
+        if( a->IsOnLayer( edgeLayer ) && b->Type() != PCB_FOOTPRINT_T )
+        {
+            if( b->IsOnLayer( active ) && IsCopperLayer( active ) )
+                layer = active;
+            else if( IsCopperLayer( b->GetLayer() ) )
+                layer = b->GetLayer();
+        }
+        else if( b->IsOnLayer( edgeLayer ) && a->Type() != PCB_FOOTPRINT_T )
+        {
+            if( a->IsOnLayer( active ) && IsCopperLayer( active ) )
+                layer = active;
+            else if( IsCopperLayer( a->GetLayer() ) )
+                layer = a->GetLayer();
+        }
+
+        if( layer >= 0 )
+        {
+            c = aEngine.EvalRules( EDGE_CLEARANCE_CONSTRAINT, a, b, layer, nullptr );
+            aOut.add( "edge_clearance", "mm", c, "", layer );
+        }
+    }
+
+    if( aEngine.HasRulesForConstraintType( PHYSICAL_CLEARANCE_CONSTRAINT ) )
+    {
+        LSET reportLayers = layerIntersection;
+
+        if( a->IsOnLayer( Edge_Cuts ) )
+            reportLayers |= bFP ? LSET( { F_CrtYd, B_CrtYd } )
+                                : LSET( b->GetLayerSet() & LSET::PhysicalLayersMask() );
+
+        if( b->IsOnLayer( Edge_Cuts ) )
+            reportLayers |= aFP ? LSET( { F_CrtYd, B_CrtYd } )
+                                : LSET( a->GetLayerSet() & LSET::PhysicalLayersMask() );
+
+        for( PCB_LAYER_ID layer : reportLayers )
+        {
+            c = aEngine.EvalRules( PHYSICAL_CLEARANCE_CONSTRAINT, a, b, layer, nullptr );
+
+            if( !c.IsNull() )
+                aOut.add( "physical_clearance", "mm", c, "", layer );
+        }
+    }
+
+    if( ( a->HasHole() || b->HasHole() )
+            && aEngine.HasRulesForConstraintType( PHYSICAL_HOLE_CLEARANCE_CONSTRAINT ) )
+    {
+        PCB_LAYER_ID layer;
+
+        if( a->HasHole() && b->IsOnLayer( active ) )
+            layer = active;
+        else if( b->HasHole() && a->IsOnLayer( active ) )
+            layer = active;
+        else if( a->HasHole() )
+            layer = b->GetLayer();
+        else
+            layer = a->GetLayer();
+
+        c = aEngine.EvalRules( PHYSICAL_HOLE_CLEARANCE_CONSTRAINT, a, b, layer, nullptr );
+        aOut.add( "physical_hole_clearance", "mm", c, "", layer );
+    }
+}
+
+/** The resolution, as the island's board.rules reads it; never throws. */
+std::string ccResolveRules( PCB_EDIT_FRAME* aFrame, const std::string& aA, const std::string& aB )
+{
+    BOARD* board = aFrame->GetBoard();
+    json   out = json::object();
+
+    out["rules"] = json::array();
+    out["notes"] = json::array();
+    out["error"] = "";
+
+    BOARD_ITEM* a = ccResolve( board, aA );
+    BOARD_ITEM* b = aB.empty() ? nullptr : ccResolve( board, aB );
+
+    if( !a || ( !aB.empty() && !b ) )
+    {
+        out["error"] = "not_found";
+        return out.dump( -1, ' ', false, json::error_handler_t::replace );
+    }
+
+    // BOARD_INSPECTION_TOOL::makeDRCEngine, with no dialog: the custom rules compiled first
+    // (a parse error ends the answer, as the Why panel's), the zone and courtyard caches built.
+    CC_RULES_ENGINE engine( board, &board->GetDesignSettings() );
+
+    try
+    {
+        engine.InitEngine( aFrame->GetDesignRulesPath() );
+    }
+    catch( const PARSE_ERROR& )
+    {
+        out["error"] = "rules_invalid";
+        return out.dump( -1, ' ', false, json::error_handler_t::replace );
+    }
+
+    bool courtyardError = false;
+
+    for( ZONE* zone : board->Zones() )
+        zone->CacheBoundingBox();
+
+    for( FOOTPRINT* footprint : board->Footprints() )
+    {
+        for( ZONE* zone : footprint->Zones() )
+            zone->CacheBoundingBox();
+
+        footprint->BuildCourtyardCaches();
+
+        if( ( footprint->GetFlags() & MALFORMED_COURTYARDS ) != 0 )
+            courtyardError = true;
+    }
+
+    CC_RULES rules;
+
+    if( !b )
+    {
+        rules.a = a;
+        ccInspectConstraints( engine, a, courtyardError, rules );
+    }
+    else
+    {
+        ccReportClearance( aFrame, engine, a, b, rules );
+    }
+
+    out["rules"] = std::move( rules.rules );
+    out["notes"] = std::move( rules.notes );
+    return out.dump( -1, ' ', false, json::error_handler_t::replace );
+}
+} // namespace
+
+// project.export, a board output (cap export). aArgsJson exactly {"run": int >= 0, "dir":
+// "/tmp/cc-out/<n>", "job": one of cc_output::BoardJobs(), "settings": object}. A KiCad job's
+// settings are KiCad's own job JSON (a jobset's), merged by the outputs spec's 6.2 (unknown keys
+// dropped and named, a known key of another JSON type refused); ours take their closed keys only.
+// False (nothing queued) for anything else, with no board, or while an open is in flight; true
+// once the run is queued on the apply coroutine (the host waits for the apply queue to empty and
+// <dir>/.cc-export.json {"code", "lines": [{severity, text}], "dropped": [key]}).
+bool pcbExportBoardOutput( std::string aArgsJson )
+{
+    PCB_EDIT_FRAME* fr = pcbFrame();
+
+    if( !fr || !fr->GetBoard() || pcbjam_open::busy() )
+        return false;
+
+    json args = json::parse( aArgsJson, nullptr, /*allow_exceptions*/ false );
+
+    if( args.is_discarded() || !args.is_object() || args.size() != 4 )
+        return false;
+
+    auto run = args.find( "run" );
+    auto dir = args.find( "dir" );
+    auto job = args.find( "job" );
+    auto settings = args.find( "settings" );
+
+    if( run == args.end() || !run->is_number_integer() || run->get<long long>() < 0
+            || dir == args.end() || !dir->is_string() || job == args.end() || !job->is_string()
+            || settings == args.end() || !settings->is_object() )
+    {
+        return false;
+    }
+
+    CC_BOARD_OUTPUT a;
+    a.dir = dir->get<std::string>();
+    a.job = job->get<std::string>();
+
+    if( !cc_output::IsRunDir( a.dir, cc_output::OutputRoot() )
+            || !cc_output::Lists( cc_output::BoardJobs(), a.job ) )
+    {
+        return false;
+    }
+
+    if( cc_output::IsOurs( a.job ) )
+    {
+        if( !cc_output::ReadOurs( a.job, *settings, a.ours ) )
+            return false;
+    }
+    else
+    {
+        const wxString name = wxString::FromUTF8( a.job.c_str() );
+
+        if( JOB_REGISTRY::GetKifaceType( name ) != KIWAY::FACE_PCB )
+            return false;
+
+        a.kicadJob.reset( JOB_REGISTRY::CreateInstance<JOB>( name ) );
+
+        if( !a.kicadJob || !cc_output::MergeSettings( *a.kicadJob, a.job, *settings, a.merge ) )
+            return false;
+    }
+
+    pcbjam_collab::runOnCoroutine( fr, [a]() { ccRunBoardOutput( a ); } );
+    return true;
+}
+
+// board.rules (cap rules): KiCad's Constraints Resolution for one board item and Clearance
+// Resolution for two. aArgsJson exactly {"a": uuid, "b": uuid or ""}, lowercase 8-4-4-4-12, b
+// not a. Answers {"rules": [RuleRecord], "notes": [string], "error": "" | "rules_invalid" |
+// "not_found"}; "" for args of another shape, with no board, or while an open is in flight. A
+// read: synchronous, no coroutine, nothing changed.
+std::string pcbResolveRules( std::string aArgsJson )
+{
+    PCB_EDIT_FRAME* fr = pcbFrame();
+
+    if( !fr || !fr->GetBoard() || pcbjam_open::busy() )
+        return "";
+
+    json args = json::parse( aArgsJson, nullptr, /*allow_exceptions*/ false );
+
+    if( args.is_discarded() || !args.is_object() || args.size() != 2 )
+        return "";
+
+    auto a = args.find( "a" );
+    auto b = args.find( "b" );
+
+    if( a == args.end() || !a->is_string() || b == args.end() || !b->is_string() )
+        return "";
+
+    const std::string first = a->get<std::string>();
+    const std::string second = b->get<std::string>();
+
+    if( !ccIsLowerUuid( first ) || ( !second.empty() && ( !ccIsLowerUuid( second ) || second == first ) ) )
+        return "";
+
+    try
+    {
+        return ccResolveRules( fr, first, second );
+    }
+    catch( ... )
+    {
+        return "";
+    }
+}
+
 EMSCRIPTEN_BINDINGS(pcbnew) {
     // Register vector types for iteration
     register_vector<FOOTPRINT*>("FootprintVector");
@@ -5763,6 +6795,10 @@ EMSCRIPTEN_BINDINGS(pcbnew) {
     function("kicadExplainViolation", &pcbExplainViolation);
     function("kicadBoardItemGet", &pcbBoardItemGet);
     function("kicadBoardItemSet", &pcbBoardItemSet);
+    // Circuit Center (island cc23, engine run 14): one board output through KiCad's own job or
+    // exporter, no dialog (project.export), and the rules for an item or a pair (board.rules).
+    function("kicadExportBoardOutput", &pcbExportBoardOutput);
+    function("kicadResolveRules", &pcbResolveRules);
 
 #ifndef KICAD_MERGED_EMBIND
     // JS names ALSO registered by eeschema_embind.cpp — in the merged image these are
