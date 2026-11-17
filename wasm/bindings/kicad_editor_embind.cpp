@@ -436,6 +436,16 @@ static bool kicadHostActions()
     return true;
 }
 
+// A marker (engine run 14): this engine's symbol editor asks the page before it opens KiCad's
+// pin, field, text, text box, shape or symbol properties dialog (kicad cc/main
+// SYMBOL_EDITOR_EDIT_TOOL::Properties, the pin tool and the drawing tools, through
+// window.kicadHostSymEdit.onRequest), so the page may take that request (the island's
+// ev.symedit, cap symeditHeld).
+static bool kicadHostSymEdit()
+{
+    return true;
+}
+
 static bool kicadSetChrome( bool aShow )
 {
     wxFrame* frame =
@@ -876,6 +886,8 @@ EMSCRIPTEN_BINDINGS(kicad_editor) {
     // The board properties request and every hotkey's action go to the page first (run 12).
     function("kicadHostBoardProperties", &kicadHostBoardProperties);
     function("kicadHostActions", &kicadHostActions);
+    // The symbol editor's dialogs go to the page first (run 14, window.kicadHostSymEdit).
+    function("kicadHostSymEdit", &kicadHostSymEdit);
 
     // Read-only viewer lock (read-only-viewer).
     function("kicadSetReadOnly", &kicadSetReadOnly);

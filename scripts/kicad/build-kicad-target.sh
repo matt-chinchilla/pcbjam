@@ -396,8 +396,12 @@ log_info "KiCad WASM support verified"
 # (compiled with -DKICAD_MERGED_EMBIND, which compiles out their duplicate
 # definitions and shared-name registrations) plus the dispatcher TU that registers
 # the shared JS names once — see wasm/bindings/kicad_editor_embind.cpp.
+# The Symbol Editor's exports (symedit_embind.cpp, engine run 14) are their own TU beside
+# eeschema's, linked wherever eeschema's bindings are.
 if [ "${APP_NAME}" = "kicad_editor" ]; then
-    EMBIND_OBJ="${STUBS_BUILD}/pcbnew_embind.o ${STUBS_BUILD}/eeschema_embind.o ${STUBS_BUILD}/kicad_editor_embind.o"
+    EMBIND_OBJ="${STUBS_BUILD}/pcbnew_embind.o ${STUBS_BUILD}/eeschema_embind.o ${STUBS_BUILD}/symedit_embind.o ${STUBS_BUILD}/kicad_editor_embind.o"
+elif [ "${EMBIND_APP}" = "eeschema" ]; then
+    EMBIND_OBJ="${STUBS_BUILD}/eeschema_embind.o ${STUBS_BUILD}/symedit_embind.o"
 else
     EMBIND_OBJ="${STUBS_BUILD}/${EMBIND_APP}_embind.o"
 fi
@@ -640,6 +644,8 @@ if [ "${APP_NAME}" = "kicad_editor" ]; then
                       "${STUBS_BUILD}/pcbnew_embind.o" pcbnew "-DKICAD_MERGED_EMBIND"
     compile_embind_tu "${PROJECT_ROOT}/wasm/bindings/eeschema_embind.cpp" \
                       "${STUBS_BUILD}/eeschema_embind.o" eeschema "-DKICAD_MERGED_EMBIND"
+    compile_embind_tu "${PROJECT_ROOT}/wasm/bindings/symedit_embind.cpp" \
+                      "${STUBS_BUILD}/symedit_embind.o" eeschema
     compile_embind_tu "${PROJECT_ROOT}/wasm/bindings/kicad_editor_embind.cpp" \
                       "${STUBS_BUILD}/kicad_editor_embind.o" common
 elif [ -f "${EMBIND_SRC}" ]; then
@@ -664,7 +670,13 @@ elif [ -f "${EMBIND_SRC}" ]; then
         eeschema) EMBIND_INC_SUBDIR="eeschema" ;;
         *)        EMBIND_INC_SUBDIR="${KICAD_SUBDIR}" ;;
     esac
-    compile_embind_tu "${EMBIND_SRC}" "${EMBIND_OBJ}" "${EMBIND_INC_SUBDIR}"
+    if [ "${EMBIND_APP}" = "eeschema" ]; then
+        compile_embind_tu "${EMBIND_SRC}" "${STUBS_BUILD}/eeschema_embind.o" "${EMBIND_INC_SUBDIR}"
+        compile_embind_tu "${PROJECT_ROOT}/wasm/bindings/symedit_embind.cpp" \
+                          "${STUBS_BUILD}/symedit_embind.o" "${EMBIND_INC_SUBDIR}"
+    else
+        compile_embind_tu "${EMBIND_SRC}" "${EMBIND_OBJ}" "${EMBIND_INC_SUBDIR}"
+    fi
 else
     log_info "No embind source for ${APP_NAME} (expected at ${EMBIND_SRC}); using empty placeholder"
     EMPTY_C="${STUBS_BUILD}/${APP_NAME}_embind_empty.c"
