@@ -2806,7 +2806,7 @@ json ccParseRules( PCB_EDIT_FRAME* aFrame, const wxString& aText )
         DRC_RULES_PARSER parser( text, wxS( "DRC rules" ) );
         parser.Parse( rules, &reporter );
     }
-    catch( const PARSE_ERROR& pe )
+    catch( PARSE_ERROR& pe )
     {
         json e = json::object();
         e["line"] = pe.lineNumber;
