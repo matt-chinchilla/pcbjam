@@ -458,10 +458,12 @@ inline bool MergeSettings( JOB& aJob, const std::string& aName, const json& aSen
     }
     else if( aName == "sch_export_bom" )
     {
-        reset( "field_delimiter" );
-        reset( "string_delimiter" );
-        reset( "ref_delimiter" );
-        reset( "ref_range_delimiter" );
+        // KiCad's delimiters are kicad-cli's defaults: a fresh job's are empty strings (the CLI
+        // fills them), and a CSV with empty delimiters runs every field together (measured).
+        force( "field_delimiter", "," );
+        force( "string_delimiter", "\"" );
+        force( "ref_delimiter", "," );
+        force( "ref_range_delimiter", "-" );
         reset( "keep_tabs" );
         reset( "keep_line_breaks" );
     }
