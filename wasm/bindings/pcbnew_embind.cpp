@@ -6734,6 +6734,11 @@ std::string pcbResolveRules( std::string aArgsJson )
     }
 }
 
+// Circuit Center (engine run 14): properties, numbering and rules (every footprint's row, the
+// eleven global board edits, Change and Update Footprints, the settings sections), in their
+// own file.
+#include "cc_rules_pcb.inc"
+
 EMSCRIPTEN_BINDINGS(pcbnew) {
     // Register vector types for iteration
     register_vector<FOOTPRINT*>("FootprintVector");
@@ -6799,6 +6804,11 @@ EMSCRIPTEN_BINDINGS(pcbnew) {
     // exporter, no dialog (project.export), and the rules for an item or a pair (board.rules).
     function("kicadExportBoardOutput", &pcbExportBoardOutput);
     function("kicadResolveRules", &pcbResolveRules);
+    // Circuit Center (island cc23, engine run 14): every footprint's row (board.footprints), the
+    // global board edits (board.edit) and Change and Update Footprints (footprints.exchange).
+    function("kicadBoardFootprints", &pcbBoardFootprints);
+    function("kicadBoardEdit", &pcbBoardEdit);
+    function("kicadFootprintsExchange", &pcbFootprintsExchange);
 
 #ifndef KICAD_MERGED_EMBIND
     // JS names ALSO registered by eeschema_embind.cpp — in the merged image these are
@@ -6858,6 +6868,9 @@ EMSCRIPTEN_BINDINGS(pcbnew) {
     // Runtime lib-table row insert + load (a new team library appeared
     // mid-session; the lib set is otherwise frozen at boot).
     function("kicadLibsAddEntry", &pcbjam_libs::addLibraryEntry PCBJAM_PARKER_POLICY);
+    // Settings sections (engine run 14); the merged image dispatches these two names.
+    function("kicadSettingsGet", &pcbSettingsGet);
+    function("kicadSettingsSet", &pcbSettingsSet);
 #endif // !KICAD_MERGED_EMBIND
 }
 #endif

@@ -60,6 +60,11 @@ std::string pcbLibsTestEditorFootprint();
 bool        pcbLibsTestEditorLoad( std::string aLib, std::string aName );
 std::string pcbUpdateFromLibrary( std::string aLib, std::string aNamesJson );
 std::string schUpdateFromLibrary( std::string aLib, std::string aNamesJson );
+// Settings sections (engine run 14): cc_rules_pcb.inc and cc_rules_sch.inc.
+std::string pcbSettingsGet( std::string aSection );
+bool        pcbSettingsSet( std::string aArgsJson );
+std::string schSettingsGet( std::string aSection );
+bool        schSettingsSet( std::string aArgsJson );
 void        pcbCollabApply( std::string aJson );
 void        pcbCollabApplyItems( std::string aJson );
 std::string pcbPlaceImportedItem( std::string aSexpr );
@@ -736,6 +741,30 @@ static std::string updateFromLibrary( std::string aKind, std::string aLib, std::
     return "{\"ok\":false,\"error\":\"no editor for this kind\"}";
 }
 
+// settings.get / settings.set (engine run 14, island cc23, cap settings): one section of the
+// live editor; a section the frame does not hold answers "" or false in that frame's own code.
+static std::string settingsGet( std::string aSection )
+{
+    if( pcbEditorActive() )
+        return pcbSettingsGet( aSection );
+
+    if( schEditorActive() )
+        return schSettingsGet( aSection );
+
+    return "";
+}
+
+static bool settingsSet( std::string aArgsJson )
+{
+    if( pcbEditorActive() )
+        return pcbSettingsSet( aArgsJson );
+
+    if( schEditorActive() )
+        return schSettingsSet( aArgsJson );
+
+    return false;
+}
+
 // Presence shims (collab-presence 0002 pcbnew / 0003 eeschema): route to the live
 // editor's implementation, same pattern as the collab bridge shims above.
 static void collabPresenceStart()
@@ -973,6 +1002,9 @@ EMSCRIPTEN_BINDINGS(kicad_editor) {
     // Placed-footprint usage + update-from-library (libs 0017 §2c/2d).
     function("kicadLibsFootprintUsage", &libsFootprintUsage);
     function("kicadUpdateFromLibrary", &updateFromLibrary);
+    // Settings sections of the live editor (engine run 14, island cc23).
+    function("kicadSettingsGet", &settingsGet);
+    function("kicadSettingsSet", &settingsSet);
 }
 
 #endif // __EMSCRIPTEN__
