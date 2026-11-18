@@ -300,3 +300,36 @@ mode, Board tab; listener `window.kicadHostBoardItem = { onRequest: r => (log.pu
 - Wrong if: a wx dialog with the listener answering true; two requests for one E; a set that
   changes some items when one refuses; a tuning set adding an undo step; the tool stack left
   busy after a placed picture.
+
+## Handover
+
+`git merge run15/main` in both worktrees (pcbjam `8845342`, kicad `4e6fd5c0`), then:
+
+`/home/matthew/cc-wave2/bin/gate.sh scripts/kicad/syntax-check-run15.sh --kicad
+/home/matthew/cc-engine-wt/e3/kicad all --kicad-file pcbnew/tools/edit_tool.cpp --kicad-file
+pcbnew/tools/drawing_tool.cpp --kicad-file pcbnew/generators/pcb_tuning_pattern.cpp --kicad-file
+pcbnew/tools/pad_tool.cpp --kicad-file pcbnew/tools/footprint_editor_control.cpp`:
+
+```
+PASS pcbnew         pcbnew_embind.cpp subdir=pcbnew -DKICAD_MERGED_EMBIND (14086 ms)
+PASS eeschema       eeschema_embind.cpp subdir=eeschema -DKICAD_MERGED_EMBIND (13897 ms)
+PASS symedit        symedit_embind.cpp subdir=eeschema  (8484 ms)
+PASS fpedit         fpedit_embind.cpp subdir=pcbnew  (8116 ms)
+PASS dsedit         dsedit_embind.cpp subdir=pagelayout_editor  (1205 ms)
+PASS kicad_editor   kicad_editor_embind.cpp subdir=common  (5735 ms)
+PASS occ            pcbnew_embind.cpp subdir=pcbnew (13562 ms)
+PASS kicad pcbnew/tools/edit_tool.cpp (10771 ms)
+PASS kicad pcbnew/tools/drawing_tool.cpp (9134 ms)
+PASS kicad pcbnew/generators/pcb_tuning_pattern.cpp (9089 ms)
+PASS kicad pcbnew/tools/pad_tool.cpp (7151 ms)
+PASS kicad pcbnew/tools/footprint_editor_control.cpp (7938 ms)
+syntax-check: 0 failed
+```
+
+`scripts/kicad/check-run15-exports.sh --since run15/main --kicad /home/matthew/cc-engine-wt/e3/kicad
+--kicad-since run15/main`: `check-run15-exports: 161 names registered in the merged image (154
+kicad names), 16 of 110 run 15 names, 0 failures`.
+
+Held, not built (RULINGS 5): fp-f1 waits for fp-e0's gate item 1 to ask for it; flt-ds4-e waits
+for flt-ds4-i's diagnosis to name a pcbnew file (cause (b) or (c) of addendum 13.1). Neither
+diagnosis existed under `/home/matthew/cc-wave2/reports/` or `plan/` at this handover.
