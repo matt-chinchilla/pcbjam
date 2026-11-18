@@ -181,3 +181,26 @@ After E0 dca68eb added -I thirdparty/dxflib_qcad, git merge run15/main in both w
     PASS eeschema       eeschema_embind.cpp subdir=eeschema -DKICAD_MERGED_EMBIND
 
 fp-e8 code is 9c1570e (kicad: none). Still owed at the handover: the syntax check all, the export check, e6.done. sy2-e stays held (no diagnosis says to build it).
+
+## Handover checks (2026-11-18)
+
+After git merge run15/main in the lane worktrees, run by the controller on the lane tips. The conditional unit sy2-e stays held (RULINGS 5).
+
+The syntax check all:
+
+```
+PASS pcbnew         pcbnew_embind.cpp subdir=pcbnew -DKICAD_MERGED_EMBIND (12934 ms)
+PASS eeschema       eeschema_embind.cpp subdir=eeschema -DKICAD_MERGED_EMBIND (12886 ms)
+PASS symedit        symedit_embind.cpp subdir=eeschema  (6659 ms)
+PASS fpedit         fpedit_embind.cpp subdir=pcbnew  (8070 ms)
+PASS dsedit         dsedit_embind.cpp subdir=pagelayout_editor  (4928 ms)
+PASS kicad_editor   kicad_editor_embind.cpp subdir=common  (4812 ms)
+PASS occ            pcbnew_embind.cpp subdir=pcbnew (11990 ms)
+syntax-check: 0 failed
+```
+
+The export check:
+
+```
+check-run15-exports: 253 names registered in the merged image (246 kicad names), 108 of 111 run 15 names, 0 failures
+```
