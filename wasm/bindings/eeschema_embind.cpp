@@ -19,6 +19,9 @@
 // Modified by Circuit Center Inc on 2026-11-18: engine run 15's seams, lane e13's lease slot
 // (cc_e13_lease.h) and one include per author lane's schematic face (cc_eN_sch.inc) after
 // cc_rules_sch.inc, each with its own namespace and bindings block.
+// Modified by Circuit Center Inc on 2026-11-18: the simulator's faults (engine run 15, lane e13):
+// KiCad's logged errors kept as problems instead of a modal box, no_model and pin_map problems,
+// a value KiCad wants as a number refused, a subcircuit's pins listed, runs keyed by number.
 
 #ifdef __EMSCRIPTEN__
 #include <emscripten.h>
@@ -4571,7 +4574,14 @@ json simProblem( const char* aCode, SEVERITY aSeverity, const wxString& aText )
 
 bool mentionsNotFound( const wxString& aText )
 {
-    return aText.Lower().Contains( wxS( "not found" ) );
+    return aText.Lower().Contains( wxS( "not found" ) )
+           || aText.Lower().Contains( wxS( "could not find library file" ) );
+}
+
+/** KiCad's pin map refusals (SIM_MODEL::AssignSymbolPinNumberToModelPin, the Sim.Pins reader). */
+bool mentionsModelPin( const wxString& aText )
+{
+    return aText.Lower().Contains( wxS( "simulation model pin" ) );
 }
 
 /** Error and warning lines of aReporter as problems; aErrorCode for errors, a miss as file_missing. */
@@ -4587,6 +4597,8 @@ void appendProblems( const RUN_LINES_REPORTER& aReporter, const char* aErrorCode
 
         if( mentionsNotFound( text ) )
             code = "file_missing";
+        else if( mentionsModelPin( text ) )
+            code = "pin_map";
         else if( isErrorSeverity( severity ) )
             code = aErrorCode;
 
@@ -4853,6 +4865,10 @@ bool readSimParams( const json& aParams, SIM_MODEL& aModel, const std::set<std::
         const SIM_MODEL::PARAM* param = aModel.FindParam( name );
 
         if( param->info.dir == SIM_MODEL::PARAM::DIR_OUT )
+            return false;
+
+        // SetParamValue keeps any text: a value KiCad wants as a number is judged here.
+        if( !cc_e13::simNumberAccepted( toUtf8( *value ), param->info.type ) )
             return false;
 
         aModel.SetParamValue( name, toUtf8( *value ) );   // throws IO_ERROR on refusal
@@ -5163,6 +5179,14 @@ json simFileJson( SCH_EDIT_FRAME* aFrame, const wxString& aPath )
 
                     for( const std::string& pin : model.GetPinNames() )
                         pinNames.push_back( pin );
+
+                    // A subcircuit names its pins in its .subckt line, not in a type table:
+                    // the library reader adds them as the model's pins (GetPinNames is empty).
+                    if( pinNames.empty() )
+                    {
+                        for( const SIM_MODEL_PIN& pin : model.GetPins() )
+                            pinNames.push_back( pin.modelPinName );
+                    }
                 }
 
                 m["pins"] = std::move( pinNames );
@@ -5224,7 +5248,9 @@ struct SIM_LIVE_RUN
     SIM_TYPE                 kind = ST_UNKNOWN;
     std::vector<std::string> plotsBefore;
     int                      depth = 0;
-    bool                     started = false;         // bg_run asked: an idle event now ends it
+    bool                     started = false;         // bg_run asked
+    bool                     running = false;         // the service said this run is running:
+                                                      // only now does an idle event end it
     bool                     stopRequested = false;
     bool                     finishQueued = false;
     json                     problems = json::array();
@@ -5258,7 +5284,7 @@ std::map<int, std::vector<std::string>>& simKindPlots()
     return plots;
 }
 
-void finishSimRun();
+void finishSimRun( long long aRun );
 
 /**
  * NGSPICE's reporter: the console lines (the last 2,000), and the finish queued on the
@@ -5295,7 +5321,19 @@ public:
     {
         std::optional<SIM_LIVE_RUN>& live = simLive();
 
-        if( aNewState != SIM_IDLE || !live || !live->started || live->finishQueued )
+        if( !live || !live->started || live->finishQueued )
+            return;
+
+        // The service sends running, then idle, for each bg_run, in order. An idle event of an
+        // earlier run that arrives after this run's bg_run (a halted run's late event) comes
+        // before this run's running event, so it never ends this run.
+        if( aNewState == SIM_RUNNING )
+        {
+            live->running = true;
+            return;
+        }
+
+        if( aNewState != SIM_IDLE || !live->running )
             return;
 
         SCH_EDIT_FRAME* fr = schFrame();
@@ -5303,8 +5341,10 @@ public:
         if( !fr )
             return;
 
+        // The queued finish is keyed by the run's number: it never touches a later run.
+        const long long run = live->run;
         live->finishQueued = true;
-        pcbjam_collab::runOnCoroutine( fr, []() { finishSimRun(); } );
+        pcbjam_collab::runOnCoroutine( fr, [run]() { finishSimRun( run ); } );
     }
 
     std::deque<std::string> m_console;
@@ -5541,11 +5581,13 @@ void collectModelProblems( SCH_EDIT_FRAME* aFrame, json& aOut )
                 continue;   // a later unit of a part already made
 
             RUN_LINES_REPORTER reporter;
+            const SIM_MODEL*   made = nullptr;
 
             try
             {
                 mgr.SetFilesStack( simFilesStack( sch, symbol ) );
-                mgr.CreateModel( &path, *symbol, /*aResolve*/ true, 0, wxEmptyString, reporter );
+                made = &mgr.CreateModel( &path, *symbol, /*aResolve*/ true, 0, wxEmptyString,
+                                         reporter ).model;
             }
             catch( const IO_ERROR& e )
             {
@@ -5560,13 +5602,74 @@ void collectModelProblems( SCH_EDIT_FRAME* aFrame, json& aOut )
             const std::string uuid = toUtf8( symbol->m_Uuid.AsString() );
             const std::string sheetPath = toUtf8( path.PathAsString() );
 
-            appendProblems( reporter, "model_error", aOut,
-                            [&]( json& aProblem )
-                            {
-                                aProblem["ref"] = r;
-                                aProblem["uuid"] = uuid;
-                                aProblem["sheetPath"] = sheetPath;
-                            } );
+            auto stamp =
+                    [&]( json& aProblem )
+                    {
+                        aProblem["ref"] = r;
+                        aProblem["uuid"] = uuid;
+                        aProblem["sheetPath"] = sheetPath;
+                    };
+
+            const size_t said = aOut.size();
+            appendProblems( reporter, "model_error", aOut, stamp );
+
+            // Power symbols and other "#" references are not simulated (ERC_TESTER::
+            // TestSimModelIssues skips them the same way).
+            if( !made || ref.StartsWith( wxS( "#" ) ) )
+                continue;
+
+            // KiCad found nothing to build a model from (no Sim.* fields, nothing inferred
+            // from the value): the netlist would carry a bare line ngspice cannot read.
+            if( made->GetType() == SIM_MODEL::TYPE::NONE )
+            {
+                if( aOut.size() == said )
+                {
+                    json problem = simProblem( "no_model", RPT_SEVERITY_ERROR,
+                                               wxString::Format( wxS( "%s has no simulation model" ),
+                                                                 ref ) );
+                    stamp( problem );
+                    aOut.push_back( std::move( problem ) );
+                }
+
+                continue;
+            }
+
+            // The pin map against the symbol's own pins (DIALOG_SIM_MODEL's pin table): a model
+            // pin assigned to a pin the symbol does not have is an error; a required model pin
+            // left on no symbol pin (an optional one is named in angle brackets) a warning.
+            std::set<wxString> symbolPins;
+
+            for( SCH_PIN* pin : symbol->GetAllLibPins() )
+                symbolPins.insert( pin->GetNumber() );
+
+            for( const SIM_MODEL_PIN& pin : made->GetPins() )
+            {
+                const wxString modelPin = wxString::FromUTF8( pin.modelPinName.c_str() );
+                json           problem;
+
+                if( !pin.symbolPinNumber.IsEmpty() && !symbolPins.count( pin.symbolPinNumber ) )
+                {
+                    problem = simProblem( "pin_map", RPT_SEVERITY_ERROR,
+                                          wxString::Format( wxS( "%s: model pin %s is assigned to "
+                                                                 "pin %s, which the symbol does "
+                                                                 "not have" ),
+                                                            ref, modelPin, pin.symbolPinNumber ) );
+                }
+                else if( pin.symbolPinNumber.IsEmpty() && !modelPin.StartsWith( wxS( "<" ) ) )
+                {
+                    problem = simProblem( "pin_map", RPT_SEVERITY_WARNING,
+                                          wxString::Format( wxS( "%s: model pin %s is not "
+                                                                 "assigned to any symbol pin" ),
+                                                            ref, modelPin ) );
+                }
+                else
+                {
+                    continue;
+                }
+
+                stamp( problem );
+                aOut.push_back( std::move( problem ) );
+            }
         }
     }
 }
@@ -5586,6 +5689,39 @@ void appendCircuitProblems( const RUN_LINES_REPORTER& aReporter, json& aOut )
     {
         if( !said.count( problem.value( "text", "" ) ) )
             aOut.push_back( std::move( problem ) );
+    }
+}
+
+/**
+ * The lines KiCad logged while a capture was alive (cc_e13::SIM_LOG_CAPTURE), as problems not
+ * already said (same text): a library file KiCad could not find is file_missing with its path.
+ */
+void appendLogProblems( const cc_e13::SIM_LOG_CAPTURE& aCapture, json& aOut )
+{
+    std::set<std::string> said;
+
+    for( const json& problem : aOut )
+        said.insert( problem.value( "text", "" ) );
+
+    for( const auto& [error, text] : aCapture.m_lines )
+    {
+        const SEVERITY severity = error ? RPT_SEVERITY_ERROR : RPT_SEVERITY_WARNING;
+        const char*    code = mentionsNotFound( text ) ? "file_missing" : "other";
+        json           problem = simProblem( code, severity, text );
+
+        if( said.count( problem.value( "text", "" ) ) )
+            continue;
+
+        said.insert( problem.value( "text", "" ) );
+
+        // "Could not find library file '<path>'": the path between the quotes.
+        const int open = text.Find( '\'' );
+        const int close = text.Find( '\'', /*fromEnd*/ true );
+
+        if( std::string( code ) == "file_missing" && open != wxNOT_FOUND && close > open )
+            problem["path"] = toUtf8( text.Mid( open + 1, close - open - 1 ) );
+
+        aOut.push_back( std::move( problem ) );
     }
 }
 
@@ -5663,12 +5799,12 @@ const char* simTraceName( SIM_TRACE_TYPE aType )
  * signal map, the operating point's values handed to the schematic as KiCad's frame hands
  * them (SCHEMATIC::SetOperatingPoint), then result.json, then the record last.
  */
-void finishSimRun()
+void finishSimRun( long long aRun )
 {
     std::optional<SIM_LIVE_RUN>& live = simLive();
 
-    if( !live )
-        return;
+    if( !live || live->run != aRun )
+        return;   // that run is over: a task of run N never touches run N+1
 
     // A copy: the run stays live (a netlist or a second run refused) until its record.
     SIM_LIVE_RUN run = *live;
@@ -5921,9 +6057,13 @@ void startSimRun( long long aRun, const std::string& aDir, const std::string& aC
             writeRunDone( aDir, "accepted.json", accepted );
 
             simLive()->finishQueued = true;
-            finishSimRun();
+            finishSimRun( aRun );
             return;
         }
+
+        // KiCad's logged errors (a library file the netlist cannot find) kept as problems,
+        // never a modal box, from the model checks through the attach.
+        std::optional<cc_e13::SIM_LOG_CAPTURE> logged( std::in_place );
 
         // SIMULATOR_FRAME::LoadSimulator without its dialogs: the annotation as problems,
         // the connections rebuilt as KiCad does before a simulation, each model made.
@@ -5993,6 +6133,8 @@ void startSimRun( long long aRun, const std::string& aDir, const std::string& aC
         settings->SetCompatibilityMode( mode );
 
         appendCircuitProblems( reporter, problems );
+        appendLogProblems( *logged, problems );
+        logged.reset();
         simCircuit() = circuit;
 
         if( !attached || hasErrorProblem( problems ) )
@@ -6223,8 +6365,20 @@ static std::string kicadSimModelGet( std::string aArgsJson )
     if( !hit.symbol )
         return "";
 
-    return simModelSheetJson( fr, hit.symbol, hit.path )
-            .dump( -1, ' ', false, json::error_handler_t::replace );
+    cc_e13::SIM_LOG_CAPTURE logged;   // KiCad's logged errors as problems, never a modal box
+    json                    sheet = simModelSheetJson( fr, hit.symbol, hit.path );
+    const size_t            said = sheet["problems"].size();
+
+    appendLogProblems( logged, sheet["problems"] );
+
+    for( size_t i = said; i < sheet["problems"].size(); ++i )
+    {
+        sheet["problems"][i]["ref"] = sheet["ref"];
+        sheet["problems"][i]["uuid"] = sheet["uuid"];
+        sheet["problems"][i]["sheetPath"] = sheet["sheetPath"];
+    }
+
+    return sheet.dump( -1, ' ', false, json::error_handler_t::replace );
 }
 
 // sim.model.set: {"uuid", "sheetPath", "model": SimModelSet | null}, those three keys only;
@@ -6263,6 +6417,8 @@ static bool kicadSimModelSet( std::string aArgsJson )
 
     try
     {
+        cc_e13::SIM_LOG_CAPTURE logged;   // a refusal is false: KiCad's logged lines never a box
+
         if( !readSimModelSet( fr, hit.symbol, args["model"], set ) )
             return false;
     }
@@ -6308,7 +6464,19 @@ static std::string kicadSimFileRead( std::string aArgsJson )
     if( !path )
         return "";
 
-    return simFileJson( fr, *path ).dump( -1, ' ', false, json::error_handler_t::replace );
+    cc_e13::SIM_LOG_CAPTURE logged;   // KiCad's logged errors as problems, never a modal box
+    json                    file = simFileJson( fr, *path );
+    const size_t            said = file["problems"].size();
+
+    appendLogProblems( logged, file["problems"] );
+
+    for( size_t i = said; i < file["problems"].size(); ++i )
+    {
+        if( !file["problems"][i].contains( "path" ) )
+            file["problems"][i]["path"] = toUtf8( *path );
+    }
+
+    return file.dump( -1, ' ', false, json::error_handler_t::replace );
 }
 
 // sim.netlist: {"command", "options": {voltages, currents, dissipations, events}}, those
@@ -6341,6 +6509,10 @@ static std::string kicadSimNetlist( std::string aArgsJson )
     out["problems"] = json::array();
     out["directive"] = "";
 
+    // KiCad's logged errors (NETLIST_EXPORTER_SPICE::writeInclude's "Could not find library
+    // file") kept as problems: never a modal box that holds every later export.
+    cc_e13::SIM_LOG_CAPTURE logged;
+
     try
     {
         RUN_LINES_REPORTER  reporter;
@@ -6358,6 +6530,7 @@ static std::string kicadSimNetlist( std::string aArgsJson )
 
         circuit.GetNetlist( wxString::FromUTF8( command.c_str() ), flags, &formatter, reporter );
         appendCircuitProblems( reporter, out["problems"] );
+        appendLogProblems( logged, out["problems"] );
 
         out["directive"] = toUtf8( circuit.GetSchTextSimCommand() );
 
@@ -6496,10 +6669,13 @@ static bool kicadSimStop()
 
     live->stopRequested = true;
 
-    pcbjam_collab::runOnCoroutine( fr, []() {
+    const long long run = live->run;
+
+    pcbjam_collab::runOnCoroutine( fr, [run]() {
         SCH_EDIT_FRAME* frame = schFrame();
 
-        if( !frame || !simLive() || simLive()->finishQueued )
+        // Keyed by the run's number: a Stop of run N never halts or finishes run N+1.
+        if( !frame || !simLive() || simLive()->run != run || simLive()->finishQueued )
             return;
 
         std::shared_ptr<SPICE_SIMULATOR> engine = simEngine( frame );
@@ -6510,7 +6686,7 @@ static bool kicadSimStop()
         if( !engine || !engine->Stop() )
         {
             simLive()->finishQueued = true;
-            finishSimRun();
+            finishSimRun( run );
         }
     } );
 
