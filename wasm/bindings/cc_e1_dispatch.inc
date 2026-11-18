@@ -53,6 +53,16 @@ int promptPick( int aToken, std::string aKind )
 {
     return CcHostPromptPick( aToken, aKind );
 }
+
+// ---- st-hold-e: K-HOLD (kicad ACTION_MENU::OnMenuEvent, ACTION_TOOLBAR, the language range) ----
+
+// A marker: this engine's menu bar, context menu, toolbar and palette presses ask the page as its
+// keys do (run 12's window.kicadHostAction.onRequest), and the Set Language items ask with the
+// name cc.Control.setLanguage. The island lists its cap heldMenus on it.
+bool heldMenus()
+{
+    return true;
+}
 } // namespace cc_e1
 
 EMSCRIPTEN_BINDINGS( cc_e1_dispatch )
@@ -61,4 +71,5 @@ EMSCRIPTEN_BINDINGS( cc_e1_dispatch )
     emscripten::function( "kicadPromptAnswer", &cc_e1::promptAnswer );
     emscripten::function( "kicadPromptCancel", &cc_e1::promptCancel );
     emscripten::function( "kicadPromptPick", &cc_e1::promptPick );
+    emscripten::function( "kicadHeldMenus", &cc_e1::heldMenus );
 }

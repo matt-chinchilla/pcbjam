@@ -59,3 +59,31 @@ What the build train must probe:
 - `{"values":{"value":"x"}}`: `{"accepted":false,"field":"value","message":""}` and the prompt stays parked (a following good answer is accepted).
 - Routing a track, `pcbnew.InteractiveRouter.SelLayerAndPlaceVia` (`<`): ask `layer`, `record.layers` copper only (the not allowed mask applied), every `canonical` like `F.Cu`; answer `{"layer":"B.Cu"}` places the via on B.Cu; `{"layer":"F.SilkS"}` refuses with field `layer`.
 - No listener (`delete window.kicadHostPrompt`): KiCad's dialog shows as before (plain behavior unchanged).
+
+## st-hold-e: K-HOLD, menus, toolbars and the language list ask as keys do
+
+Export (pcbjam `cc_e1_dispatch.inc`, block `cc_e1_dispatch`, not merged only): `kicadHeldMenus() -> bool` marker, true (the island's cap `heldMenus`).
+
+Host asks, all through run 12's `hostHoldsAction( std::string )` (`window.kicadHostAction.onRequest`, unchanged), kicad commit 290cfa8c:
+
+- `common/tool/action_menu.cpp` `ACTION_MENU::OnMenuEvent`: just before `toolMgr->ProcessEvent( *evt )`, for a `wxEVT_COMMAND_MENU_SELECTED` whose id is an action UI id, the pressed `TOOL_ACTION` is found in this menu and its submenus (the same walk as `findToolAction`) and asked by name; held: the press is dropped (return). Menu bar, submenus and KiCad's own context menus alike (a context menu still opens: no change to `DispatchContextMenu` in this unit).
+- `common/tool/action_toolbar.cpp` `ACTION_TOOLBAR::onToolEvent`: the cycling group press (asks for the NEXT action; held: handled, the group keeps its action) and the plain action press (held: handled, nothing dispatched); `onPaletteEvent`: held hides the palette, nothing dispatched. The cancel press (`CancelTool`) is not an action and is not asked.
+- `common/eda_base_frame.cpp` `EDA_BASE_FRAME::OnLanguageSelectionEvent`: asks `cc.Control.setLanguage` (a name of ours); held: nothing changes.
+
+Syntax check: `/home/matthew/cc-wave2/bin/gate.sh scripts/kicad/syntax-check-run15.sh --kicad /home/matthew/cc-engine-wt/e1/kicad kicad_editor --kicad-file common/tool/action_menu.cpp --kicad-file common/tool/action_toolbar.cpp --kicad-file common/eda_base_frame.cpp`
+
+```
+PASS kicad_editor   kicad_editor_embind.cpp subdir=common  (8648 ms)
+PASS kicad common/tool/action_menu.cpp (6547 ms)
+PASS kicad common/tool/action_toolbar.cpp (5616 ms)
+PASS kicad common/eda_base_frame.cpp (7930 ms)
+syntax-check: 0 failed
+```
+
+What the build train must probe:
+
+- `Module.kicadHeldMenus()` true.
+- With `window.kicadHostAction = { onRequest: t => { const a = JSON.parse(t).action; console.log('held?', a); return a === 'pcbnew.DRCTool.runDRC'; } }` in the Board frame with KiCad's menus shown: Inspect > Design Rules Checker from the menu bar logs `held? pcbnew.DRCTool.runDRC` and NO DRC dialog opens; the DRC toolbar button the same. Wrong: the dialog opens (the hook missed the path), or an unheld item (View > Zoom to Fit) stops working (the hold dropped every press).
+- A listener returning true for `cc.Control.setLanguage`: Preferences > Set Language > Deutsch leaves the menus English; no listener: the language changes as before.
+- A right click still shows KiCad's context menu; choosing an item the listener holds (`pcbnew.InteractiveEdit.properties`) logs it and runs nothing; another item runs.
+- A cycling toolbar group (the units toggle): held, the units stay; not held, they cycle as before.
