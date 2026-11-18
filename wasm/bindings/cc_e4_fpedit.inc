@@ -11,7 +11,9 @@
 //
 // fp-e2 (FP spec 5.1, 7.1): kicadFpEditOpen, kicadFpEditState and kicadFpEditTake (the gate
 // code of build G), then kicadFpEditNew, kicadFpEditMarkSaved, kicadFpEditSelection and
-// kicadFpEditSelect.
+// kicadFpEditSelect. fp-e-items (FP spec 7.2): the item kind table and the four item exports.
+// fp-e3: the pad kind (cc_item_pad.h), kicadFpEditPadDefaultsGet, kicadFpEditPadDefaultsSet
+// and kicadFpEditEnumerate.
 
 #include <map>
 #include <set>
@@ -35,6 +37,10 @@
 #include <tools/pcb_selection_tool.h>
 #include <tool/actions.h>
 #include <view/view_controls.h>
+#include <dialogs/dialog_enum_pads.h>
+#include <netinfo.h>
+
+#include "cc_item_pad.h"
 
 namespace cc_e4
 {
@@ -1109,6 +1115,129 @@ bool kicadFpEditItemsRemove( std::string aArgsJson )
             } );
 }
 
+
+// ── fp-e3: the pad kind, the master pad, the numbering loop ──────────────────────────
+
+/** The pad row of the item kind table (registered once, here in the fpedit TU). */
+const bool kPadKindRegistered =
+        ( cc_fpitems::ccRegisterItemKind( { "pad", &padkind::kindGet, &padkind::kindSet,
+                                             &padkind::kindAdd } ),
+          true );
+
+// fpedit.padDefaults.get: the master pad KiCad gives every new pad (BOARD_DESIGN_SETTINGS::
+// m_Pad_Master, what DefaultPadProperties edits), as a pad record with no kind and no uuid,
+// positions from 0, 0. "" with no ready frame.
+std::string kicadFpEditPadDefaultsGet()
+{
+    using namespace cc_fpedit;
+
+    FOOTPRINT_EDIT_FRAME* fr = readyFrame();
+
+    if( !fr || !fr->GetBoard() )
+        return "";
+
+    const PAD* master = fr->GetDesignSettings().m_Pad_Master.get();
+
+    if( !master )
+        return "";
+
+    return dumpJson( padkind::padJson( master, VECTOR2I( 0, 0 ) ) );
+}
+
+// fpedit.padDefaults.set: {set: <pad keys>}, that key only; the patch onto the master pad by
+// the pad dialog's rules (checked on a copy first, refused where the dialog refuses). Not an
+// undo step and not a modification of the footprint (KiCad's Default Pad Properties is
+// neither); the next pad the pad tool places takes it. A number given becomes the pad tool's
+// last number, as the dialog does.
+bool kicadFpEditPadDefaultsSet( std::string aArgsJson )
+{
+    using namespace cc_fpedit;
+
+    FOOTPRINT_EDIT_FRAME* fr = readyFrame();
+
+    if( !fr || !fr->GetBoard() )
+        return false;
+
+    PAD* master = fr->GetDesignSettings().m_Pad_Master.get();
+
+    if( !master )
+        return false;
+
+    json args = json::parse( aArgsJson, nullptr, /*allow_exceptions*/ false );
+
+    if( args.is_discarded() || !onlyKeys( args, { "set" } ) || !args.contains( "set" )
+            || !args["set"].is_object() || args["set"].empty() )
+    {
+        return false;
+    }
+
+    padkind::PAD_PATCH patch;
+
+    if( !padkind::readPatch( args["set"], patch )
+            || !padkind::patchTakes( master, patch, VECTOR2I( 0, 0 ) ) )
+    {
+        return false;
+    }
+
+    if( !padkind::applyPatch( master, patch, VECTOR2I( 0, 0 ) ) )
+        return false;
+
+    // The master pad is a pattern: no net (TransferDataFromWindow).
+    master->SetNetCode( NETINFO_LIST::UNCONNECTED );
+
+    if( patch.number && fr->GetToolManager() )
+    {
+        if( PAD_TOOL* padTool = fr->GetToolManager()->GetTool<PAD_TOOL>() )
+            padTool->SetLastPadNumber( master->GetNumber() );
+    }
+
+    return true;
+}
+
+// fpedit.enumerate: {start: 0..999, step: 0..999, prefix: string[0..64]}, those three keys
+// exactly (the dialog's spin ranges and its prefix box); starts KiCad's own click in order
+// numbering loop with them through PAD_TOOL::enumerateLoop (fp-e1b's split of EnumeratePads):
+// no dialog, the reader clicks or drags across pads, Esc ends it, KiCad commits it as ONE undo
+// step "Renumber Pads". False when the loop did not start (no pads, pad edit mode) or for any
+// other shape.
+bool kicadFpEditEnumerate( std::string aArgsJson )
+{
+    using namespace cc_fpedit;
+
+    FOOTPRINT_EDIT_FRAME* fr = readyFrame();
+    FOOTPRINT*            footprint = currentFootprint( fr );
+
+    if( !footprint || !fr->GetToolManager() )
+        return false;
+
+    json args = json::parse( aArgsJson, nullptr, /*allow_exceptions*/ false );
+
+    if( args.is_discarded() || !onlyKeys( args, { "start", "step", "prefix" } )
+            || !hasKeys( args, { "start", "step", "prefix" } ) )
+    {
+        return false;
+    }
+
+    std::optional<int>      start = intOf( args["start"], 0, 999 );
+    std::optional<int>      step = intOf( args["step"], 0, 999 );
+    std::optional<wxString> prefix = textOf( args["prefix"], 0, 64 );
+
+    if( !start || !step || !prefix )
+        return false;
+
+    PAD_TOOL* padTool = fr->GetToolManager()->GetTool<PAD_TOOL>();
+
+    if( !padTool )
+        return false;
+
+    SEQUENTIAL_PAD_ENUMERATION_PARAMS params;
+    params.m_start_number = *start;
+    params.m_step = *step;
+    params.m_prefix = *prefix;   // the dialog always sets it, empty included
+
+    return padTool->enumerateLoop( params ) == 1;
+}
+
 } // namespace cc_e4
 
 EMSCRIPTEN_BINDINGS( cc_e4_fpedit )
@@ -1124,4 +1253,7 @@ EMSCRIPTEN_BINDINGS( cc_e4_fpedit )
     function( "kicadFpEditItemsSet", &cc_e4::kicadFpEditItemsSet );
     function( "kicadFpEditItemsAdd", &cc_e4::kicadFpEditItemsAdd );
     function( "kicadFpEditItemsRemove", &cc_e4::kicadFpEditItemsRemove );
+    function( "kicadFpEditPadDefaultsGet", &cc_e4::kicadFpEditPadDefaultsGet );
+    function( "kicadFpEditPadDefaultsSet", &cc_e4::kicadFpEditPadDefaultsSet );
+    function( "kicadFpEditEnumerate", &cc_e4::kicadFpEditEnumerate );
 }
