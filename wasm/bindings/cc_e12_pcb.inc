@@ -14,6 +14,9 @@
 #include <pcbnew_settings.h>
 #include <router/pns_routing_settings.h>
 #include <settings/common_settings.h>
+#include <settings/settings_manager.h>
+#include <wildcards_and_files_ext.h>
+#include <pcb_io/pcb_io_mgr.h>
 #include <pcb_painter.h>
 #include <pcb_plot_params.h>
 #include <pcb_view.h>
@@ -876,6 +879,9 @@ CC_PCB_JSON_SECTION zoneDefaultsSection( BOARD* aBoard )
 
 json zoneDefaultsRead( BOARD* aBoard, PROJECT* aProject )
 {
+    if( !aBoard )
+        return json();
+
     return ccPcbJsonGet( zoneDefaultsSection( aBoard ) );
 }
 
@@ -907,6 +913,9 @@ bool zoneDefaultsSet( PCB_EDIT_FRAME* aFrame, const json& aValue, bool aDryRun, 
 
 json zoneHatchOffsetsRead( BOARD* aBoard, PROJECT* aProject )
 {
+    if( !aBoard )
+        return json();
+
     BOARD_DESIGN_SETTINGS& bds = aBoard->GetDesignSettings();
     json                   layers = json::array();
 
@@ -1010,6 +1019,9 @@ bool zoneHatchOffsetsSet( PCB_EDIT_FRAME* aFrame, const json& aValue, bool aDryR
 
 json boardFormattingRead( BOARD* aBoard, PROJECT* aProject )
 {
+    if( !aBoard )
+        return json();
+
     BOARD_DESIGN_SETTINGS& bds = aBoard->GetDesignSettings();
     const PCB_PLOT_PARAMS& plot = aBoard->GetPlotOptions();
     json                   out = json::object();
@@ -1110,6 +1122,9 @@ CC_PCB_JSON_SECTION tuningPatternsSection( BOARD* aBoard )
 
 json tuningPatternsRead( BOARD* aBoard, PROJECT* aProject )
 {
+    if( !aBoard )
+        return json();
+
     return ccPcbJsonGet( tuningPatternsSection( aBoard ) );
 }
 
@@ -1355,6 +1370,227 @@ bool tuningProfilesSet( PCB_EDIT_FRAME* aFrame, const json& aValue, bool aDryRun
 
     return jsonSectionSet( *section, aValue, aDryRun );
 }
+
+// ── kicadSettingsRead, the board half (m8-e, 6.2): Board Setup's Import Settings without its
+// dialog. The other project is loaded by the frame's SETTINGS_MANAGER (LoadProject, not made
+// active) and its board by the KiCad plugin of PCB_IO_MGR, the board given the project as
+// onAuxiliaryAction does; each asked section is read by ccPcbSettingsRead, the same bodies
+// kicadSettingsGet answers with, over that board and project (customRules from the rules file
+// beside the other board); then the board leaves the project, the project is unloaded without a
+// save and the board deleted. Nothing of the open design changes and no undo step is made.
+
+namespace read
+{
+/** kicadSettingsRead's arguments, read whole: {run, dir: "/tmp/cc-settings-read/<n>",
+ *  project: "<name>.kicad_pro", board?: "<name>.kicad_pcb", sections: [1 to 64 names]}, the
+ *  files already in dir (plain names, no path). */
+struct READ_ARGS
+{
+    std::string              dir;
+    std::string              project;
+    std::string              board;
+    std::vector<std::string> sections;
+};
+
+bool plainFileName( const std::string& aName, const std::string& aExt )
+{
+    return aName.size() > aExt.size() && aName.size() <= 255
+           && aName.compare( aName.size() - aExt.size(), aExt.size(), aExt ) == 0
+           && aName.find_first_of( std::string( "/\\:\0", 4 ) ) == std::string::npos && aName[0] != '.';
+}
+
+std::optional<READ_ARGS> readArgs( const std::string& aArgsJson )
+{
+    json args = json::parse( aArgsJson, nullptr, /*allow_exceptions*/ false );
+
+    if( args.is_discarded() || !args.is_object() || args.size() < 4 || args.size() > 5 )
+        return std::nullopt;
+
+    for( const auto& [key, v] : args.items() )
+    {
+        if( key != "run" && key != "dir" && key != "project" && key != "board" && key != "sections" )
+            return std::nullopt;
+    }
+
+    if( !args.contains( "run" ) || !args["run"].is_number_integer() || args["run"].get<long long>() < 0
+            || !args.contains( "dir" ) || !args["dir"].is_string() || !args.contains( "project" )
+            || !args["project"].is_string() || !args.contains( "sections" ) || !args["sections"].is_array()
+            || args["sections"].empty() || args["sections"].size() > 64
+            || ( args.contains( "board" ) && !args["board"].is_string() ) )
+    {
+        return std::nullopt;
+    }
+
+    READ_ARGS a;
+    a.dir = args["dir"].get<std::string>();
+    a.project = args["project"].get<std::string>();
+    a.board = args.contains( "board" ) ? args["board"].get<std::string>() : std::string();
+
+    if( !cc_output::IsRunDir( a.dir, "/tmp/cc-settings-read/" ) || !plainFileName( a.project, ".kicad_pro" )
+            || ( args.contains( "board" ) && !plainFileName( a.board, ".kicad_pcb" ) )
+            || !wxFileName::FileExists( wxString::FromUTF8( a.dir + "/" + a.project ) )
+            || ( !a.board.empty() && !wxFileName::FileExists( wxString::FromUTF8( a.dir + "/" + a.board ) ) ) )
+    {
+        return std::nullopt;
+    }
+
+    std::set<std::string> seen;
+
+    for( const json& name : args["sections"] )
+    {
+        if( !name.is_string() || name.get<std::string>().empty() || name.get<std::string>().size() > 64
+                || !seen.insert( name.get<std::string>() ).second )
+        {
+            return std::nullopt;
+        }
+
+        a.sections.push_back( name.get<std::string>() );
+    }
+
+    return a;
+}
+
+/** KiCad's message, first line, the run folder taken out of it (the page shows it). */
+std::string readProblem( const wxString& aText, const std::string& aDir )
+{
+    std::string text = std::string( aText.utf8_str() );
+    text = text.substr( 0, text.find( '\n' ) );
+
+    for( size_t at = text.find( aDir + "/" ); at != std::string::npos; at = text.find( aDir + "/" ) )
+        text.erase( at, aDir.size() + 1 );
+
+    for( size_t at = text.find( aDir ); at != std::string::npos; at = text.find( aDir ) )
+        text.erase( at, aDir.size() );
+
+    return text.size() > 512 ? text.substr( 0, 512 ) : text;
+}
+
+/** settings-read.json {sections, missing}, then .cc-settings-read.json {error, message} last. */
+void writeReadRecord( const std::string& aDir, const json& aSections, const json& aMissing, const std::string& aError,
+                      const std::string& aMessage )
+{
+    json record = json::object();
+    record["sections"] = aSections;
+    record["missing"] = aMissing;
+    cc_output::WriteRecord( aDir, "settings-read.json", record );
+
+    json done = json::object();
+    done["error"] = aError;
+    done["message"] = aMessage;
+    cc_output::WriteRecord( aDir, ".cc-settings-read.json", done );
+}
+
+void runPcb( const READ_ARGS& aArgs )
+{
+    json        sections = json::object();
+    json        missing = json::array();
+    std::string error;
+    std::string message;
+
+    PCB_EDIT_FRAME* frame = pcbFrame();
+
+    if( !frame || !frame->GetBoard() )
+    {
+        writeReadRecord( aArgs.dir, sections, missing, "island_error", "no board editor" );
+        return;
+    }
+
+    wxLogNull         noLog;
+    SETTINGS_MANAGER* manager = frame->GetSettingsManager();
+    const wxString    projectPath = wxString::FromUTF8( aArgs.dir + "/" + aArgs.project );
+    const wxString    boardPath = wxString::FromUTF8( aArgs.dir + "/" + aArgs.board );
+    const bool        loadedBefore = manager->GetProject( projectPath ) != nullptr;
+
+    if( !loadedBefore && !manager->LoadProject( projectPath, false ) )
+    {
+        error = "unreadable";
+        message = "KiCad could not load the project file.";
+    }
+    else if( PROJECT* other = manager->GetProject( projectPath ) )
+    {
+        BOARD* otherBoard = nullptr;
+
+        if( !aArgs.board.empty() )
+        {
+            try
+            {
+                IO_RELEASER<PCB_IO> pi( PCB_IO_MGR::FindPlugin( PCB_IO_MGR::KICAD_SEXP ) );
+                otherBoard = pi->LoadBoard( boardPath, nullptr );
+            }
+            catch( const IO_ERROR& ioe )
+            {
+                error = "unreadable";
+                message = readProblem( ioe.Problem(), aArgs.dir );
+            }
+            catch( ... )
+            {
+                error = "unreadable";
+                message = "KiCad could not load the board file.";
+            }
+
+            if( error.empty() && !otherBoard )
+            {
+                error = "unreadable";
+                message = "KiCad could not load the board file.";
+            }
+        }
+
+        if( error.empty() )
+        {
+            if( otherBoard )
+                otherBoard->SetProject( other );
+
+            wxFileName rulesFile( boardPath );
+            rulesFile.SetExt( FILEEXT::DesignRulesFileExtension );
+            const wxString rulesPath = otherBoard ? rulesFile.GetFullPath() : wxString();
+            const std::set<std::string> known = ccPcbSections();
+
+            for( const std::string& name : aArgs.sections )
+            {
+                json value;
+
+                if( known.count( name ) && ( name != "customRules" || wxFileName::FileExists( rulesPath ) ) )
+                {
+                    try
+                    {
+                        value = ccPcbSettingsRead( otherBoard, other, rulesPath, name );
+                    }
+                    catch( ... )
+                    {
+                        value = json();
+                    }
+                }
+
+                if( value.is_null() )
+                    missing.push_back( name );
+                else
+                    sections[name] = std::move( value );
+            }
+
+            if( otherBoard && other != &frame->Prj() )
+                otherBoard->ClearProject();
+        }
+
+        delete otherBoard;
+
+        if( !loadedBefore && other != &frame->Prj() )
+            manager->UnloadProject( other, false );
+    }
+    else
+    {
+        error = "unreadable";
+        message = "KiCad could not load the project file.";
+    }
+
+    if( !error.empty() )
+    {
+        sections = json::object();
+        missing = json::array();
+    }
+
+    writeReadRecord( aArgs.dir, sections, missing, error, message );
+}
+} // namespace read
 } // namespace pcb
 
 const bool kRouter = ccRegisterPcbSection( { "router", "pcb", &pcb::routerGet, &pcb::routerSet } );
@@ -1366,17 +1602,49 @@ const bool kMouse = ccRegisterPcbSection( { "mouse", "pcb", &pcb::mouseGet, &pcb
 const bool kStackupLayers = ccRegisterPcbSection( { "stackupLayers", "pcb", &pcb::stackupLayersGet,
                                                     &pcb::stackupLayersSet } );
 const bool kZoneDefaults = ccRegisterPcbSection( { "zoneDefaults", "pcb", &pcb::zoneDefaultsGet,
-                                                   &pcb::zoneDefaultsSet } );
+                                                   &pcb::zoneDefaultsSet,
+                                                 true, &pcb::zoneDefaultsRead } );
 const bool kZoneHatchOffsets = ccRegisterPcbSection( { "zoneHatchOffsets", "pcb", &pcb::zoneHatchOffsetsGet,
-                                                       &pcb::zoneHatchOffsetsSet } );
+                                                       &pcb::zoneHatchOffsetsSet,
+                                                 true, &pcb::zoneHatchOffsetsRead } );
 const bool kBoardFormatting = ccRegisterPcbSection( { "boardFormatting", "pcb", &pcb::boardFormattingGet,
-                                                      &pcb::boardFormattingSet } );
+                                                      &pcb::boardFormattingSet,
+                                                 true, &pcb::boardFormattingRead } );
 const bool kTuningPatterns = ccRegisterPcbSection( { "tuningPatterns", "pcb", &pcb::tuningPatternsGet,
-                                                     &pcb::tuningPatternsSet } );
+                                                     &pcb::tuningPatternsSet,
+                                                 true, &pcb::tuningPatternsRead } );
 const bool kComponentClasses = ccRegisterPcbSection( { "componentClasses", "pcb", &pcb::componentClassesGet,
-                                                       &pcb::componentClassesSet } );
+                                                       &pcb::componentClassesSet,
+                                                 true, &pcb::componentClassesRead } );
 const bool kTuningProfiles = ccRegisterPcbSection( { "tuningProfiles", "pcb", &pcb::tuningProfilesGet,
-                                                     &pcb::tuningProfilesSet } );
+                                                     &pcb::tuningProfilesSet,
+                                                 true, &pcb::tuningProfilesRead } );
+
+// The board half of kicadSettingsRead (registered in cc_e12_dispatch.inc, which picks it on
+// pcbEditorActive()): the arguments read whole, then the read queued on the apply coroutine.
+// false for any other shape, no frame or an open in flight.
+bool settingsReadPcb( std::string aArgsJson )
+{
+    PCB_EDIT_FRAME* fr = pcbFrame();
+
+    if( !fr || !fr->GetBoard() || pcbjam_open::busy() )
+        return false;
+
+    try
+    {
+        std::optional<pcb::read::READ_ARGS> args = pcb::read::readArgs( aArgsJson );
+
+        if( !args )
+            return false;
+
+        pcbjam_collab::runOnCoroutine( fr, [a = *args]() { pcb::read::runPcb( a ); } );
+        return true;
+    }
+    catch( ... )
+    {
+        return false;
+    }
+}
 
 #ifdef KICAD_MERGED_EMBIND
 // ── kicadTuningSolve (m7-e, 5.3; merged image only): KiCad's Tuning Profiles panel's "work out"

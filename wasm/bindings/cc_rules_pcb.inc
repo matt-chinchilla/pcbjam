@@ -2520,14 +2520,19 @@ bool ccPcbJsonSet( const CC_PCB_JSON_SECTION& aSection, const json& aPatch )
     return true;
 }
 
-std::optional<CC_PCB_JSON_SECTION> ccPcbJsonSection( PCB_EDIT_FRAME* aFrame, const std::string& aName )
+/** Engine run 15 (m8-e): a project file section of aBoard and aProject (the open design's, or
+ *  another design loaded beside it); nullopt for another name or a missing board or project. */
+std::optional<CC_PCB_JSON_SECTION> ccPcbJsonSection( BOARD* aBoard, PROJECT* aProject, const std::string& aName )
 {
+    if( !aProject )
+        return std::nullopt;
+
     CC_PCB_JSON_SECTION    section;
-    BOARD_DESIGN_SETTINGS& bds = aFrame->GetBoard()->GetDesignSettings();
+    BOARD_DESIGN_SETTINGS* bds = aBoard ? &aBoard->GetDesignSettings() : nullptr;
 
     if( aName == "netClasses" )
     {
-        std::shared_ptr<NET_SETTINGS>& net = aFrame->Prj().GetProjectFile().NetSettings();
+        std::shared_ptr<NET_SETTINGS>& net = aProject->GetProjectFile().NetSettings();
 
         if( !net )
             return std::nullopt;
@@ -2540,30 +2545,45 @@ std::optional<CC_PCB_JSON_SECTION> ccPcbJsonSection( PCB_EDIT_FRAME* aFrame, con
     }
     else if( aName == "textDefaults" )
     {
-        section.settings = &bds;
+        if( !bds )
+            return std::nullopt;
+
+        section.settings = bds;
         section.keys = { { "defaults", "/defaults" } };
     }
     else if( aName == "constraints" )
     {
-        section.settings = &bds;
+        if( !bds )
+            return std::nullopt;
+
+        section.settings = bds;
         section.keys = { { "rules", "/rules" } };
     }
     else if( aName == "predefinedSizes" )
     {
-        section.settings = &bds;
+        if( !bds )
+            return std::nullopt;
+
+        section.settings = bds;
         section.keys = { { "track_widths", "/track_widths" },
                          { "via_dimensions", "/via_dimensions" },
                          { "diff_pair_dimensions", "/diff_pair_dimensions" } };
     }
     else if( aName == "teardrops" )
     {
-        section.settings = &bds;
+        if( !bds )
+            return std::nullopt;
+
+        section.settings = bds;
         section.keys = { { "teardrop_options", "/teardrop_options" },
                          { "teardrop_parameters", "/teardrop_parameters" } };
     }
     else if( aName == "checkSeverities" )
     {
-        section.settings = &bds;
+        if( !bds )
+            return std::nullopt;
+
+        section.settings = bds;
         section.keys = { { "rule_severities", "/rule_severities" } };
     }
     else
@@ -2572,6 +2592,11 @@ std::optional<CC_PCB_JSON_SECTION> ccPcbJsonSection( PCB_EDIT_FRAME* aFrame, con
     }
 
     return section;
+}
+
+std::optional<CC_PCB_JSON_SECTION> ccPcbJsonSection( PCB_EDIT_FRAME* aFrame, const std::string& aName )
+{
+    return ccPcbJsonSection( aFrame->GetBoard(), &aFrame->Prj(), aName );
 }
 
 const char* ccStackupKind( BOARD_STACKUP_ITEM_TYPE aType )
@@ -2648,6 +2673,12 @@ struct CC_PCB_SECTION
     // (ccPcbSettingsChanged, the tool reset among them). false only for a section that holds
     // no board state (an editor preference), so the board is not marked modified.
     bool setupOk = true;
+
+    // Engine run 15 (m8-e, widened at the end so every registration above keeps its meaning):
+    // the section read from a given board and project (another design loaded beside the open
+    // one, kicadSettingsRead), null when that design does not hold it. Left empty, the section
+    // never travels (kicadSettingsRead lists it in missing).
+    std::function<json( BOARD* aBoard, PROJECT* aProject )> read = nullptr;
 };
 
 /** Run 14's sections, answered by the chains of ccPcbSettingsGet and ccRunPcbSettingsSet. */
@@ -2702,44 +2733,41 @@ bool ccRegisterPcbSection( CC_PCB_SECTION aSection )
     return true;
 }
 
-json ccPcbSettingsGet( PCB_EDIT_FRAME* aFrame, const std::string& aSection )
+/**
+ * Engine run 15 (m8-e): the sections Import Settings carries, read from aBoard and aProject
+ * (the open design's, or another design loaded beside it) with the bodies the frame's get
+ * uses; aRulesPath is the design's rules file (customRules answers {text: ""} when it is
+ * missing, as the get always has). Then a registered section's reader. Null for a section
+ * that never travels (variants, page, a registered section with no reader), a missing project,
+ * or a board section with no board (a registered reader is then given a null board).
+ */
+json ccPcbSettingsRead( BOARD* aBoard, PROJECT* aProject, const wxString& aRulesPath, const std::string& aSection )
 {
-    BOARD*                 board = aFrame->GetBoard();
-    BOARD_DESIGN_SETTINGS& bds = board->GetDesignSettings();
+    if( !aProject )
+        return json();
 
-    if( std::optional<CC_PCB_JSON_SECTION> section = ccPcbJsonSection( aFrame, aSection ) )
+    if( std::optional<CC_PCB_JSON_SECTION> section = ccPcbJsonSection( aBoard, aProject, aSection ) )
         return ccPcbJsonGet( *section );
 
     if( aSection == "textVariables" )
     {
         json out = json::object();
 
-        for( const auto& [name, text] : aFrame->Prj().GetTextVars() )
+        for( const auto& [name, text] : aProject->GetTextVars() )
             out[toUtf8( name )] = ccText( text );
 
         return out;
     }
 
-    if( aSection == "variants" )
+    if( !aBoard )
     {
-        json names = json::array();
-
-        for( const wxString& name : board->GetVariantNames() )
-        {
-            json entry = json::object();
-            entry["name"] = ccText( name, 128 );
-            entry["description"] = ccText( board->GetVariantDescription( name ) );
-            names.push_back( std::move( entry ) );
-        }
-
-        json out = json::object();
-        out["names"] = std::move( names );
-        out["current"] = ccText( board->GetCurrentVariant(), 128 );
-        return out;
+        // A project read with no board: only the project's own registered sections.
+        const CC_PCB_SECTION* registered = ccPcbRegisteredSection( aSection );
+        return registered && registered->read ? registered->read( nullptr, aProject ) : json();
     }
 
-    if( aSection == "page" )
-        return ccPcbPageJson( aFrame );
+    BOARD*                 board = aBoard;
+    BOARD_DESIGN_SETTINGS& bds = board->GetDesignSettings();
 
     if( aSection == "layers" )
     {
@@ -2818,7 +2846,7 @@ json ccPcbSettingsGet( PCB_EDIT_FRAME* aFrame, const std::string& aSection )
     if( aSection == "customRules" )
     {
         json     out = json::object();
-        wxString path = aFrame->GetDesignRulesPath();
+        wxString path = aRulesPath;
         std::string text;
 
         if( !path.IsEmpty() && wxFileName::FileExists( path ) )
@@ -2841,6 +2869,40 @@ json ccPcbSettingsGet( PCB_EDIT_FRAME* aFrame, const std::string& aSection )
         out["text"] = text;
         return out;
     }
+
+    if( const CC_PCB_SECTION* registered = ccPcbRegisteredSection( aSection ) )
+        return registered->read ? registered->read( aBoard, aProject ) : json();
+
+    return json();
+}
+
+json ccPcbSettingsGet( PCB_EDIT_FRAME* aFrame, const std::string& aSection )
+{
+    BOARD* board = aFrame->GetBoard();
+
+    if( aSection == "variants" )
+    {
+        json names = json::array();
+
+        for( const wxString& name : board->GetVariantNames() )
+        {
+            json entry = json::object();
+            entry["name"] = ccText( name, 128 );
+            entry["description"] = ccText( board->GetVariantDescription( name ) );
+            names.push_back( std::move( entry ) );
+        }
+
+        json out = json::object();
+        out["names"] = std::move( names );
+        out["current"] = ccText( board->GetCurrentVariant(), 128 );
+        return out;
+    }
+
+    if( aSection == "page" )
+        return ccPcbPageJson( aFrame );
+
+    if( ccPcbBuiltinSections().count( aSection ) )
+        return ccPcbSettingsRead( board, &aFrame->Prj(), aFrame->GetDesignRulesPath(), aSection );
 
     if( const CC_PCB_SECTION* registered = ccPcbRegisteredSection( aSection ) )
         return registered->get( aFrame );

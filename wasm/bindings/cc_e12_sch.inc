@@ -10,7 +10,9 @@
 // translation unit holds every lane's face) and every name registers in the block below,
 // never in a shared block. The rules: BUILD-NOTES-run15.md.
 
+#include <erc/erc_settings.h>
 #include <settings/common_settings.h>
+#include <settings/settings_manager.h>
 #include <project/component_class_settings.h>
 #include <project/project_file.h>
 #include <schematic_settings.h>
@@ -373,15 +375,247 @@ bool componentClassesSet( SCH_EDIT_FRAME* aFrame, const json& aValue, bool aDryR
     aMessage = "component classes are set in the board editor";
     return false;
 }
+
+// ── kicadSettingsRead, the schematic half (m8-e, 6.2): Schematic Setup's Import Settings
+// without its dialog. The other project is loaded by the frame's SETTINGS_MANAGER (LoadProject,
+// not made active); its ERC and schematic settings are made and read from its project file
+// exactly as SCHEMATIC::SetProject makes them (onAuxiliaryAction builds a whole SCHEMATIC for
+// this, whose destructor clears SCHEMATIC::m_IsSchematicExists and the SCH_FIELD listeners of
+// the open schematic too; the settings alone are what the sections read); each asked section is
+// read by ccSchSettingsRead, the same bodies kicadSettingsGet answers with; then the settings
+// made here are deleted and the project unloaded without a save. Nothing of the open design
+// changes and no undo step is made.
+
+namespace read
+{
+/** kicadSettingsRead's arguments, read whole: {run, dir: "/tmp/cc-settings-read/<n>",
+ *  project: "<name>.kicad_pro", board?: "<name>.kicad_pcb", sections: [1 to 64 names]}, the
+ *  files already in dir (plain names, no path). */
+struct READ_ARGS
+{
+    std::string              dir;
+    std::string              project;
+    std::string              board;
+    std::vector<std::string> sections;
+};
+
+bool plainFileName( const std::string& aName, const std::string& aExt )
+{
+    return aName.size() > aExt.size() && aName.size() <= 255
+           && aName.compare( aName.size() - aExt.size(), aExt.size(), aExt ) == 0
+           && aName.find_first_of( std::string( "/\\:\0", 4 ) ) == std::string::npos && aName[0] != '.';
+}
+
+std::optional<READ_ARGS> readArgs( const std::string& aArgsJson )
+{
+    json args = json::parse( aArgsJson, nullptr, /*allow_exceptions*/ false );
+
+    if( args.is_discarded() || !args.is_object() || args.size() < 4 || args.size() > 5 )
+        return std::nullopt;
+
+    for( const auto& [key, v] : args.items() )
+    {
+        if( key != "run" && key != "dir" && key != "project" && key != "board" && key != "sections" )
+            return std::nullopt;
+    }
+
+    if( !args.contains( "run" ) || !args["run"].is_number_integer() || args["run"].get<long long>() < 0
+            || !args.contains( "dir" ) || !args["dir"].is_string() || !args.contains( "project" )
+            || !args["project"].is_string() || !args.contains( "sections" ) || !args["sections"].is_array()
+            || args["sections"].empty() || args["sections"].size() > 64
+            || ( args.contains( "board" ) && !args["board"].is_string() ) )
+    {
+        return std::nullopt;
+    }
+
+    READ_ARGS a;
+    a.dir = args["dir"].get<std::string>();
+    a.project = args["project"].get<std::string>();
+    a.board = args.contains( "board" ) ? args["board"].get<std::string>() : std::string();
+
+    if( !cc_output::IsRunDir( a.dir, "/tmp/cc-settings-read/" ) || !plainFileName( a.project, ".kicad_pro" )
+            || ( args.contains( "board" ) && !plainFileName( a.board, ".kicad_pcb" ) )
+            || !wxFileName::FileExists( wxString::FromUTF8( a.dir + "/" + a.project ) )
+            || ( !a.board.empty() && !wxFileName::FileExists( wxString::FromUTF8( a.dir + "/" + a.board ) ) ) )
+    {
+        return std::nullopt;
+    }
+
+    std::set<std::string> seen;
+
+    for( const json& name : args["sections"] )
+    {
+        if( !name.is_string() || name.get<std::string>().empty() || name.get<std::string>().size() > 64
+                || !seen.insert( name.get<std::string>() ).second )
+        {
+            return std::nullopt;
+        }
+
+        a.sections.push_back( name.get<std::string>() );
+    }
+
+    return a;
+}
+
+/** KiCad's message, first line, the run folder taken out of it (the page shows it). */
+std::string readProblem( const wxString& aText, const std::string& aDir )
+{
+    std::string text = std::string( aText.utf8_str() );
+    text = text.substr( 0, text.find( '\n' ) );
+
+    for( size_t at = text.find( aDir + "/" ); at != std::string::npos; at = text.find( aDir + "/" ) )
+        text.erase( at, aDir.size() + 1 );
+
+    for( size_t at = text.find( aDir ); at != std::string::npos; at = text.find( aDir ) )
+        text.erase( at, aDir.size() );
+
+    return text.size() > 512 ? text.substr( 0, 512 ) : text;
+}
+
+/** settings-read.json {sections, missing}, then .cc-settings-read.json {error, message} last. */
+void writeReadRecord( const std::string& aDir, const json& aSections, const json& aMissing, const std::string& aError,
+                      const std::string& aMessage )
+{
+    json record = json::object();
+    record["sections"] = aSections;
+    record["missing"] = aMissing;
+    cc_output::WriteRecord( aDir, "settings-read.json", record );
+
+    json done = json::object();
+    done["error"] = aError;
+    done["message"] = aMessage;
+    cc_output::WriteRecord( aDir, ".cc-settings-read.json", done );
+}
+
+void runSch( const READ_ARGS& aArgs )
+{
+    json        sections = json::object();
+    json        missing = json::array();
+    std::string error;
+    std::string message;
+
+    SCH_EDIT_FRAME* frame = schFrame();
+
+    if( !frame )
+    {
+        writeReadRecord( aArgs.dir, sections, missing, "island_error", "no schematic editor" );
+        return;
+    }
+
+    wxLogNull         noLog;
+    SETTINGS_MANAGER* manager = frame->GetSettingsManager();
+    const wxString    projectPath = wxString::FromUTF8( aArgs.dir + "/" + aArgs.project );
+    const bool        loadedBefore = manager->GetProject( projectPath ) != nullptr;
+
+    if( !loadedBefore && !manager->LoadProject( projectPath, false ) )
+    {
+        error = "unreadable";
+        message = "KiCad could not load the project file.";
+    }
+    else if( PROJECT* other = manager->GetProject( projectPath ) )
+    {
+        PROJECT_FILE& file = other->GetProjectFile();
+        const bool    madeErc = !file.m_ErcSettings;
+        const bool    madeSch = !file.m_SchematicSettings;
+
+        if( madeErc )
+        {
+            file.m_ErcSettings = new ERC_SETTINGS( &file, "erc" );
+            file.m_ErcSettings->LoadFromFile();
+        }
+
+        if( madeSch )
+        {
+            file.m_SchematicSettings = new SCHEMATIC_SETTINGS( &file, "schematic" );
+            file.m_SchematicSettings->LoadFromFile();
+        }
+
+        const std::set<std::string> known = ccSchSections();
+
+        for( const std::string& name : aArgs.sections )
+        {
+            json value;
+
+            if( known.count( name ) )
+            {
+                try
+                {
+                    value = ccSchSettingsRead( other, name );
+                }
+                catch( ... )
+                {
+                    value = json();
+                }
+            }
+
+            if( value.is_null() )
+                missing.push_back( name );
+            else
+                sections[name] = std::move( value );
+        }
+
+        if( madeSch )
+        {
+            delete file.m_SchematicSettings;
+            file.m_SchematicSettings = nullptr;
+        }
+
+        if( madeErc )
+        {
+            delete file.m_ErcSettings;
+            file.m_ErcSettings = nullptr;
+        }
+
+        if( !loadedBefore && other != &frame->Prj() )
+            manager->UnloadProject( other, false );
+    }
+    else
+    {
+        error = "unreadable";
+        message = "KiCad could not load the project file.";
+    }
+
+    writeReadRecord( aArgs.dir, sections, missing, error, message );
+}
+} // namespace read
 } // namespace sch
 
 const bool kSchEditing = ccRegisterSchSection( { "schEditing", "sch", &sch::schEditingGet, &sch::schEditingSet,
                                                  false } );
 const bool kSchMouse = ccRegisterSchSection( { "mouse", "sch", &sch::mouseGet, &sch::mouseSet, false } );
-const bool kAnnotation = ccRegisterSchSection( { "annotation", "sch", &sch::annotationGet, &sch::annotationSet } );
-const bool kBomPresets = ccRegisterSchSection( { "bomPresets", "sch", &sch::bomPresetsGet, &sch::bomPresetsSet } );
+const bool kAnnotation = ccRegisterSchSection( { "annotation", "sch", &sch::annotationGet, &sch::annotationSet, true,
+                                                false, &sch::annotationRead } );
+const bool kBomPresets = ccRegisterSchSection( { "bomPresets", "sch", &sch::bomPresetsGet, &sch::bomPresetsSet, true,
+                                                false, &sch::bomPresetsRead } );
 const bool kSchComponentClasses = ccRegisterSchSection( { "componentClasses", "sch", &sch::componentClassesGet,
-                                                          &sch::componentClassesSet } );
+                                                          &sch::componentClassesSet,
+                                                          true, false, &sch::componentClassesRead } );
+
+// The schematic half of kicadSettingsRead (registered in cc_e12_dispatch.inc, which picks it on
+// schEditorActive()): the arguments read whole (a staged board is not read here), then the
+// read queued on the apply coroutine. false for any other shape, no frame or an open in flight.
+bool settingsReadSch( std::string aArgsJson )
+{
+    SCH_EDIT_FRAME* fr = schFrame();
+
+    if( !fr || pcbjam_open::busy() )
+        return false;
+
+    try
+    {
+        std::optional<sch::read::READ_ARGS> args = sch::read::readArgs( aArgsJson );
+
+        if( !args )
+            return false;
+
+        pcbjam_collab::runOnCoroutine( fr, [a = *args]() { sch::read::runSch( a ); } );
+        return true;
+    }
+    catch( ... )
+    {
+        return false;
+    }
+}
 } // namespace cc_e12
 
 EMSCRIPTEN_BINDINGS( cc_e12_sch )
