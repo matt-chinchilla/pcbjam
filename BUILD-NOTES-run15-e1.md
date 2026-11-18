@@ -220,3 +220,47 @@ What the build train must probe (fixture `island:tests/fixtures/canvas-kinds/`, 
 - Board cell: `ask` `tableCell`, `record.width` and `record.height` numbers, `record.size === null`; `{"width":2,"height":2}` accepted, the text grows.
 - `kicadTableCsv('{"uuid":"<the schematic table uuid>"}')`: `{"name":"canvas-kinds-table","text":"..."}` with three lines of three comma separated fields ending in `\n`; a cell's uuid gives the same; `kicadTableCsv('{}')` and `kicadTableCsv('{"uuid":"<a wire>"}')` give `""`. Board: two lines of two fields. Wrong: fields of a cell holding a comma not quoted.
 - No listener: each dialog shows as before (both `ShowModal` and `ShowQuasiModal` paths: the drawing tool's new table uses `ShowQuasiModal() == wxID_OK`).
+
+## st-keys-e: kicadHotkeysGet, kicadHotkeysSet
+
+Pcbjam only (no KiCad file), commit 3620c5e. Both registered in `cc_e1_dispatch.inc` block `cc_e1_dispatch` (dispatcher TU, merged image), no halves: the live schematic or board frame's own `TOOL_MANAGER` (top window `KIWAY_PLAYER`) and its `ACTION_MANAGER`. Footprint, symbol and drawing sheet editors answer `""` / `false`.
+
+- `kicadHotkeysGet() -> string`: `{ "editor": "sch" | "pcb", "actions": [{ name, label, key, default, alt }] }`, sorted by name: every action of the frame's action manager whose name starts with `eeschema.` (schematic) or `pcbnew.` (board) or `common.`, and which has a friendly name (KiCad's own hotkey list rule, `HOTKEY_STORE::Init`). `key` the primary key now, `default` KiCad's default, `alt` the secondary (the island's seeded chord), each in KiCad's key grammar (`KeyNameFromKeyCode`, `Ctrl+Shift+M`), `""` for none; `label` `GetFriendlyName()`. A read.
+- `kicadHotkeysSet( string json ) -> bool`: `{ "keys": { "<action>": "<key>" | "" } }` exactly, at most 2,048 entries. Read whole first: an action not in this editor's list, a value not a string, a key `KeyCodeFromKeyName` cannot read (result 0 or less), any other shape, a modal dialog, a parked prompt or an open in flight: `false`, nothing changes. Then `TOOL_ACTION::SetHotKey( key, GetHotKeyAlt() )` per action (PRIMARY only, the secondary kept) and `ACTION_MANAGER::UpdateHotKeys( false )` (rebuilds the key map from the actions, no file read, no reset to defaults). Not an edit: no undo step, no modified flag. Keys live for this engine's lifetime: the page sends `cc.viewer.editorKeys` again at `ev.ready`.
+
+What the build train must probe (Glasgow example, Edit mode, each frame):
+
+- `JSON.parse(Module.kicadHotkeysGet())`: schematic `editor === "sch"`, an action `eeschema.InteractiveEdit.rotateCCW` with `default === "R"`; no `pcbnew.` name; board `editor === "pcb"`, `pcbnew.InteractiveRouter.SingleTrack` with `default === "X"`; no `eeschema.` name. Wrong: both editors' actions in one list.
+- `Module.kicadHotkeysSet('{"keys":{"pcbnew.InteractiveRouter.SingleTrack":"Shift+Q"}}')` true; get shows `key: "Shift+Q"`, `alt` unchanged; pressing Shift+Q on the canvas starts routing; X no longer does. `{"keys":{"pcbnew.InteractiveRouter.SingleTrack":""}}` true and the action has no key. `{"keys":{"pcbnew.Nope":"Q"}}`, `{"keys":{"pcbnew.InteractiveRouter.SingleTrack":"NotAKey"}}` and `{}` give false and nothing changes. Undo history and the save state unchanged after a set.
+
+## m6-e3: kicadSelectionFilterGet, kicadSelectionFilterSet
+
+Pcbjam only, commit 3620c5e (the same commit as st-keys-e: both units sit in `cc_e1_dispatch.inc`). Registered in `cc_e1_dispatch.inc` block `cc_e1_dispatch`; halves `selectionFilterGetPcb`, `selectionFilterSetPcb` (`cc_e1_pcb.inc`) and `selectionFilterGetSch`, `selectionFilterSetSch` (`cc_e1_sch.inc`), all under `#ifdef KICAD_MERGED_EMBIND` (MERGED IMAGE ONLY: the dispatcher calling them exists only there, and the pane is found by `dynamic_cast`, which occ_service should not have to link).
+
+- `kicadSelectionFilterGet() -> string`: board `{ lockedItems, footprints, text, tracks, vias, pads, graphics, zones, keepouts, dimensions, points, otherItems }` (`PCB_SELECTION_FILTER_OPTIONS`), schematic `{ lockedItems, symbols, text, wires, labels, pins, graphics, images, ruleAreas, otherItems }` (`SCH_SELECTION_FILTER_OPTIONS`), each a boolean, from `PCB_SELECTION_TOOL::GetFilter()` / `SCH_SELECTION_TOOL::GetFilter()`. `""` in any other frame. A read.
+- `kicadSelectionFilterSet( string json ) -> bool`: some of the live editor's keys with booleans, the others kept; read whole first: an unknown key, a non boolean, an empty object, another shape, a modal dialog, a parked prompt or an open in flight: false, nothing changes. Writes the tool's filter and then sets KiCad's hidden Selection Filter pane from it (`PANEL_SELECTION_FILTER::SetCheckboxesFromFilter`, `PANEL_SCH_SELECTION_FILTER::SetCheckboxesFromFilter`; the pane found among the frame's child windows), so the pane and the tool never disagree. No undo step, no modified flag.
+
+What the build train must probe (Glasgow example, Edit mode):
+
+- Board: `JSON.parse(Module.kicadSelectionFilterGet())` has the twelve keys, `tracks === true`. `Module.kicadSelectionFilterSet('{"tracks":false}')` true: a drag box over tracks and pads selects only the pads; get shows `tracks: false`, the rest unchanged. `{"tracks":"no"}`, `{"wires":true}` (a schematic key) and `{}` give false. Wrong: the box still takes tracks (the tool's filter not written), or KiCad's pane switches disagreeing with get (the pane not refreshed).
+- Schematic: ten keys; `{"wires":false}` true, a drag box over wires and symbols takes the symbols only; `{"tracks":false}` false.
+- Footprint editor frame: get `""`, set false.
+
+Syntax check for both units (and the m12-e dialogs again), from this worktree: `/home/matthew/cc-wave2/bin/gate.sh scripts/kicad/syntax-check-run15.sh --kicad /home/matthew/cc-engine-wt/e1/kicad all --kicad-file eeschema/dialogs/dialog_table_properties.cpp --kicad-file pcbnew/dialogs/dialog_table_properties.cpp --kicad-file eeschema/dialogs/dialog_tablecell_properties.cpp --kicad-file pcbnew/dialogs/dialog_tablecell_properties.cpp`:
+
+```
+PASS pcbnew         pcbnew_embind.cpp subdir=pcbnew -DKICAD_MERGED_EMBIND (12363 ms)
+PASS eeschema       eeschema_embind.cpp subdir=eeschema -DKICAD_MERGED_EMBIND (12207 ms)
+PASS symedit        symedit_embind.cpp subdir=eeschema  (7546 ms)
+PASS fpedit         fpedit_embind.cpp subdir=pcbnew  (6893 ms)
+PASS dsedit         dsedit_embind.cpp subdir=pagelayout_editor  (999 ms)
+PASS kicad_editor   kicad_editor_embind.cpp subdir=common  (5424 ms)
+PASS occ            pcbnew_embind.cpp subdir=pcbnew (11910 ms)
+PASS kicad eeschema/dialogs/dialog_table_properties.cpp (7281 ms)
+PASS kicad pcbnew/dialogs/dialog_table_properties.cpp (6068 ms)
+PASS kicad eeschema/dialogs/dialog_tablecell_properties.cpp (6222 ms)
+PASS kicad pcbnew/dialogs/dialog_tablecell_properties.cpp (5869 ms)
+syntax-check: 0 failed
+```
+
+Export check: `scripts/kicad/check-run15-exports.sh --since run15/main --kicad /home/matthew/cc-engine-wt/e1/kicad --kicad-since run15/main`: `168 names registered in the merged image (161 kicad names), 23 of 110 run 15 names, 0 failures`.
