@@ -13,16 +13,24 @@
 # dsedit_embind.cpp and kicad_editor_embind.cpp without it; every local include followed in
 # place, comments dropped, #if arms it cannot decide counted both ways) and fails when:
 #   1. a kicad... name is registered (function("kicad...")) more than once across them;
-#   2. a registered name is in neither list of wasm/bindings/run15-exports.txt;
+#   2. a registered name is in neither list of wasm/bindings/run15-exports.txt; a name that does
+#      not start with kicad registered in a lane's file; a registration whose name is not a
+#      string literal (function( std::string( ... ) ... ), anywhere);
 #   3. a run 15 name is registered outside its lane's own files (cc_eN_*.inc; dsedit_embind.cpp
 #      is lane e6's; kicad_editor_embind.cpp and the two cc_rules incs are e0's);
 #   4. with --join: a run 15 name of the list is not registered;
 #   5. a file added since <rev> (default: the run 15 base) lacks the notice in its first ten
 #      lines ("Copyright (C) 2026 Circuit Center Inc" and "SPDX-License-Identifier:
 #      GPL-3.0-or-later"), or a file changed since <rev> adds no "Modified by Circuit Center Inc
-#      on <date>" line (with --kicad, the same for the KiCad tree since --kicad-since);
+#      on <date>" line, unless that file already carries the notice in its first ten lines (a
+#      file of ours, such as a lane's own inc) (with --kicad, the same for the KiCad tree since
+#      --kicad-since);
 #   6. an added file, or an added line of a changed file, names an agent, a tool, a model or a
-#      session.
+#      session, or holds an em dash or an en dash;
+#   7. a dispatcher face (cc_eN_dispatch.inc) declares a function at namespace scope that no
+#      file of the same lane (cc_eN_*.inc, cc_eN_*.h) defines (the merged image's link would
+#      fail on it). Two definitions of one cc_eN function in two faces are seen only at the link.
+# '#if 0' and '#if 1' are decided; any other condition it cannot decide is counted both ways.
 # Exit 0 when every check passes, 1 when any fails (each failure on its own line), 2 on usage.
 set -euo pipefail
 
@@ -105,6 +113,8 @@ TRUE, FALSE, UNKNOWN = 1, 0, 2
 
 def cond_value(expr, defines, base):
     expr = expr.strip()
+    if expr in ("0", "1"):
+        return TRUE if expr == "1" else FALSE
     m = re.fullmatch(r'__has_include\s*\(\s*"([^"]+)"\s*\)', expr)
     if m:
         return TRUE if os.path.exists(os.path.join(base, m.group(1))) else FALSE
@@ -117,7 +127,8 @@ def cond_value(expr, defines, base):
     return UNKNOWN
 
 regs = []   # (name, file, line, tu)
-FUNC = re.compile(r'\bfunction\s*\(\s*"(kicad\w*)"')
+FUNC = re.compile(r'\bfunction\s*\(\s*"(\w+)"')
+INDIRECT = re.compile(r'(?<!std::)(?<![\w<])function\s*\(\s*(?!")[^\s)]')
 
 def scan(path, defines, tu, seen):
     real = os.path.realpath(path)
@@ -161,6 +172,8 @@ def scan(path, defines, tu, seen):
             continue
         for m in FUNC.finditer(line):
             regs.append((m.group(1), os.path.relpath(path, pcbjam), ln, tu))
+        if INDIRECT.search(line):
+            fail(f"{os.path.relpath(path, pcbjam)}:{ln}: a registration whose name is not a string literal")
 
 TUS = [("pcbnew_embind.cpp", {"KICAD_MERGED_EMBIND"}), ("eeschema_embind.cpp", {"KICAD_MERGED_EMBIND"}),
        ("symedit_embind.cpp", set()), ("fpedit_embind.cpp", set()), ("dsedit_embind.cpp", set()),
@@ -188,6 +201,12 @@ def owner_of(relpath):
     return None
 
 for name, rs in sorted(by_name.items()):
+    if not name.startswith("kicad"):
+        for _, f, l, _ in rs:
+            own = owner_of(f)
+            if own not in (None, "e0") or os.path.basename(f) == "fpedit_embind.cpp":
+                fail(f"{name}: registered at {f}:{l}; every run 15 name starts with kicad")
+        continue
     if len(rs) > 1:
         where = ", ".join(f"{f}:{l}" for _, f, l, _ in rs)
         fail(f"{name}: registered {len(rs)} times ({where})")
@@ -199,6 +218,43 @@ for name, rs in sorted(by_name.items()):
             if own != listed_new[name]:
                 fail(f"{name}: registered at {f}:{l}, a file of {own or 'no lane'}; the list gives it to {listed_new[name]}")
 
+# ── 7. a dispatcher face's declared halves are defined in the same lane's files ──
+DECL = re.compile(r'^\s*(?:extern\s+)?(?:const\s+)?[\w:<>]+(?:\s*[\*&])?\s+[\*&]?(\w+)\s*\([^(){};=]*\)\s*;\s*$')
+NOT_TYPES = {"return", "else", "delete", "new", "throw", "case", "goto", "using", "typedef"}
+for fn in sorted(os.listdir(bind)):
+    m = re.fullmatch(r'cc_(e\d+)_dispatch\.inc', fn)
+    if not m:
+        continue
+    lane = m.group(1)
+    text = strip_comments(open(os.path.join(bind, fn), encoding="utf-8").read())
+    # The braces of the whole face in order (a namespace's brace may sit on the next line), and
+    # for each line whether every brace open at its start is a namespace's.
+    toks = list(re.finditer(r'namespace\s+[\w:]*\s*\{|\{|\}', text))
+    kinds, decls, ti, off = [], [], 0, 0
+    for ln, line in enumerate(text.split("\n"), 1):
+        while ti < len(toks) and toks[ti].end() <= off:
+            t = toks[ti].group(0)
+            if t == "}":
+                if kinds:
+                    kinds.pop()
+            else:
+                kinds.append("ns" if t.startswith("namespace") else "block")
+            ti += 1
+        if all(k == "ns" for k in kinds):
+            d = DECL.match(line)
+            if d and line.split()[0] not in NOT_TYPES:
+                decls.append((d.group(1), ln))
+        off += len(line) + 1
+    if not decls:
+        continue
+    lane_text = ""
+    for other in os.listdir(bind):
+        if re.fullmatch(rf'cc_{lane}_\w+\.(inc|h)', other):
+            lane_text += strip_comments(open(os.path.join(bind, other), encoding="utf-8").read()) + "\n"
+    for name, ln in decls:
+        if not re.search(rf'\b{re.escape(name)}\s*\([^;{{}}]*\)\s*(?:const\s*)?(?:noexcept\s*)?\{{', lane_text):
+            fail(f"wasm/bindings/{fn}:{ln}: {name} is declared but no file of {lane} defines it")
+
 if join:
     for name, lane in sorted(listed_new.items()):
         if name not in by_name:
@@ -207,6 +263,7 @@ if join:
 # ── notices and names in what changed ──
 NOTICE = ("Copyright (C) 2026 Circuit Center Inc", "SPDX-License-Identifier: GPL-3.0-or-later")
 MODIFIED = re.compile(r"Modified by Circuit Center Inc on 20\d\d-\d\d-\d\d")
+DASHES = re.compile("[\u2013\u2014]")
 # The words are kept rot13 encoded, so this file names none of them.
 BANNED = re.compile(codecs.decode('\\o(pynhqr|naguebcvp|bchf\\f*\\q|fbaarg|unvxh|pungtcg|bcranv|tcg-?\\q|pbcvybg|pbqrk|trzvav|yyz|fhontrag|pb-nhguberq-ol|pynhqr-frffvba|trarengrq (ol|jvgu) (na? )?(nv|nffvfgnag|zbqry))\\o|pynhqr\\.nv|frffvba_[0-9N-Mn-m]{8,}|\\ojs_[0-9n-s]{6,}', "rot13"), re.I)
 
@@ -239,15 +296,22 @@ def check_tree(repo, rev, label):
             m = BANNED.search(text)
             if m:
                 fail(f"{label}/{f}: names {m.group(0)!r}")
+            if DASHES.search(text):
+                fail(f"{label}/{f}: holds an em dash or an en dash")
         else:
             added = [l[1:] for l in git(repo, "diff", rev, "--", f).splitlines()
                      if l.startswith("+") and not l.startswith("+++")]
-            if not any(MODIFIED.search(l) for l in added):
+            ours = all(s in "\n".join(text.split("\n")[:10]) for s in NOTICE)
+            if not ours and not any(MODIFIED.search(l) for l in added):
                 fail(f"{label}/{f}: changed, but adds no 'Modified by Circuit Center Inc on <date>' line")
             for l in added:
                 m = BANNED.search(l)
                 if m:
                     fail(f"{label}/{f}: an added line names {m.group(0)!r}")
+                    break
+            for l in added:
+                if DASHES.search(l):
+                    fail(f"{label}/{f}: an added line holds an em dash or an en dash")
                     break
 
 check_tree(pcbjam, since, "pcbjam")
@@ -255,7 +319,8 @@ if kicad:
     check_tree(kicad, ksince, "kicad")
 
 n_new = sum(1 for n in listed_new if n in by_name)
-print(f"check-run15-exports: {len(by_name)} names registered in the merged image, "
+n_kicad = sum(1 for n in by_name if n.startswith("kicad"))
+print(f"check-run15-exports: {len(by_name)} names registered in the merged image ({n_kicad} kicad names), "
       f"{n_new} of {len(listed_new)} run 15 names, {len(fails)} failures")
 for f in fails:
     print("FAIL " + f)
