@@ -430,28 +430,99 @@ What the build train must probe (the unit's recipe):
 - the failure that means it is wrong: an undo step after a set, the board not modified, a
   file in `heldBy` 0 that a footprint visibly carries, any KiCad window.
 
-## Hand over state (this seat, 2026-11-18)
+## st-placefile-e: a staged sheet or board onto the pointer (BUILD-NOTES-run15-st-placefile-e.md)
 
-Done: fp-e7 (earlier seat), fp-e5, fp-e6. Not started, for the relay on this same branch, in
-this order: fp-e4b, m13-e, st-placefile-e. Nothing uncommitted, nothing stashed.
+Relay seat. Commit pcbjam `7399336` (`cc_e5_pcb.inc`, `cc_e5_sch.inc`, `cc_e5_dispatch.inc`);
+its syntax check and export check are the hand over's below (the tree at `b1db0fd`). No KiCad
+file, no marker, no host ask.
 
-Notes for the relay:
+`kicadPlaceFromFile( json )` -> `cc_e5::placeFromFile`, registered in `EMSCRIPTEN_BINDINGS(
+cc_e5_dispatch )`; halves `placeFromFilePcb` (`cc_e5_pcb.inc`) and `placeFromFileSch`
+(`cc_e5_sch.inc`), picked by `pcbEditorActive()` then `schEditorActive()` (the footprint and
+symbol editors answer false). Merged image only (the halves are reached from the dispatcher;
+the board half compiles in occ_service's unit unused).
 
-- fp-e4b: the kind bodies go in `cc_item_shape.h` (inline or static only, namespace `cc_e5::fp` or
-  `cc_fpitems`, no registrar) and are registered once from `cc_e5_fpedit.inc` with
-  `cc_fpitems::ccRegisterItemKind( { "shape", ... } )` and likewise `dimension`, `zone`, `image`,
-  `point`. Lane e4's branch (not yet on run15/main at this hand over) widens `cc_fp_items.h` with
-  the bodies' contract (get WITHOUT kind and uuid; set checks every key before it changes
-  anything and calls `aCommit.Modify( item )` first; add returns a NEW item not yet added) and
-  `ccItemKindName`; code to that contract and `git merge run15/main` once merged.log names it.
-  The dimension keys are `DIALOG_DIMENSION_PROPERTIES::updateDimensionFromDialog`
-  (dialog_dimension_properties.cpp 376).
-- st-placefile-e: `PCB_CONTROL::AppendBoard( PCB_IO&, path )` is public, but its body builds a
-  `WX_PROGRESS_REPORTER` ("Load PCB") and a `KIDIALOG` query callback, and on an IO_ERROR calls
-  `DisplayErrorMessage` (pcb_control.cpp from 2061). With no KiCad file in this lane those cannot
-  be held back here: REPORTED to E0 (whether run 14's progress reporter shows a window in the
-  engine, and who owns an `#ifdef __EMSCRIPTEN__` in pcb_control.cpp if it does). The sheet half
-  runs `SCH_ACTIONS::importSheet` with a `wxString*` parameter (`SCH_DRAWING_TOOLS::ImportSheet`
-  reads it at sch_drawing_tools.cpp 824); keep the string alive past the call (a static). The
-  island stages under `/tmp/cc-stage/<n>/` (small tools spec 6.1), so the path rule is
-  `cc_output::IsRunDir( dir, "/tmp/cc-stage/" )`; both frames' halves through `cc_e5_dispatch.inc`.
+- args exactly `{kind, path}`: the board frame takes only `kind` "board" and a `.kicad_pcb`,
+  the schematic frame only "sheet" and a `.kicad_sch`; `path` a regular file of at most 25 MB
+  directly inside a stage run folder `/tmp/cc-stage/<n>` (small tools spec 6.1: the island
+  stages there, never in the project folder, and removes the folder after the answer). Any
+  other shape, kind, extension or folder, no ready frame (an open in flight, a dialog up):
+  false, nothing queued.
+- board: on the apply coroutine `PCB_CONTROL::AppendBoard( *pi, path )` with the plugin
+  `AppendBoardFromFile` itself picks (`PCB_IO_MGR::FindPluginTypeFromBoardPath( path,
+  KICTL_KICAD_ONLY )`), in place of its file dialog; KiCad's own body loads the board into the
+  live one, keeps the destination stackup, page and title block, places the new items on the
+  move tool (`placeBoardItems` then `RunSynchronousAction( PCB_ACTIONS::move )`, the same road
+  as `pcbPlaceImportedItem`), groups them when the design block option says so, and pushes ONE
+  commit "Append Board" on the press (a cancel reverts).
+- sheet: on the apply coroutine `RunAction<wxString*>( SCH_ACTIONS::importSheet, &s )` with
+  `s` a function static holding the path (`SCH_DRAWING_TOOLS::ImportSheet` reads the parameter
+  at sch_drawing_tools.cpp 874 and, the name given, never opens its file chooser); the sheet,
+  or its contents when `m_DesignBlockChooserPanel.place_as_sheet` is off, is on the pointer;
+  one commit on the press.
+
+What AppendBoard builds that is not ours to change (pcb_control.cpp 2061 on, no KiCad file in
+this lane; REPORTED to E0 by the first seat and again here):
+- a `WX_PROGRESS_REPORTER` "Load PCB": its `updateUI` is already a no op in the engine
+  (wx_progress_reporters.cpp 62), and the reporter is made and destroyed inside the load's
+  `try` block, which runs straight through with no yield, before the move tool starts. Whether
+  the wx port paints the wxProgressDialog it constructs is for the train to see (below).
+- the plugin's query callback (a `KIDIALOG`) and the IO_ERROR path's `DisplayErrorMessage`:
+  both are KiCad message dialogs, which e1's message ask (`CcHostMessage`, confirm.cpp and
+  kidialog.cpp under `__EMSCRIPTEN__` on run15/main) now offers to the page first; the page's
+  card answers them. A KiCad file that loads cleanly asks neither.
+- placing as a sheet (when the user's design block option says so) makes a sheet symbol whose
+  file is the staged path; the island removes that folder after the answer. The default
+  option places the contents. The train must check which one the island's config gives.
+
+What the build train must probe (the unit's recipe, st-placefile-s):
+- board frame, the business card board open: stage another `.kicad_pcb` (complex_hierarchy's
+  board) at `/tmp/cc-stage/1/other.kicad_pcb`, `kicadPlaceFromFile('{"kind":"board","path":
+  "/tmp/cc-stage/1/other.kicad_pcb"}')` is true; its items follow the pointer; a click places
+  them and the undo depth goes up by exactly one; Ctrl+Z removes them all. Esc instead leaves
+  the board as it was with no undo step.
+- no window seen at any frame between the call and the click: the classifier's zero chrome,
+  zero beige frames (a "Load PCB" box seen is the progress reporter's: a defect, reported
+  back to E0 with its wx type).
+- schematic frame, complex_hierarchy open: stage a `.kicad_sch` at `/tmp/cc-stage/2/`,
+  `{"kind":"sheet","path":...}` true, the contents (or the sheet) on the pointer, one undo step
+  on the click, no file chooser.
+- refusals: `{"kind":"sheet"}` in the board frame, a `.kicad_sch` named as a board, a path in
+  `/tmp/cc-stage/` itself or outside it, a missing file: each false, nothing queued.
+
+## Hand over state (relay seat, 2026-11-18): every unit of the lane done
+
+Units: fp-e7, fp-e5, fp-e6 (first seat); fp-e4b `47bb3a4`, m13-e `0ae7a6d`, st-placefile-e
+`7399336` (this seat). Nothing uncommitted, nothing stashed; no repair note `fix/e5-*.md` was
+ever written. Branch `seat/run15-e5`, run15/main merged at `b1db0fd` (run15/main `ba5656b`).
+
+Exports of the lane (13): `kicadFootprintForEditor`, `kicadFootprintPushToBoard` (block
+`cc_e5_pcb`); `kicadFootprintConvert`, `kicadEmbeddedFilesGet`, `kicadEmbeddedFilesSet`,
+`kicadEmbeddedFileExtract`, `kicadPlaceFromFile` (block `cc_e5_dispatch`, merged image only);
+`kicadFpEditFootprintGet`, `kicadFpEditFootprintSet`, `kicadFpEditEmbed`, `kicadFpEditCheck`,
+`kicadFpEditCleanup`, `kicadFpEditPlotSvg` (block `cc_e5_fpedit`, merged image only). The five
+shape kinds of the item table register from `cc_e5_fpedit.inc` with no export.
+
+Reported to E0 (information, nothing blocks): `font/outline_font.h` cannot be included by an
+embind TU (`<freetype/freetype.h>` not on `compile_embind_tu`'s include list; m13-e reads font
+names without it); AppendBoard's "Load PCB" progress reporter is made and destroyed with no
+yield in the engine, for the train to watch (st-placefile-e's section). No include path,
+CMake line, build script line or new name is needed by this lane.
+
+The hand over checks, on `b1db0fd`:
+
+```
+cd /home/matthew/cc-engine-wt/e5/pcbjam
+/home/matthew/cc-wave2/bin/gate.sh scripts/kicad/syntax-check-run15.sh --kicad /home/matthew/cc-engine-wt/e0-kicad all
+PASS pcbnew         pcbnew_embind.cpp subdir=pcbnew -DKICAD_MERGED_EMBIND (12472 ms)
+PASS eeschema       eeschema_embind.cpp subdir=eeschema -DKICAD_MERGED_EMBIND (12693 ms)
+PASS symedit        symedit_embind.cpp subdir=eeschema  (6825 ms)
+PASS fpedit         fpedit_embind.cpp subdir=pcbnew  (7980 ms)
+PASS dsedit         dsedit_embind.cpp subdir=pagelayout_editor  (1011 ms)
+PASS kicad_editor   kicad_editor_embind.cpp subdir=common  (5186 ms)
+PASS occ            pcbnew_embind.cpp subdir=pcbnew (12025 ms)
+syntax-check: 0 failed
+
+scripts/kicad/check-run15-exports.sh --since run15/main
+check-run15-exports: 227 names registered in the merged image (220 kicad names), 82 of 111 run 15 names, 0 failures
+```
