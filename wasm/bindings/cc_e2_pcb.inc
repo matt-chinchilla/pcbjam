@@ -21,6 +21,12 @@
 
 #include <microwave/cc_microwave_arm.h>
 
+#ifdef KICAD_MERGED_EMBIND
+#include <host_prompt.h>
+#include <pcb_base_frame.h>
+#include <zone_settings.h>
+#endif
+
 namespace cc_e2
 {
 namespace pcb
@@ -268,7 +274,200 @@ bool autoplaceQuiet()
     return true;
 }
 
+
+#ifdef KICAD_MERGED_EMBIND
+
+namespace pcb
+{
+
+/**
+ * m3-e2: a new zone's settings answered by the host (host_prompt.h, ask zoneSettings, modal),
+ * reached from KiCad's three zone editors' Invoke functions through g_ccZoneSettingsHost.
+ *
+ * The record { kind, sheet } and the answer { set } are the records the page already reads and
+ * writes for zones, never a second shape: the settings are exported into a zone that is never
+ * added to the board (ZONE_SETTINGS::ExportSetting), its record read, the answer applied to it,
+ * and the settings imported back from it (ZONE_SETTINGS::operator<<), all KiCad's code.
+ * - copper: wave 1's zone sheet (ccItemSheet, board.item.get's zone keys) with uuid "", the
+ *   answer's set keys board.item.set's zone keys (each read by ccReadItemSet as its one key set
+ *   and applied by ccApplyItemSet) plus layers (copper layers the board enables, by canonical
+ *   name), the layers a new zone needs. The board editor only (ccApplyItemSet is the board
+ *   editor's); in another frame KiCad's own dialog shows.
+ * - nonCopper, ruleArea: M4's zone record through the item kinds table (cc_fp_items.h,
+ *   ccFpItemJson and ccFpItemApply of the kind zone, board frame, origin 0, 0), uuid "". While
+ *   no zone kind is registered the ask is not made and KiCad's own dialog shows.
+ */
+class ZONE_SETTINGS_RECEIVER : public CC_PROMPT_RECEIVER
+{
+public:
+    ZONE_SETTINGS_RECEIVER( const std::string& aKind, PCB_BASE_FRAME* aFrame, ZONE& aZone ) :
+            m_kind( aKind ), m_frame( aFrame ), m_zone( aZone )
+    {
+    }
+
+    bool CcApply( const json& aAnswer, std::string& aField ) override
+    {
+        if( !aAnswer.is_object() )
+            return false;
+
+        for( auto it = aAnswer.begin(); it != aAnswer.end(); ++it )
+        {
+            if( it.key() != "set" )
+            {
+                aField = it.key();
+                return false;
+            }
+        }
+
+        aField = "set";
+
+        if( !aAnswer.contains( "set" ) || !aAnswer["set"].is_object() )
+            return false;
+
+        const json& set = aAnswer["set"];
+        aField.clear();
+
+        if( m_kind == "copper" )
+            return applyCopper( set, aField );
+
+        // The kinds table's own apply, inside a commit that is never pushed (the zone is not
+        // on the board; a commit that goes out of scope only frees its copies).
+        BOARD_COMMIT commit( m_frame );
+        return cc_fpitems::ccFpItemApply( &m_zone, set, commit, VECTOR2I( 0, 0 ), true );
+    }
+
+private:
+    bool applyCopper( const json& aSet, std::string& aField )
+    {
+        PCB_EDIT_FRAME* frame = static_cast<PCB_EDIT_FRAME*>( m_frame );
+        BOARD*          board = frame->GetBoard();
+
+        // Read the whole set first.
+        std::vector<CC_ITEM_SET> sets;
+        std::optional<LSET>      layers;
+
+        for( auto it = aSet.begin(); it != aSet.end(); ++it )
+        {
+            if( it.key() == "layers" )
+            {
+                LSET chosen;
+
+                if( it->is_array() && !it->empty() && it->size() <= PCB_LAYER_ID_COUNT )
+                {
+                    for( const json& name : *it )
+                    {
+                        const PCB_LAYER_ID layer = name.is_string()
+                                                           ? ccLayerByName( board, name.get<std::string>() )
+                                                           : UNDEFINED_LAYER;
+
+                        if( layer == UNDEFINED_LAYER || !IsCopperLayer( layer ) )
+                        {
+                            chosen.reset();
+                            break;
+                        }
+
+                        chosen.set( layer );
+                    }
+                }
+
+                if( chosen.none() )
+                {
+                    aField = "layers";
+                    return false;
+                }
+
+                layers = chosen;
+                continue;
+            }
+
+            CC_ITEM_SET one;
+
+            if( !ccReadItemSet( board, &m_zone, json{ { it.key(), it.value() } }, one ) )
+            {
+                aField = it.key();
+                return false;
+            }
+
+            sets.push_back( one );
+        }
+
+        for( const CC_ITEM_SET& one : sets )
+            ccApplyItemSet( frame, &m_zone, one );
+
+        if( layers )
+            m_zone.SetLayerSet( *layers );
+
+        return true;
+    }
+
+    std::string     m_kind;
+    PCB_BASE_FRAME* m_frame;
+    ZONE&           m_zone;
+};
+
+
+int zoneSettingsAsk( const char* aKind, PCB_BASE_FRAME* aFrame, ZONE_SETTINGS* aSettings )
+{
+    if( !aKind || !aFrame || !aSettings || !aFrame->GetBoard() )
+        return -1;
+
+    const std::string kind = aKind;
+    const bool        copper = kind == "copper";
+
+    if( copper && !aFrame->IsType( FRAME_PCB_EDITOR ) )
+        return -1;
+
+    if( !copper && ( ( kind != "nonCopper" && kind != "ruleArea" )
+                     || !cc_fpitems::ccItemKind( "zone" ) ) )
+    {
+        return -1;
+    }
+
+    // The settings in a zone of the board that is never added to it.
+    ZONE zone( aFrame->GetBoard() );
+    aSettings->ExportSetting( zone );
+
+    json sheet = copper ? ccItemSheet( aFrame->GetBoard(), &zone )
+                        : cc_fpitems::ccFpItemJson( &zone, VECTOR2I( 0, 0 ), true );
+
+    if( !sheet.is_object() )
+        return -1;
+
+    sheet["uuid"] = "";
+
+    json record;
+    record["kind"] = kind;
+    record["sheet"] = std::move( sheet );
+
+    ZONE_SETTINGS_RECEIVER receiver( kind, aFrame, zone );
+    const int              result = CcHostPromptModal( "zoneSettings", record, receiver );
+
+    if( result == 1 )
+        *aSettings << zone;
+
+    return result;
+}
+
+} // namespace pcb
+
+#endif // KICAD_MERGED_EMBIND
+
 } // namespace cc_e2
+
+#ifdef KICAD_MERGED_EMBIND
+// dialog_copper_zones.cpp's hook (m3-e2), declared here as each zone editor declares it.
+extern int ( *g_ccZoneSettingsHost )( const char* aKind, PCB_BASE_FRAME* aFrame,
+                                      ZONE_SETTINGS* aSettings );
+
+namespace cc_e2
+{
+namespace pcb
+{
+// Set before anything can draw a zone (static initialization of this translation unit).
+[[maybe_unused]] static const bool kZoneSettingsHost = ( g_ccZoneSettingsHost = &zoneSettingsAsk, true );
+} // namespace pcb
+} // namespace cc_e2
+#endif
 
 EMSCRIPTEN_BINDINGS( cc_e2_pcb )
 {
