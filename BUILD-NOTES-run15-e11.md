@@ -117,3 +117,32 @@ syntax-check: 0 failed
   1. `board.rules { a: <a track's uuid> }`: a `solder_mask_expansion` record with a number in mm in `opt` and source `board` (Glasgow's board setup value), never null.
   2. `board.rules { a: <a track>, b: <a pad of another net> }`: records on F.Cu or B.Cu only where both are.
   3. `board.rules { a, b }` for two pads of one through hole part: the records' layers name only Glasgow's 4 enabled copper layers, never `In5.Cu` and beyond. Wrong if 32 layers (the image lacks f4ace52).
+
+## Handover (every unit of the lane done: 3d-e1, 3d-e4, 3d-e2, 3d-e5, lo-e3o-e, lo-e3r-e)
+
+`git merge run15/main` in both worktrees (pcbjam `run15/main` 48e664e, build G's gitlink), then, after build G's container exited, from `/home/matthew/cc-engine-wt/e11/pcbjam`:
+
+`/home/matthew/cc-wave2/bin/gate.sh scripts/kicad/syntax-check-run15.sh --kicad /home/matthew/cc-engine-wt/e11/kicad all --kicad-file pcbnew/pcbnew_jobs_handler.cpp --kicad-file common/jobs/job_export_pcb_3d.cpp`
+
+```
+PASS pcbnew         pcbnew_embind.cpp subdir=pcbnew -DKICAD_MERGED_EMBIND (12081 ms)
+PASS eeschema       eeschema_embind.cpp subdir=eeschema -DKICAD_MERGED_EMBIND (11708 ms)
+PASS symedit        symedit_embind.cpp subdir=eeschema  (6942 ms)
+PASS fpedit         fpedit_embind.cpp subdir=pcbnew  (6591 ms)
+PASS dsedit         dsedit_embind.cpp subdir=pagelayout_editor  (994 ms)
+PASS kicad_editor   kicad_editor_embind.cpp subdir=common  (4685 ms)
+PASS occ            pcbnew_embind.cpp subdir=pcbnew (10864 ms)
+PASS kicad pcbnew/pcbnew_jobs_handler.cpp (9032 ms)
+PASS kicad common/jobs/job_export_pcb_3d.cpp (3124 ms)
+syntax-check: 0 failed
+```
+
+The stub's own compile line (the 3d-e2 section's method): `PASS stub wasm/stubs/exporter_step_stub.cpp`.
+
+`scripts/kicad/check-run15-exports.sh --since run15/main --kicad /home/matthew/cc-engine-wt/e11/kicad --kicad-since run15/main`: `check-run15-exports: 157 names registered in the merged image (150 kicad names), 12 of 110 run 15 names, 0 failures`.
+
+Reported to E0:
+1. PE46's VRML cause is PCBJam's earcut GLU shim `libs/kimath/glu_tess/glu_tess_impl.cpp` (no lane's file): it never calls the BEGIN and END callbacks and ignores `GLU_TESS_BOUNDARY_ONLY`, so every `VRML_LAYER` is empty and O17 writes only its header. Held; needs an owner (the 3d-e2 section).
+2. The lease's edge: 3d-e2 edited the 3D file check in `ccRunBoardOutput` (queued by `pcbExportBoardOutput`), lo-e3r-e edited `ccInspectConstraints` and `ccReportClearance` (called by `pcbResolveRules`); the leased bodies themselves held nothing to change. lo-e3o-e's drill fix is in kicad `pcbnew_jobs_handler.cpp` (this lane's file), not in the settings merge.
+3. The syntax check script cannot name a pcbjam stub (`--kicad-file` prefixes the KiCad tree); a `--pcbjam-file` mode would cover `wasm/stubs/exporter_step_stub.cpp`.
+4. `pcbnew_embind.cpp` carries this lane's dated line at the END of its header comment (not beside the seams' line) to keep merges with other lanes' lines apart.
