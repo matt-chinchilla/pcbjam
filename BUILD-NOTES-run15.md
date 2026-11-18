@@ -99,7 +99,15 @@ Build G (the seams, E0-OCC and the gate units at the cut: fp-e2, 3d-e1, 3d-e4, d
 
 ## Merges
 
-(none yet)
+The early header commits (ENGINE-AUTHORS.md section 7), each merged alone with `git merge --no-ff <sha>`, then `syntax-check-run15.sh --kicad /home/matthew/cc-engine-wt/e0-kicad all` on the merged tip (every unit PASS, `syntax-check: 0 failed`); the pcbjam ones also `check-run15-exports.sh` (0 failures). No gitlink bump (the next build takes it). The log line of each is in `/home/matthew/cc-wave2/engine/status/merged.log`.
+
+| lane | repo | commit | merge on `run15/main` | holds |
+|---|---|---|---|---|
+| e3 | kicad | 426e5044 | 54afb1c8 | `pcbnew/tools/pad_tool.h`: `PAD_TOOL::enumerateLoop` declared under `__EMSCRIPTEN__` with the struct's forward declaration (also checked: `--kicad-file pcbnew/tools/pad_tool.cpp` PASS) |
+| e7 | kicad | a0bd3c27 | c57840f9 | `include/cc_host_design_block.h` (`ccHostDesignBlock()`, `ccSetHostDesignBlock`, the options and the take), included by no file yet |
+| e1 | kicad | d0055781 | 79c5c7af | `include/host_prompt.h` (`CcHostPromptModal`, `CcHostPromptModeless`, `CC_PROMPT_RECEIVER`, the parked prompts, the message capture), included by no file yet |
+| e8 | pcbjam | 4c1c94f | 9b8bcd7 | R2: the symbol editor's readers and appliers moved into `symedit_common.h`'s `cc_symedit`; read line by line against the removed code: the same bodies made `inline`, plus a `aYUp = true` default on the point, text, text box and shape helpers and `readItemSetBounded( aSet, aUnits, aBodies, ... )` under the symbol wrapper that passes the symbol's counts as before |
+| e4 | pcbjam | 6c44e59 | 7181009 | `wasm/bindings/fpedit_common.h`, taken now by `fpedit_embind.cpp`'s `__has_include` slot (fpedit unit PASS with it) |
 
 ## Builds
 
