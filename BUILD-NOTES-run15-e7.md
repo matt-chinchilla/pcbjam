@@ -86,7 +86,24 @@ Kicad:
 PCBJam:
 - `kicadDesignBlockPlace( argsJson )` registered in `cc_e7_dispatch` (`cc_e7::designBlockPlace`): `pcbEditorActive()` -> `cc_e7::blockPlacePcb` (`cc_e7_pcb.inc`, merged image only), `schEditorActive()` -> `cc_e7::blockPlaceSch` (`cc_e7_sch.inc`), else false.
 - Args read whole: exactly `dir` (a run folder under `/tmp/cc-block/`), `name` (the save's rule), `asSheet`, `keepAnnotations`, `asGroup` (booleans). The block is read synchronously by `DESIGN_BLOCK_IO::DesignBlockLoad( dir, name )`; false when it cannot be read or holds no file for the frame (`.kicad_pcb` on the board, `.kicad_sch` on the schematic), with no frame, or an open in flight. Then on the apply coroutine: `ccSetHostDesignBlock( block, options )`, `RunAction( PCB_ACTIONS::placeDesignBlock )` or `SCH_ACTIONS::placeDesignBlock`, then the slot cleared (a tool that did not start leaves no stale block for the pane's own placement).
-- The block's `LIB_ID` is the reader's: an empty nickname and the block's name. A group placed as a group therefore carries no design block LINK (`EDA_GROUP::HasDesignBlockLink` wants a nickname): Apply its layout and Save to its block need a group linked by Update from the schematic or by KiCad's pane. Open question for the site: the contract has no library nickname key.
+- The block's `LIB_ID` is the reader's: an empty nickname and the block's name, unless the call names the block's library (below, relay 2026-11-18). Without it a group placed as a group carries no design block LINK (`EDA_GROUP::HasDesignBlockLink` wants a nickname).
+
+### The design block link on a placed group (relay 2026-11-18)
+
+Commit: pcbjam 3c0f6ee (with e-sheetreload: the same three incs). No kicad file: KiCad's methods are untouched.
+
+- `kicadDesignBlockPlace` takes one more OPTIONAL key, `nickname` (the library row's nickname, 1 to 120 characters, no NUL, a nickname `LIB_ID::SetLibNickname` accepts). The five key form is read exactly as before; a sixth key other than `nickname`, a non string, an empty string or a nickname LIB_ID refuses answers false with nothing queued.
+- With it, after `DESIGN_BLOCK_IO::DesignBlockLoad` the block's `LIB_ID` gets that nickname through `GetLibId().SetLibNickname( nickname )`, the same line `DESIGN_BLOCK_LIBRARY_ADAPTER::LoadDesignBlock` runs (`common/design_block_library_adapter.cpp` 214) on the Design Blocks pane's path. KiCad's placement then links the group itself: `PCB_CONTROL::AppendBoard` sets `group->SetDesignBlockLibId( aDesignBlock->GetLibId() )` (`pcb_control.cpp` about 2324) and the schematic's `SCH_DRAWING_TOOLS` does the same (`sch_drawing_tools.cpp` 934 and 3770, the place lane e8's host hunk feeds). Nothing in KiCad needed rewriting.
+- Both halves (`cc_e7::pcb::readBlockPlaceArgs` in `cc_e7_pcb.inc`, `cc_e7::sch::readBlockPlaceArgs` in `cc_e7_sch.inc`) read it the same way.
+- The link only works for Apply its layout and Save to its block when that row is loaded in the engine's design block table (`kicadLibsAddEntry('design_block', nickname, folder)` or `project.libs`): KiCad's tools find the block through the pane's libraries by that LIB_ID.
+
+For the island: `block.place` passes `nickname: <the design-block-lib-table row the block came from>` to `Module.kicadDesignBlockPlace` whenever the block comes from a table row (the design's own `<stem>_blocks`, an add-on's, KiCad's set once loaded), and leaves the key out for a block with no row. The engine of an older run answers false to the six key form, so the island sends it only on the run 15 engine (the cap that lists `blocks`). Example: `Module.kicadDesignBlockPlace(JSON.stringify({dir:'/tmp/cc-block/3',name:'LDO',asSheet:false,keepAnnotations:false,asGroup:true,nickname:'blocks-small_blocks'}))`.
+
+What the build train must probe (the link):
+1. Frame pcb on blocks-small with `kicadLibsAddEntry('design_block','blocks-small_blocks','<folder>/blocks-small_blocks.kicad_blocks')` done: place LDO with `asGroup:true,nickname:'blocks-small_blocks'`, press to put it down; the board's new group has `HasDesignBlockLink()` (the saved board's group carries `(lib_id "blocks-small_blocks:LDO")`); then `kicadDesignBlockApplyLayout` on that group's uuid answers a record `{applied:1, failures:[]}` and `kicadDesignBlockSave` scope `linkedGroup` with the group selected answers `{code:0}`. Wrong if: the group carries no lib_id (the nickname was not set before `ccSetHostDesignBlock`), or Apply answers "No groups with a linked design block are selected.".
+2. The same in frame sch (once e8's e-block-place-sch is joined): the placed group's `lib_id` is `blocks-small_blocks:LDO`.
+3. False at once: `nickname:''`, `nickname:5`, a sixth key named otherwise, `nickname` with a character LIB_ID refuses in a nickname.
+4. The five key form places exactly as before (no link).
 
 What the build train must probe:
 1. Frame sch on blocks-small, LDO's files written under `/tmp/cc-block/1/LDO.kicad_block/`: `Module.kicadDesignBlockPlace(JSON.stringify({dir:'/tmp/cc-block/1',name:'LDO',asSheet:true,keepAnnotations:false,asGroup:false}))` answers true, the block hangs off the pointer, a press commits ONE undo step, no dialog and no pane. Needs e8's e-block-place-sch merged; without it the tool reads the pane (wrong if seen on the joined build).
@@ -108,27 +125,39 @@ syntax-check: 0 failed
 ```
 (the handover runs `all`.)
 
-## e-block-layout (DB3, K-B2): PART DONE, the Update widening held
+## e-block-layout (DB3, K-B2)
 
-Commits: kicad 8397a505 (with st-paste-e's hunks: one file); pcbjam 9183722.
+Commits: kicad 8397a505 (with st-paste-e's hunks: one file); pcbjam 9183722 (K-B2's export), c2bf8e1 (the Update widening and the marker, RULINGS 21), c6519dc (one layout report per group, summed).
 
 Kicad:
 - `include/cc_host_block_layout.h` (new): `CC_HOST_BLOCK_LAYOUT_REPORT { applied, linked, skippedNoLink, failures[{ uuid, reason }], lines }`, the slot `ccHostBlockLayoutReport()`, the RAII `CC_HOST_BLOCK_LAYOUT_SCOPE`, and `ccHostBlockLayoutLine( line )` (true when a reporter took an info bar line).
-- `pcbnew/tools/pcb_control.cpp` `PCB_CONTROL::ApplyDesignBlockLayout` (about 1510 to 1830): under `__EMSCRIPTEN__` with a reporter set, its three info bar lines become reporter lines, no `WX_PROGRESS_REPORTER` is made (so no cancel path), and its summary `HTML_MESSAGE_BOX` is replaced by filling the record (KiCad's own failure reasons, per group uuid). The work itself (RepeatLayout into ONE `sharedCommit`, "Apply design block layout to %d group(s)") is KiCad's, unchanged. With no reporter KiCad's path runs word for word (the progress condition is an `#ifdef`/`#else` pair). Recompile reach: that .cpp.
+- `pcbnew/tools/pcb_control.cpp` `PCB_CONTROL::ApplyDesignBlockLayout` (about 1510 to 1830): under `__EMSCRIPTEN__` with a reporter set, its three info bar lines become reporter lines, no `WX_PROGRESS_REPORTER` is made (so no cancel path), and its summary `HTML_MESSAGE_BOX` is replaced by filling the record (KiCad's own failure reasons, per group uuid). The work itself (RepeatLayout into ONE `sharedCommit`, "Apply design block layout to %d group(s)") is KiCad's, unchanged. With no reporter KiCad's path runs word for word (the progress condition is an `#ifdef`/`#else` pair). The tool SETS `applied`, `linked` and `skippedNoLink` per run and appends `failures`. Recompile reach: that .cpp.
 
 PCBJam:
 - `kicadDesignBlockApplyLayout( argsJson )` registered in `cc_e7_pcb` under `KICAD_MERGED_EMBIND` (merged image only), `cc_e7::blockApplyLayout`: exactly `run` (>= 0), `dir` (run folder under `/tmp/cc-blocklayout/`), `uuids` (1 to 256 distinct lower case uuids, each a group on the board, checked synchronously); false otherwise, with no board or an open in flight. On the apply coroutine: selection cleared, those groups selected (`PCB_SELECTION_TOOL::select`, as KiCad's Update PCB dialog does), `PCB_ACTIONS::applyDesignBlockLayout` under the reporter scope, selection cleared, then `<dir>/.cc-block-layout.json` last: `{"applied", "failures": [{"uuid", "reason"}], "lines"}`.
-- The block of each group is found as KiCad finds it: the group's design block link through the Design Blocks pane's libraries (`GetDesignBlock( group->GetDesignBlockLibId() )`), so the group's library row must be loaded (kicadLibsAddEntry design_block). A group placed by kicadDesignBlockPlace carries no link (see e-block-place).
+- The block of each group is found as KiCad finds it: the group's design block link through the Design Blocks pane's libraries (`GetDesignBlock( group->GetDesignBlockLibId() )`), so the group's library row must be loaded (kicadLibsAddEntry design_block). A group placed by kicadDesignBlockPlace carries the link only when the call names the block's `nickname` (e-block-place, the relay's subsection).
+- The Update widening (lease of RULINGS 21, pcbjam `wasm/bindings/pcbnew_embind.cpp`, nothing outside the leased bodies; the file gains its dated "Modified by Circuit Center Inc" line):
+  - `CC_UPDATE_ARGS` gains `transferGroups` and `applyDesignBlockLayouts` (both false by default).
+  - `pcbUpdateBoardFromSchematic` (the reader) takes run 14's seven keys, or those and BOTH `transferGroups` and `applyDesignBlockLayouts` (booleans; nine keys). Eight keys, a non boolean, or `applyDesignBlockLayouts` true with `transferGroups` false answer false with nothing queued (KiCad's dialog enables Apply design block layouts only while Keep groups is on).
+  - `ccRunBoardUpdate`: `updater.SetTransferGroups( transferGroups )`, `SetApplyDesignBlockLayouts( applyDesignBlockLayouts )` (both were hard coded false). The preview token is `ccDigest( ccUpdateToken(...) + "|g0/1" + "|b0/1" )`, so an apply whose two options differ from its preview's is stale. On an apply with `applyDesignBlockLayouts`, after `OnNetlistChanged` and `ccPlaceNewFootprints` (whose one move of the new parts beside the board stays appended to the "Update Netlist" step), each group in `updater.GetAddedGroups()` with `HasDesignBlockLink()` is selected alone and laid out by `PCB_ACTIONS::applyDesignBlockLayout` under its own `CC_HOST_BLOCK_LAYOUT_SCOPE`, as `dialog_update_pcb.cpp` 122 to 136 does (each group its own commit, as there); the per run reports are summed; the selection is cleared and the new parts selected again as `ccPlaceNewFootprints` left them; the tool's info bar lines go into `.cc-update.json` `lines` (severity info).
+  - `report.json` gains `layouts: {"applied": n, "failures": [{"uuid", "reason"}]}` whenever `transferGroups` is true (a preview: `{applied:0, failures:[]}`), and is byte for byte run 14's otherwise.
+  - Lease slot `cc_e7_lease.h`: `#include <cc_host_block_layout.h>` (header only, so occ_service compiles it too).
+- Marker `kicadBoardUpdateGroups()` (bool, always true) registered in `cc_e7_pcb` (`cc_e7::boardUpdateGroups`), in both configurations like the update export itself.
 
-HELD, reported to E0: the widening of `kicadUpdateBoardFromSchematic` (`transferGroups`, `applyDesignBlockLayouts`, the layouts' records) and its marker `kicadBoardUpdateGroups`. The lease is only the body of `pcbUpdateBoardFromSchematic` (the argument reader). The updater runs in `ccRunBoardUpdate` (pcbnew_embind.cpp about 3982, NOT leased), which hard codes `updater.SetTransferGroups( false )` and `SetApplyDesignBlockLayouts( false )` and takes `CC_UPDATE_ARGS` (about 3963, not leased); KiCad's Update dialog also lays out `updater.GetAddedGroups()` after `OnNetlistChanged` (dialog_update_pcb.cpp 122 to 136), which must go in the same runner, and the preview token (`ccUpdateToken`) should fold the two flags in. The fix needs the lease widened to `CC_UPDATE_ARGS` and `ccRunBoardUpdate` (about 15 lines: two fields, the two setters, the layout loop with the reporter scope, a `layouts` key in report.json). Not written here, and the marker not registered (the island lists the cap on the marker, so it must not exist before the widening works).
+Undo: an apply with layouts is the "Update Netlist" step plus one "Apply design block layout to 1 group(s)" step per laid out group, exactly KiCad's Update PCB dialog's result.
+
+For the island: `board.preview` and `board.update` send `transferGroups` and `applyDesignBlockLayouts` (both keys, or neither) when `Module.kicadBoardUpdateGroups` exists (cap `blockLayouts`); the answer's `report.json` then carries `layouts`.
 
 What the build train must probe:
-1. Frame pcb on blocks-small with the block row loaded and a group linked to LDO (from Update with groups once the widening lands, or a fixture board holding one): move a footprint of the group, `Module.kicadDesignBlockApplyLayout(JSON.stringify({run:1,dir:'/tmp/cc-blocklayout/1',uuids:['<group uuid>']}))` answers true; the footprint is back where the block's layout puts it; ONE undo step; record `{applied:1,failures:[],lines:[]}`; no message box.
+1. Frame pcb on blocks-small with the block row loaded and a group linked to LDO (from Update with groups, or a placement with `nickname`): move a footprint of the group, `Module.kicadDesignBlockApplyLayout(JSON.stringify({run:1,dir:'/tmp/cc-blocklayout/1',uuids:['<group uuid>']}))` answers true; the footprint is back where the block's layout puts it; ONE undo step; record `{applied:1,failures:[],lines:[]}`; no message box.
 2. A group linked to LDO_PARTIAL: record `{applied:0, failures:[{uuid, reason}]}` with KiCad's reason; no undo step.
 3. An unlinked group's uuid: `{applied:0,failures:[],lines:["No groups with a linked design block are selected."]}`.
 4. False at once: a uuid that is not a group, a repeated uuid, upper case, an empty list, `dir` outside `/tmp/cc-blocklayout/`.
-
-Checks: see the handover block at the end.
+5. `typeof Module.kicadBoardUpdateGroups === 'function'` and it answers true.
+6. Frame pcb on blocks-small, LDO placed as a sheet on the schematic and saved (its schematic group linked to the block): preview `{run:1,dir:'/tmp/cc-update/1',apply:false,replaceFootprints:true,deleteExtra:false,relinkByReference:false,token:'',transferGroups:true,applyDesignBlockLayouts:true}` answers true, `report.json` has `layouts:{applied:0,failures:[]}` and a token; the apply with that token lands LDO's footprints in ONE group with `(lib_id "blocks-small_blocks:LDO")` placed as the block's layout beside the board, `report.json` `layouts:{applied:1,failures:[]}`, undo depth +2 (Update Netlist, then the layout). Wrong if: the group's footprints are spread (the layout did not run: link or row missing), `applied` counts only the last group with two blocks placed, or a message box shows.
+7. An apply whose `transferGroups` or `applyDesignBlockLayouts` differs from its preview's answers `{error:"stale"}`.
+8. Run 14's seven key calls answer exactly as before (no `layouts` key; the token is a different hash but round trips). False at once: eight keys, `applyDesignBlockLayouts:true` with `transferGroups:false`, a non boolean of either.
+9. The island e2e `blocks-layout.spec.ts`.
 
 ## st-paste-e (K-PASTE)
 
@@ -146,6 +175,25 @@ What the build train must probe:
 2. Frame pcb, tracks with nets copied: `{"mode":"keep","clearNets":true}` pastes them with no net; `clearNets:false` keeps the nets.
 3. After it, a plain Ctrl+Shift+V (if a door reaches KiCad's own pasteSpecial) shows the dialog path again, never a stale choice (wrong if it pastes silently).
 4. False at once: `mode` `"other"`, a missing or extra key, a non boolean clearNets.
+
+## e-sheetreload (DS1, PM10)
+
+Commit: pcbjam 3c0f6ee (with the design block link). No kicad file.
+
+- `kicadDrawingSheetReload()` (bool, no arguments) registered in `cc_e7_dispatch` (`cc_e7::drawingSheetReload`): `pcbEditorActive()` -> `cc_e7::sheetReloadPcb` (`cc_e7_pcb.inc`), `schEditorActive()` -> `cc_e7::sheetReloadSch` (`cc_e7_sch.inc`), any other frame false. Each half answers false with no frame (no board) or an open in flight, else queues on the apply coroutine and answers true (the host waits for the apply queue to empty, as for every queued op; a `project.write` queued before it lands first).
+- On the coroutine, KiCad's own reload: the body of `PCB_EDIT_FRAME::LoadDrawingSheet` (`pcbnew/pcbnew_config.cpp` 44) or `SCH_EDIT_FRAME::LoadDrawingSheet` (`eeschema/eeschema_config.cpp` 83): `FILENAME_RESOLVER` over the name the document holds (`PROJECT_FILE::m_BoardDrawingSheetFile`, `SCHEMATIC_SETTINGS::m_SchDrawingSheetFileName`) with the project path and the design's embedded files, then `DS_DATA_MODEL::GetTheInstance().LoadDrawingSheet( filename, &msg )`, which loads KiCad's default sheet for an empty name and for a file that does not read, as in KiCad. The one difference from calling the method: its `ShowInfoBarError` on a failed read is not shown (the house rule: no info bar); the message is dropped.
+- `BASE_SCREEN::m_DrawingSheetFileName` is set to that name first, as each frame's `LoadProjectSettings` sets it (so the page settings and a later project save see the name the document now holds).
+- Redraw: the drawing sheet's own view item (`PCB_DRAW_PANEL_GAL::GetDrawingSheet()`, `SCH_VIEW::GetDrawingSheet()`) updated with `KIGFX::REPAINT` (`DS_PROXY_VIEW_ITEM::ViewDraw` builds its list from the model at each draw), then `Refresh()`.
+- No commit, no undo step, `OnModify` never called: the modified flag is unchanged.
+- Both halves are compiled in every configuration (the board half also in occ_service's, where nothing calls it: it uses only common and pcbnew code that image links); the export itself exists only in the merged image (the dispatcher face).
+
+For the island: `sheet.reload` calls `Module.kicadDrawingSheetReload()` (no arguments) and answers `{}` once the apply queue is empty; false means no board or schematic frame, or an open in flight. Cap `sheetReload` on the export's presence.
+
+What the build train must probe:
+1. Frame sch on ds-small: write a changed `.kicad_wks` (a new text) with `project.write`, `Module.kicadDrawingSheetReload()` answers true; after the queue empties a PDF through `project.export` carries the new text; undo depth and the modified flag unchanged. Wrong if: the PDF shows the old sheet (the name was resolved against the wrong path, or the plot reads another model), or the design reads modified.
+2. The same in frame pcb (Gerber or PDF plot with the drawing sheet).
+3. A design whose `.kicad_pro` names a sheet that is not there: answers true, the default sheet is drawn, no info bar shows.
+4. In the footprint editor, symbol editor or drawing sheet editor frame: false.
 
 ## State at the end of this seat (2026-11-18 08:20)
 
@@ -173,3 +221,29 @@ check-run15-exports: 157 names registered in the merged image (150 kicad names),
 ```
 
 Merged image only: kicadDesignBlockSave's and kicadDesignBlockPlace's board halves, kicadDesignBlockApplyLayout. New KiCad headers (no existing KiCad header changed): `include/cc_host_design_block.h`, `include/cc_host_block_layout.h`, `include/cc_paste_special.h`, `eeschema/cc_sch_design_block_write.h`, `pcbnew/cc_pcb_design_block_write.h`.
+
+## Relay (2026-11-18 09:40): e-block-layout finished, e-sheetreload, the design block link
+
+Read before writing: SEAT-RULES.md, RULINGS.md (21 leases `CC_UPDATE_ARGS` and `ccRunBoardUpdate` to this lane for the Update widening), ENGINE-AUTHORS.md, `mq.py author e7`, `mq.py unit e-block-layout`, `mq.py unit e-sheetreload`, the projects content spec (sections 6, 8.7, 8.8, the exports table). `git merge run15/main` in both worktrees first (pcbjam b341d41, kicad 4e149ff9). No fix note `e7-*.md` was open.
+
+Commits (pcbjam only; no kicad commit in this relay): c2bf8e1 (the Update widening and the marker), c6519dc (the per group reports summed: the tool sets `applied` on each run, so one scope across runs kept only the last), 3c0f6ee (kicadDrawingSheetReload and the place `nickname` key), then these notes.
+
+Exports: `kicadBoardUpdateGroups` (cc_e7_pcb, both configurations), `kicadDrawingSheetReload` (cc_e7_dispatch, halves in cc_e7_pcb and cc_e7_sch), `kicadUpdateBoardFromSchematic` widened (run 14's registration, leased bodies), `kicadDesignBlockPlace` widened (optional `nickname`). Merged image only: the export names of the dispatcher face (as for every dispatcher name), kicadDesignBlockApplyLayout, the board halves of kicadDesignBlockSave and kicadDesignBlockPlace. Reported to E0: nothing (no include path, CMake or build line; `cc_host_block_layout.h` and the drawing sheet headers are on the existing include lists).
+
+Checks after the commits (the handover's own run follows below):
+
+```
+/home/matthew/cc-wave2/bin/gate.sh scripts/kicad/syntax-check-run15.sh --kicad /home/matthew/cc-engine-wt/e7/kicad all --kicad-file pcbnew/tools/pcb_control.cpp --kicad-file eeschema/tools/sch_editor_control.cpp --kicad-file eeschema/sch_design_block_utils.cpp --kicad-file pcbnew/pcb_design_block_utils.cpp
+PASS pcbnew         pcbnew_embind.cpp subdir=pcbnew -DKICAD_MERGED_EMBIND (13029 ms)
+PASS eeschema       eeschema_embind.cpp subdir=eeschema -DKICAD_MERGED_EMBIND (12795 ms)
+PASS symedit        symedit_embind.cpp subdir=eeschema  (6973 ms)
+PASS fpedit         fpedit_embind.cpp subdir=pcbnew  (6763 ms)
+PASS dsedit         dsedit_embind.cpp subdir=pagelayout_editor  (1002 ms)
+PASS kicad_editor   kicad_editor_embind.cpp subdir=common  (5244 ms)
+PASS occ            pcbnew_embind.cpp subdir=pcbnew (12073 ms)
+PASS kicad pcbnew/tools/pcb_control.cpp (9768 ms)
+PASS kicad eeschema/tools/sch_editor_control.cpp (8505 ms)
+PASS kicad eeschema/sch_design_block_utils.cpp (5678 ms)
+PASS kicad pcbnew/pcb_design_block_utils.cpp (5442 ms)
+syntax-check: 0 failed
+```
