@@ -14,7 +14,8 @@
  * is obtained through other means (e.g., from the UI).
  *
  * Modified by Circuit Center Inc on 2026-11-18: lane e11's leased bodies, the board outputs'
- * per format 3D file check, the footprint export counting each library footprint once.
+ * per format 3D file check, the footprint export counting each library footprint once, the
+ * rules answer's solder mask figure and a pair's layers limited to the board's.
  */
 
 #ifdef __EMSCRIPTEN__
@@ -6238,6 +6239,19 @@ void ccInspectConstraints( CC_RULES_ENGINE& aEngine, BOARD_ITEM* aItem, bool aCo
     {
         c = aEngine.EvalRules( SOLDER_MASK_EXPANSION_CONSTRAINT, aItem, nullptr, UNDEFINED_LAYER,
                                nullptr );
+
+        // No rule and no local value: KiCad's engine names no figure for a track or a shape
+        // (its board setup default is given to a pad only), while the item itself uses the
+        // board setup's expansion (PCB_TRACK::GetSolderMaskExpansion,
+        // PCB_SHAPE::GetSolderMaskExpansion). Answer that figure, from the board setup, as the
+        // engine answers a pad's.
+        if( !c.m_Value.HasMin() && !c.m_Value.HasOpt() && !c.m_Value.HasMax() )
+        {
+            c.SetParentRule( nullptr );
+            c.SetName( wxS( "board setup" ) );
+            c.m_Value.SetOpt( aItem->GetBoard()->GetDesignSettings().m_SolderMaskExpansion );
+        }
+
         aOut.add( "solder_mask_expansion", "mm", c, "", UNDEFINED_LAYER );
     }
 
@@ -6342,7 +6356,11 @@ void ccReportClearance( PCB_EDIT_FRAME* aFrame, CC_RULES_ENGINE& aEngine, BOARD_
     aOut.b = b;
 
     const PCB_LAYER_ID    active = aFrame->GetActiveLayer();
-    const LSET            layerIntersection = a->GetLayerSet() & b->GetLayerSet();
+    // Only the board's enabled layers: a through hole pad's set is every copper layer KiCad
+    // knows (32), not the board's.
+    const LSET            enabled = a->GetBoard() ? a->GetBoard()->GetEnabledLayers()
+                                                  : LSET::AllLayersMask();
+    const LSET            layerIntersection = a->GetLayerSet() & b->GetLayerSet() & enabled;
     const LSET            copperIntersection = layerIntersection & LSET::AllCuMask();
     BOARD_CONNECTED_ITEM* ac = dynamic_cast<BOARD_CONNECTED_ITEM*>( a );
     BOARD_CONNECTED_ITEM* bc = dynamic_cast<BOARD_CONNECTED_ITEM*>( b );
@@ -6449,7 +6467,8 @@ void ccReportClearance( PCB_EDIT_FRAME* aFrame, CC_RULES_ENGINE& aEngine, BOARD_
         if( DRC_ENGINE::MatchDpSuffix( ac->GetNet()->GetNetname(), coupledNet, dummy )
                 && bc->GetNetname() == coupledNet )
         {
-            const LSET   dpIntersection = ac->GetLayerSet() & bc->GetLayerSet() & LSET::AllCuMask();
+            const LSET   dpIntersection = ac->GetLayerSet() & bc->GetLayerSet() & LSET::AllCuMask()
+                                          & enabled;
             PCB_LAYER_ID dpLayer = active;
 
             if( !dpIntersection.test( dpLayer ) && dpIntersection.any() )
@@ -6581,11 +6600,11 @@ void ccReportClearance( PCB_EDIT_FRAME* aFrame, CC_RULES_ENGINE& aEngine, BOARD_
 
         if( a->IsOnLayer( Edge_Cuts ) )
             reportLayers |= bFP ? LSET( { F_CrtYd, B_CrtYd } )
-                                : LSET( b->GetLayerSet() & LSET::PhysicalLayersMask() );
+                                : LSET( b->GetLayerSet() & LSET::PhysicalLayersMask() & enabled );
 
         if( b->IsOnLayer( Edge_Cuts ) )
             reportLayers |= aFP ? LSET( { F_CrtYd, B_CrtYd } )
-                                : LSET( a->GetLayerSet() & LSET::PhysicalLayersMask() );
+                                : LSET( a->GetLayerSet() & LSET::PhysicalLayersMask() & enabled );
 
         for( PCB_LAYER_ID layer : reportLayers )
         {
