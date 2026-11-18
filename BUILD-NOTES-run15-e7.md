@@ -247,3 +247,28 @@ PASS kicad eeschema/sch_design_block_utils.cpp (5678 ms)
 PASS kicad pcbnew/pcb_design_block_utils.cpp (5442 ms)
 syntax-check: 0 failed
 ```
+
+## Handover (2026-11-18 09:50)
+
+All six units of the lane done and committed: e-librows, e-block-save, e-block-place (with the `nickname` link), e-block-layout (with the Update widening and `kicadBoardUpdateGroups`), st-paste-e, e-sheetreload. Nothing held. No fix note `e7-*.md` open. After `git merge run15/main` in both worktrees (pcbjam 54c328b, kicad 638f4c3c):
+
+```
+/home/matthew/cc-wave2/bin/gate.sh scripts/kicad/syntax-check-run15.sh --kicad /home/matthew/cc-engine-wt/e7/kicad all --kicad-file pcbnew/tools/pcb_control.cpp --kicad-file eeschema/tools/sch_editor_control.cpp --kicad-file eeschema/sch_design_block_utils.cpp --kicad-file pcbnew/pcb_design_block_utils.cpp
+PASS pcbnew         pcbnew_embind.cpp subdir=pcbnew -DKICAD_MERGED_EMBIND (12413 ms)
+PASS eeschema       eeschema_embind.cpp subdir=eeschema -DKICAD_MERGED_EMBIND (12635 ms)
+PASS symedit        symedit_embind.cpp subdir=eeschema  (6924 ms)
+PASS fpedit         fpedit_embind.cpp subdir=pcbnew  (6775 ms)
+PASS dsedit         dsedit_embind.cpp subdir=pagelayout_editor  (986 ms)
+PASS kicad_editor   kicad_editor_embind.cpp subdir=common  (4937 ms)
+PASS occ            pcbnew_embind.cpp subdir=pcbnew (11763 ms)
+PASS kicad pcbnew/tools/pcb_control.cpp (9214 ms)
+PASS kicad eeschema/tools/sch_editor_control.cpp (8423 ms)
+PASS kicad eeschema/sch_design_block_utils.cpp (5744 ms)
+PASS kicad pcbnew/pcb_design_block_utils.cpp (5734 ms)
+syntax-check: 0 failed
+
+/home/matthew/cc-wave2/bin/gate.sh scripts/kicad/check-run15-exports.sh --since run15/main --kicad /home/matthew/cc-engine-wt/e7/kicad --kicad-since run15/main
+check-run15-exports: 219 names registered in the merged image (212 kicad names), 74 of 111 run 15 names, 0 failures
+```
+
+The lane's eight new names are all registered: kicadLibsRemoveEntry, kicadPathVarsSet, kicadDesignBlockSave, kicadDesignBlockPlace, kicadPasteSpecial, kicadDrawingSheetReload (cc_e7_dispatch), kicadDesignBlockApplyLayout (cc_e7_pcb, merged only), kicadBoardUpdateGroups (cc_e7_pcb).
