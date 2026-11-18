@@ -109,3 +109,61 @@ Syntax check at this commit:
 
 `/home/matthew/cc-wave2/bin/gate.sh scripts/kicad/syntax-check-run15.sh --kicad /home/matthew/cc-engine-wt/e12/kicad pcbnew`:
 `PASS pcbnew pcbnew_embind.cpp subdir=pcbnew -DKICAD_MERGED_EMBIND (11951 ms)`, `syntax-check: 0 failed`.
+
+## st-editprefs-e: sections schEditing, pcbEditing, mouse
+
+Changed `kicadSettingsGet`, `kicadSettingsSet` (registered sections, no new export). Files: pcbjam
+`wasm/bindings/cc_e12_pcb.inc` (`pcbEditing` as `kPcbEditing`, `mouse` as `kMouse`, both
+`setupOk` false; include `settings/common_settings.h`) and `wasm/bindings/cc_e12_sch.inc`
+(`schEditing` as `kSchEditing`, `mouse` as `kSchMouse`, both `setupOk` false). `mouse` is
+registered in BOTH frames over the one `COMMON_SETTINGS` of the image (`Pgm().GetCommonSettings()`),
+so `kicadSettingsSections()` lists it under board and schematic. App settings, never design
+state: no modified flag, no Board or Schematic Setup steps, no file saved (KiCad's Preferences OK
+also saves the settings files; the page keeps them per browser and sends them after each boot).
+A taken set runs the rest of Preferences' OK (`eda_base_frame.cpp` 1754): `ResetTools( REDRAW )`,
+then `Kiway().CommonSettingsChanged( 0 )` (0, not HOTKEYS_CHANGED, so a key map the page set is
+never reloaded from a file), then a repaint.
+
+Wire keys are KiCad's own JSON paths with dots; values keep KiCad's kinds, read whole, each
+enumeration only the numbers KiCad's panel offers:
+- `pcbEditing` (PCBNEW_SETTINGS, PANEL_EDIT_OPTIONS' board half): `editing.flip_left_right`,
+  `editing.esc_clears_net_highlight`, `editing.show_courtyard_collisions`,
+  `editing.magnetic_graphics`, `editing.ctrl_click_highlight`, `editing.auto_fill_zones`,
+  `editing.allow_free_pads`, `pcb_display.ratsnest_footprint`, `pcb_display.ratsnest_curved`,
+  `pcb_display.show_page_borders` (bool); `editing.magnetic_pads`, `editing.magnetic_tracks`
+  (0 none, 1 in the track tool, 2 always), `editing.track_drag_action` (0 move, 1 drag, 2 drag
+  free angle), `editing.arc_edit_mode` (0 to 2), `editing.pcb_angle_snap_mode` (0 direct, 1 45,
+  2 90); `editing.rotation_angle` (tenths of a degree, 1 to 3599);
+  `pcb_display.ratsnest_thickness` (0.5 to 10).
+- `schEditing` (EESCHEMA_SETTINGS, PANEL_EESCHEMA_EDITING_OPTIONS): `drawing.new_power_symbols`
+  (0 default, 1 global, 2 local), `drawing.line_mode` (0 free, 1 90, 2 45), `editing.arc_edit_mode`
+  (0 to 2), `drawing.default_repeat_offset_x`, `_y` (mils, plus or minus 100000),
+  `drawing.repeat_label_increment` (plus or minus 1000000), and the bools
+  `appearance.footprint_preview`, `system.never_show_rescue_dialog`, `autoplace_fields.enable`,
+  `autoplace_fields.allow_rejustify`, `autoplace_fields.align_to_grid`, `input.drag_is_move`,
+  `drawing.auto_start_wires`, `input.esc_clears_net_highlight`, `annotation.automatic`,
+  `input.allow_unconstrained_pin_swaps`. The two sheet colors are left out (colors stay the
+  viewer's).
+- `mouse` (COMMON_SETTINGS, PANEL_MOUSE_SETTINGS): `input.mouse_left` (0 select, -1 drag
+  selected, -2 drag any), `input.mouse_middle`, `input.mouse_right` (2 pan, 1 zoom, 3 none),
+  `input.motion_pan_modifier`, `input.scroll_modifier_zoom`, `input.scroll_modifier_pan_h`,
+  `input.scroll_modifier_pan_v` (0 or the wx key code of Alt, Control or Shift),
+  `input.auto_pan_acceleration`, `input.zoom_speed` (1 to 10), and the bools
+  `input.center_on_zoom`, `input.auto_pan`, `input.zoom_acceleration`, `input.zoom_speed_auto`,
+  `input.horizontal_pan`, `input.reverse_scroll_zoom`, `input.reverse_scroll_pan_h`.
+
+**What the build train must probe:**
+1. Board frame: `kicadSettingsSections()` board list has `pcbEditing` and `mouse`; schematic frame
+   list has `schEditing` and `mouse`.
+2. Board: set `pcbEditing {"editing.magnetic_pads": 0}`: get reads 0; a pointer near a pad no
+   longer snaps. Undo depth and the modified flag (title asterisk, `editsHeld`) unchanged. Wrong:
+   the board reads modified (setupOk not honored).
+3. Schematic: set `schEditing {"drawing.line_mode": 0}`: a new wire takes free angles.
+4. Either frame: set `mouse {"input.mouse_middle": 1}`: a middle drag zooms in both frames (one
+   object). Set `{"input.mouse_middle": 0}`, `{"input.zoom_speed": 11}`, `{"input.zoomspeed": 5}`:
+   bad_args.
+
+Syntax check at this commit (the lane's full faces):
+`/home/matthew/cc-wave2/bin/gate.sh scripts/kicad/syntax-check-run15.sh --kicad /home/matthew/cc-engine-wt/e12/kicad all`:
+`PASS pcbnew (11213 ms)`, `PASS eeschema (11440 ms)`, `PASS symedit (7048 ms)`, `PASS fpedit (6779 ms)`,
+`PASS dsedit (1000 ms)`, `PASS kicad_editor (4615 ms)`, `PASS occ (11128 ms)`, `syntax-check: 0 failed`.

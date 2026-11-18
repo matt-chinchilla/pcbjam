@@ -13,6 +13,7 @@
 #include <layer_pairs.h>
 #include <pcbnew_settings.h>
 #include <router/pns_routing_settings.h>
+#include <settings/common_settings.h>
 
 namespace cc_e12
 {
@@ -454,6 +455,200 @@ bool layerPairsSet( PCB_EDIT_FRAME* aFrame, const json& aValue, bool aDryRun, st
     return true;
 }
 
+// ── pcbEditing and mouse (st-editprefs-e, SE39 and PE51): editor preferences, KiCad's
+// Preferences panels PANEL_EDIT_OPTIONS (the board half, PCBNEW_SETTINGS) and
+// PANEL_MOUSE_SETTINGS (COMMON_SETTINGS, shared by every frame of the image). App settings, not
+// design settings: registered with setupOk false, so the board is never marked modified; the
+// page keeps them per browser and sends them after each boot. Wire keys are KiCad's own JSON
+// paths with dots ("editing.magnetic_pads"); a value keeps its JSON kind and an enumeration
+// takes only the numbers KiCad's panel offers. A taken set runs what Preferences' OK runs
+// (ResetTools REDRAW, then Kiway CommonSettingsChanged) without saving any file.
+
+struct PREF_KEY
+{
+    const char*      wire;
+    char             kind;   // 'b' bool, 'i' one of ints, 'r' an int in [lo, hi], 'd' a number in [lo, hi]
+    std::vector<int> ints;
+    double           lo = 0.0;
+    double           hi = 0.0;
+};
+
+const std::vector<PREF_KEY>& pcbEditingKeys()
+{
+    static const std::vector<PREF_KEY> keys = {
+        { "editing.flip_left_right", 'b', {} },
+        { "editing.esc_clears_net_highlight", 'b', {} },
+        { "editing.show_courtyard_collisions", 'b', {} },
+        { "editing.magnetic_graphics", 'b', {} },
+        { "editing.magnetic_pads", 'i', { 0, 1, 2 } },
+        { "editing.magnetic_tracks", 'i', { 0, 1, 2 } },
+        { "editing.track_drag_action", 'i', { 0, 1, 2 } },
+        { "editing.arc_edit_mode", 'i', { 0, 1, 2 } },
+        { "editing.ctrl_click_highlight", 'b', {} },
+        { "editing.pcb_angle_snap_mode", 'i', { 0, 1, 2 } },
+        { "editing.auto_fill_zones", 'b', {} },
+        { "editing.allow_free_pads", 'b', {} },
+        { "editing.rotation_angle", 'r', {}, 1, 3599 },   // tenths of a degree
+        { "pcb_display.ratsnest_footprint", 'b', {} },
+        { "pcb_display.ratsnest_curved", 'b', {} },
+        { "pcb_display.ratsnest_thickness", 'd', {}, 0.5, 10.0 },
+        { "pcb_display.show_page_borders", 'b', {} }
+    };
+    return keys;
+}
+
+const std::vector<PREF_KEY>& mouseKeys()
+{
+    // MOUSE_DRAG_ACTION as the file stores it: DRAG_ANY -2, DRAG_SELECTED -1, SELECT 0, ZOOM 1,
+    // PAN 2, NONE 3; modifiers 0 or a wx key code.
+    static const std::vector<PREF_KEY> keys = {
+        { "input.mouse_left", 'i', { 0, -1, -2 } },
+        { "input.mouse_middle", 'i', { 2, 1, 3 } },
+        { "input.mouse_right", 'i', { 2, 1, 3 } },
+        { "input.motion_pan_modifier", 'i', { 0, WXK_ALT, WXK_CONTROL, WXK_SHIFT } },
+        { "input.scroll_modifier_zoom", 'i', { 0, WXK_ALT, WXK_CONTROL, WXK_SHIFT } },
+        { "input.scroll_modifier_pan_h", 'i', { 0, WXK_ALT, WXK_CONTROL, WXK_SHIFT } },
+        { "input.scroll_modifier_pan_v", 'i', { 0, WXK_ALT, WXK_CONTROL, WXK_SHIFT } },
+        { "input.center_on_zoom", 'b', {} },
+        { "input.auto_pan", 'b', {} },
+        { "input.auto_pan_acceleration", 'r', {}, 1, 10 },
+        { "input.zoom_acceleration", 'b', {} },
+        { "input.zoom_speed", 'r', {}, 1, 10 },
+        { "input.zoom_speed_auto", 'b', {} },
+        { "input.horizontal_pan", 'b', {} },
+        { "input.reverse_scroll_zoom", 'b', {} },
+        { "input.reverse_scroll_pan_h", 'b', {} }
+    };
+    return keys;
+}
+
+CC_PCB_JSON_SECTION prefSection( JSON_SETTINGS* aSettings, const std::vector<PREF_KEY>& aKeys )
+{
+    CC_PCB_JSON_SECTION section;
+    section.settings = aSettings;
+
+    for( const PREF_KEY& key : aKeys )
+    {
+        std::string pointer = std::string( "/" ) + key.wire;
+        std::replace( pointer.begin(), pointer.end(), '.', '/' );
+        section.keys.emplace_back( key.wire, pointer );
+    }
+
+    return section;
+}
+
+/** aValue read whole against aKeys into a patch of KiCad's kinds; false on any other shape. */
+bool prefPatch( const json& aValue, const std::vector<PREF_KEY>& aKeys, json& aPatch )
+{
+    if( !aValue.is_object() || aValue.empty() )
+        return false;
+
+    for( const auto& [name, v] : aValue.items() )
+    {
+        auto key = std::find_if( aKeys.begin(), aKeys.end(),
+                                 [&]( const PREF_KEY& aKey ) { return name == aKey.wire; } );
+
+        if( key == aKeys.end() )
+            return false;
+
+        if( key->kind == 'b' )
+        {
+            if( !v.is_boolean() )
+                return false;
+
+            aPatch[name] = v.get<bool>();
+        }
+        else if( key->kind == 'd' )
+        {
+            if( !v.is_number() || !std::isfinite( v.get<double>() ) || v.get<double>() < key->lo
+                    || v.get<double>() > key->hi )
+            {
+                return false;
+            }
+
+            aPatch[name] = v.get<double>();
+        }
+        else
+        {
+            if( !v.is_number_integer() )
+                return false;
+
+            const long long n = v.get<long long>();
+
+            if( key->kind == 'i' ? std::find( key->ints.begin(), key->ints.end(), n ) == key->ints.end()
+                                 : ( n < (long long) key->lo || n > (long long) key->hi ) )
+            {
+                return false;
+            }
+
+            aPatch[name] = (int) n;
+        }
+    }
+
+    return true;
+}
+
+/** Preferences' OK steps, no file written: the tools redraw, every frame re-reads the input. */
+void prefsChanged( PCB_EDIT_FRAME* aFrame )
+{
+    if( TOOL_MANAGER* tools = aFrame->GetToolManager() )
+        tools->ResetTools( TOOL_BASE::REDRAW );
+
+    aFrame->Kiway().CommonSettingsChanged( 0 );
+    aFrame->GetCanvas()->GetView()->UpdateAllItems( KIGFX::REPAINT );
+    aFrame->GetCanvas()->Refresh();
+}
+
+json pcbEditingGet( PCB_EDIT_FRAME* aFrame )
+{
+    PCBNEW_SETTINGS* cfg = aFrame->GetPcbNewSettings();
+    return cfg ? ccPcbJsonGet( prefSection( cfg, pcbEditingKeys() ) ) : json();
+}
+
+bool pcbEditingSet( PCB_EDIT_FRAME* aFrame, const json& aValue, bool aDryRun, std::string& aError,
+                    std::string& aMessage, json& aRecord )
+{
+    PCBNEW_SETTINGS* cfg = aFrame->GetPcbNewSettings();
+    json             patch = json::object();
+
+    if( !cfg || !prefPatch( aValue, pcbEditingKeys(), patch ) )
+        return false;
+
+    if( aDryRun )
+        return true;
+
+    if( !ccPcbJsonSet( prefSection( cfg, pcbEditingKeys() ), patch ) )
+        return false;
+
+    prefsChanged( aFrame );
+    return true;
+}
+
+json mouseGet( PCB_EDIT_FRAME* aFrame )
+{
+    COMMON_SETTINGS* cfg = Pgm().GetCommonSettings();
+    return cfg ? ccPcbJsonGet( prefSection( cfg, mouseKeys() ) ) : json();
+}
+
+bool mouseSet( PCB_EDIT_FRAME* aFrame, const json& aValue, bool aDryRun, std::string& aError,
+               std::string& aMessage, json& aRecord )
+{
+    COMMON_SETTINGS* cfg = Pgm().GetCommonSettings();
+    json             patch = json::object();
+
+    if( !cfg || !prefPatch( aValue, mouseKeys(), patch ) )
+        return false;
+
+    if( aDryRun )
+        return true;
+
+    if( !ccPcbJsonSet( prefSection( cfg, mouseKeys() ), patch ) )
+        return false;
+
+    prefsChanged( aFrame );
+    return true;
+}
+
 // ── origins (st-origins-e, PE8): the board's grid origin and drill (aux) origin, mm, as
 // PCB_CONTROL::DoSetGridOrigin and BOARD_EDITOR_CONTROL::DoSetDrillOrigin set them ({x: 0,
 // y: 0} is KiCad's Reset). {grid_origin?: {x, y}, aux_origin?: {x, y}}. The two origin markers
@@ -560,6 +755,9 @@ bool stackupLayersSet( PCB_EDIT_FRAME* aFrame, const json& aValue, bool aDryRun,
 const bool kRouter = ccRegisterPcbSection( { "router", "pcb", &pcb::routerGet, &pcb::routerSet } );
 const bool kLayerPairs = ccRegisterPcbSection( { "layerPairs", "pcb", &pcb::layerPairsGet, &pcb::layerPairsSet } );
 const bool kOrigins = ccRegisterPcbSection( { "origins", "pcb", &pcb::originsGet, &pcb::originsSet } );
+const bool kPcbEditing = ccRegisterPcbSection( { "pcbEditing", "pcb", &pcb::pcbEditingGet, &pcb::pcbEditingSet,
+                                                 false } );
+const bool kMouse = ccRegisterPcbSection( { "mouse", "pcb", &pcb::mouseGet, &pcb::mouseSet, false } );
 const bool kStackupLayers = ccRegisterPcbSection( { "stackupLayers", "pcb", &pcb::stackupLayersGet,
                                                     &pcb::stackupLayersSet } );
 } // namespace cc_e12
