@@ -264,3 +264,9 @@ syntax-check: 0 failed
 ```
 
 Export check: `scripts/kicad/check-run15-exports.sh --since run15/main --kicad /home/matthew/cc-engine-wt/e1/kicad --kicad-since run15/main`: `168 names registered in the merged image (161 kicad names), 23 of 110 run 15 names, 0 failures`.
+
+## Handover (every unit of the lane done)
+
+Both worktrees hold `run15/main` (pcbjam 48e664e, kicad caf17fbe: `git merge run15/main` says already up to date) and are clean. The `all` syntax check and the export check above ran on the final code of both branches: `syntax-check: 0 failed` (eleven PASS lines above), `0 failures`.
+
+Lane units: m1x-e1, st-hold-e, m1-e, m1x-e2 (first seat), m12-e, st-keys-e, m6-e3 (relay seat). Merged image only: kicadSelectionFilterGet, kicadSelectionFilterSet halves (and every dispatcher export by its TU). Reported to E0: the two table tools' `ExportTableToCSV` keep KiCad's own copy of the CSV builder (`sch_edit_table_tool.cpp`, `pcb_edit_table_tool.cpp` belong to no lane); `CcTableCsvText` is the one builder `kicadTableCsv` uses.
