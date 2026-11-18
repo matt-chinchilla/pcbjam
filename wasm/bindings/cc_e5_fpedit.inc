@@ -43,6 +43,8 @@
 #include <wildcards_and_files_ext.h>
 #include <zone.h>
 
+#include "cc_item_shape.h"
+
 namespace cc_e5
 {
 // ── fp-e7: footprint files to KiCad's text (kicadFootprintConvert, the footprint editor half) ──
@@ -1733,6 +1735,24 @@ bool fpEditPlotSvg( std::string aArgsJson )
 
     return true;
 }
+
+// ── fp-e4b: the shape kinds (no export: the item exports dispatch to them) ─────────────────
+
+/** The shape, dimension, zone, image and point rows of the item kind table (registered once). */
+const bool kShapeKindsRegistered =
+        ( cc_fpitems::ccRegisterItemKind( { "shape", &fp::shapekind::kindGet,
+                                             &fp::shapekind::kindSet, &fp::shapekind::addShape } ),
+          cc_fpitems::ccRegisterItemKind( { "dimension", &fp::shapekind::kindGet,
+                                             &fp::shapekind::kindSet,
+                                             &fp::shapekind::addDimension } ),
+          cc_fpitems::ccRegisterItemKind( { "zone", &fp::shapekind::kindGet,
+                                             &fp::shapekind::kindSet, &fp::shapekind::addZone } ),
+          cc_fpitems::ccRegisterItemKind( { "image", &fp::shapekind::kindGet,
+                                             &fp::shapekind::kindSet, &fp::shapekind::addImage } ),
+          cc_fpitems::ccRegisterItemKind( { "point", &fp::shapekind::kindGet,
+                                             &fp::shapekind::kindSet, &fp::shapekind::addPoint } ),
+          true );
+
 } // namespace cc_e5
 
 EMSCRIPTEN_BINDINGS( cc_e5_fpedit )
