@@ -89,3 +89,54 @@ Syntax check (from this worktree, kicad worktree `/home/matthew/cc-engine-wt/e12
 at this commit: `PASS pcbnew pcbnew_embind.cpp subdir=pcbnew -DKICAD_MERGED_EMBIND (14076 ms)`,
 `syntax-check: 0 failed`. The first try refused `ReCreateAuxiliaryToolbar` (protected), removed.
 No header change, no include path, no CMake or build script line, no new export.
+
+## st-routing-e: sections router and layerPairs
+
+Changed `kicadSettingsGet`, `kicadSettingsSet` (two registered sections, no new export). File:
+pcbjam `wasm/bindings/cc_e12_pcb.inc` (includes `layer_pairs.h`, `pcbnew_settings.h`,
+`router/pns_routing_settings.h`, all in the board TU's include path). Both register with
+`setupOk` true, so a taken set runs Board Setup's OK steps and lo-e3s-e's tool reset (no second
+reset here).
+
+**router** (`kRouter`). The router's own settings are `PCBNEW_SETTINGS::m_PnsSettings`
+(`tools.pns`), the object the live router holds by pointer (`PNS_TOOL_BASE::Reset` calls
+`LoadSettings` with it; the router menu and DIALOG_PNS_SETTINGS edit it in place). When the router
+has not run yet the object is made exactly as the router tool makes it. Get: KiCad's JSON keys
+`mode` (0 highlight collisions, 1 shove, 2 walk around), `effort` (0 low, 1 medium, 2 full),
+`remove_loops`, `smart_pads`, `shove_vias`, `suggest_finish`, `follow_mouse`, `free_angle_mode`,
+`snap_to_tracks`, `snap_to_pads`, `optimize_dragged_track`, `auto_posture`, `fix_all_segments`
+(booleans), read and written through the object's JSON (`Store`, the patch, `Load`, run 14's
+`ccPcbJsonGet` and `ccPcbJsonSet`); plus ours from BOARD_DESIGN_SETTINGS:
+`currentTrack {index, custom, width, customWidth}`, `currentVia {index, custom, diameter, drill,
+customDiameter, customDrill}`, `currentDiffPair {index, custom, width, gap, viaGap, customWidth,
+customGap, customViaGap}` (mm; `width`, `diameter`, `drill`, `gap`, `viaGap` are the CURRENT
+figures and read only; `index` into the board's predefined list, 0 the net class value; `custom`
+of track and via is ONE flag in KiCad, `UseCustomTrackViaSize`). Set: any of the keys; mode and
+effort 0 to 2; a current object takes `index`, `custom` and its `custom*` numbers (0.001 to 100
+mm), applied in KiCad's order (the index setter clears custom, so index, then numbers, then
+custom).
+
+**layerPairs** (`kLayerPairs`). `PCB_BASE_EDIT_FRAME::GetLayerPairSettings()`. Get
+`{pairs: [{top, bottom, enabled, name}], current: {top, bottom}}` (layers by file name, `name` ""
+for none). Set `{pairs?, current?}`: `pairs` replaces the list whole through `SetLayerPairs`
+(KiCad drops a repeated pair; at most 256 rows; each row `top`, `bottom`, optional `enabled`
+default true and `name` up to 128), `current` through `SetCurrentLayerPair`; layers must be two
+different copper layers the board enables. KiCad's own queued events write the project file's
+`m_LayerPairInfos` and the screen's route layers.
+
+**What the build train must probe (Glasgow, board frame console):**
+1. `kicadSettingsSections()` lists `router` and `layerPairs`.
+2. `kicadSettingsGet('router')` answers the 13 keys and the three current objects; mode 2 on a
+   fresh engine (KiCad's default walk around). Set `{mode:1}` then get reads 1; press X and route:
+   the router shoves. Wrong: the get still reads the old mode, or the route still walks around.
+3. Set `{currentTrack:{customWidth:0.4, custom:true}}`: get reads `currentTrack.width` 0.4 and
+   `currentVia.custom` true (one flag); a new track is 0.4 mm. Set `{currentTrack:{index:0}}`:
+   custom false again. Set `{mode:3}`, `{currentTrack:{index:999}}`, `{shove_vias:1}`: bad_args.
+4. `kicadSettingsSet` layerPairs `{pairs:[{top:'F.Cu', bottom:'In1.Cu', name:'Top pair'}],
+   current:{top:'F.Cu', bottom:'In1.Cu'}}`: get reads the one pair and the current; the undo depth
+   did not move. `{current:{top:'F.Cu', bottom:'F.Cu'}}` and a layer the board does not enable:
+   bad_args.
+
+Syntax check at this commit:
+`/home/matthew/cc-wave2/bin/gate.sh scripts/kicad/syntax-check-run15.sh --kicad /home/matthew/cc-engine-wt/e12/kicad pcbnew`:
+`PASS pcbnew pcbnew_embind.cpp subdir=pcbnew -DKICAD_MERGED_EMBIND (12064 ms)`, `syntax-check: 0 failed`.
