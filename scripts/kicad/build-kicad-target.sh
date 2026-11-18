@@ -33,6 +33,10 @@
 # pcbnew) and dsedit_embind.cpp (include subdir pagelayout_editor), and compile_embind_tu adds
 # the include subdir's dialogs and tools folders at the END of its list (an include that
 # resolved before resolves the same way). The Pyodide comment of step 7.1 is reworded.
+#
+# Modified by Circuit Center Inc on 2026-11-18: compile_embind_tu also takes
+# thirdparty/dxflib_qcad at the end of its list (fp-e8's Import Graphics reaches KiCad's DXF
+# importer header from the bindings).
 
 set -e
 
@@ -639,6 +643,9 @@ compile_embind_tu() {
     # The app's dialogs and tools folders (engine run 15: the drawing sheet editor's frame and
     # the host asks reach into them). Last, so an include that resolved before still does.
     _includes+=" -I${KICAD_DIR}/${_subdir}/dialogs -I${KICAD_DIR}/${_subdir}/tools"
+    # dxflib (KiCad's DXF reader): common/import_gfx/dxf_import_plugin.h includes
+    # <dl_creationadapter.h> (engine run 15, fp-e8's Import Graphics). Last, as above.
+    _includes+=" -I${KICAD_DIR}/thirdparty/dxflib_qcad"
 
     # KiCad requires C++20 for concepts
     em++ -std=c++20 -c ${EXTRA_FLAGS} ${KICAD_TU_ABI_FLAGS} ${WX_CXXFLAGS} ${_defines} ${_includes} "${_src}" -o "${_obj}"
