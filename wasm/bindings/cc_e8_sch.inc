@@ -20,6 +20,8 @@
 #include <reference_image.h>
 #include <bitmap_base.h>
 #include <tools/sch_item_host.h>
+#include <backannotate.h>
+#include <reporter.h>
 #include <wx/base64.h>
 #include <wx/mstream.h>
 
@@ -1520,6 +1522,831 @@ bool kicadHostSchItems()
     return true;
 }
 
+
+// ── m9-e: sheet pins against hierarchical labels (cap syncPins) ───────────────────────────
+
+namespace pins
+{
+namespace cs = cc_symedit;
+
+constexpr size_t PAIRS_MAX = 4096;
+constexpr size_t ACTIONS_MAX = 4096;
+constexpr size_t NAMES_MAX = 64;
+constexpr const char* PINS_ROOT = "/tmp/cc-sheet-pins/";
+
+/** A sheet instance: the sheet, the path it sits on and its own instance path. */
+struct SHEET_AT
+{
+    SCH_SHEET*     sheet = nullptr;
+    SCH_SHEET_PATH parent;
+    SCH_SHEET_PATH instance;
+};
+
+std::vector<SHEET_AT> sheetInstances( SCH_EDIT_FRAME* aFrame )
+{
+    std::vector<SHEET_AT> out;
+
+    for( const SCH_SHEET_PATH& path : aFrame->Schematic().Hierarchy() )
+    {
+        if( path.size() < 2 || !path.Last() || !path.Last()->GetScreen() )
+            continue;
+
+        SHEET_AT at;
+        at.sheet = path.Last();
+        at.instance = path;
+        at.parent = path;
+        at.parent.pop_back();
+        out.push_back( at );
+    }
+
+    return out;
+}
+
+/** The sheet's hierarchical labels, one per name (the first), in KiCad's natural order. */
+std::vector<SCH_HIERLABEL*> uniqueLabels( SCH_SHEET* aSheet )
+{
+    std::vector<SCH_HIERLABEL*> labels;
+    std::set<wxString>          names;
+
+    for( SCH_ITEM* item : aSheet->GetScreen()->Items().OfType( SCH_HIER_LABEL_T ) )
+    {
+        SCH_HIERLABEL* label = static_cast<SCH_HIERLABEL*>( item );
+
+        if( names.insert( label->GetText() ).second )
+            labels.push_back( label );
+    }
+
+    std::sort( labels.begin(), labels.end(),
+               []( const SCH_HIERLABEL* a, const SCH_HIERLABEL* b )
+               {
+                   return StrNumCmp( a->GetText(), b->GetText(), true ) < 0;
+               } );
+
+    return labels;
+}
+
+/**
+ * Pins against labels by name: PANEL_SYNC_SHEET_PINS::UpdateForms' pairing (same name and
+ * shape: associated), then a label and a pin of the same name whose shapes differ (one row,
+ * the shapes shown apart), then the singles.
+ */
+json pairsOf( SCH_SHEET* aSheet, bool& aTruncated )
+{
+    std::vector<SCH_HIERLABEL*> labels = uniqueLabels( aSheet );
+    std::vector<SCH_SHEET_PIN*> pins = aSheet->GetPins();
+    std::vector<std::pair<SCH_HIERLABEL*, SCH_SHEET_PIN*>> rows;
+    std::vector<SCH_HIERLABEL*> unmatched;
+
+    for( SCH_HIERLABEL* label : labels )
+    {
+        auto it = std::find_if( pins.begin(), pins.end(),
+                                [&]( SCH_SHEET_PIN* p )
+                                {
+                                    return p->GetText() == label->GetText()
+                                           && p->GetShape() == label->GetShape();
+                                } );
+
+        if( it != pins.end() )
+        {
+            rows.emplace_back( label, *it );
+            pins.erase( it );
+        }
+        else
+        {
+            unmatched.push_back( label );
+        }
+    }
+
+    for( SCH_HIERLABEL* label : unmatched )
+    {
+        auto it = std::find_if( pins.begin(), pins.end(),
+                                [&]( SCH_SHEET_PIN* p ) { return p->GetText() == label->GetText(); } );
+
+        if( it != pins.end() )
+        {
+            rows.emplace_back( label, *it );
+            pins.erase( it );
+        }
+        else
+        {
+            rows.emplace_back( label, nullptr );
+        }
+    }
+
+    for( SCH_SHEET_PIN* pin : pins )
+        rows.emplace_back( nullptr, pin );
+
+    json out = json::array();
+
+    for( const auto& [label, pin] : rows )
+    {
+        if( out.size() >= PAIRS_MAX )
+        {
+            aTruncated = true;
+            break;
+        }
+
+        json r;
+        r["name"] = cs::utf8( label ? label->GetText() : pin->GetText() );
+        r["pin"] = pin ? json( cs::utf8( pin->m_Uuid.AsString() ) ) : json( nullptr );
+        r["label"] = label ? json( cs::utf8( label->m_Uuid.AsString() ) ) : json( nullptr );
+        r["pinShape"] = pin ? json( cs::nameOf( sch::PORT_SHAPES, pin->GetShape(), "passive" ) )
+                            : json( nullptr );
+        r["labelShape"] = label ? json( cs::nameOf( sch::PORT_SHAPES, label->GetShape(), "passive" ) )
+                                : json( nullptr );
+        out.push_back( r );
+    }
+
+    return out;
+}
+
+/** The sheet pin whose uuid is aUuid, anywhere in the design, with the path its sheet sits on. */
+SCH_SHEET_PIN* findPin( SCH_EDIT_FRAME* aFrame, const std::string& aUuid, SCH_SHEET_PATH& aParent )
+{
+    if( !isLowerUuid( aUuid ) )
+        return nullptr;
+
+    const KIID id( aUuid );
+
+    for( const SHEET_AT& at : sheetInstances( aFrame ) )
+    {
+        for( SCH_SHEET_PIN* pin : at.sheet->GetPins() )
+        {
+            if( pin->m_Uuid == id )
+            {
+                aParent = at.parent;
+                return pin;
+            }
+        }
+    }
+
+    return nullptr;
+}
+
+/** The hierarchical label aUuid on the sheet path aSheetPath. */
+SCH_HIERLABEL* findLabel( SCH_EDIT_FRAME* aFrame, const std::string& aUuid,
+                          const std::string& aSheetPath, SCH_SHEET_PATH& aPath )
+{
+    sch::ITEM_HIT hit = sch::findItem( aFrame, aUuid, aSheetPath );
+
+    if( !hit.item || hit.item->Type() != SCH_HIER_LABEL_T || aSheetPath.empty() )
+        return nullptr;
+
+    aPath = hit.path;
+    return static_cast<SCH_HIERLABEL*>( hit.item );
+}
+
+struct SYNC_ACTION
+{
+    std::string                     op;
+    std::string                     uuid;
+    std::string                     sheetPath;
+    std::optional<wxString>         to;
+    std::optional<LABEL_FLAG_SHAPE> shape;
+};
+
+bool readAction( const json& aAction, SYNC_ACTION& aOut )
+{
+    if( !aAction.is_object() || !aAction.contains( "op" ) || !aAction["op"].is_string() )
+        return false;
+
+    aOut.op = aAction["op"].get<std::string>();
+
+    const bool onPin = aOut.op == "renamePin" || aOut.op == "shapePin" || aOut.op == "removePin";
+    const bool onLabel = aOut.op == "renameLabel" || aOut.op == "shapeLabel" || aOut.op == "removeLabel";
+
+    if( !onPin && !onLabel )
+        return false;
+
+    const char* idKey = onPin ? "pin" : "label";
+    const bool  hasTo = aOut.op != "removePin" && aOut.op != "removeLabel";
+
+    std::vector<const char*> keys = { "op", idKey };
+
+    if( onLabel )
+        keys.push_back( "sheetPath" );
+
+    if( hasTo )
+        keys.push_back( "to" );
+
+    if( aAction.size() != keys.size() )
+        return false;
+
+    for( const char* k : keys )
+    {
+        if( !aAction.contains( k ) )
+            return false;
+    }
+
+    if( !aAction[idKey].is_string() || !isLowerUuid( aAction[idKey].get<std::string>() ) )
+        return false;
+
+    aOut.uuid = aAction[idKey].get<std::string>();
+
+    if( onLabel )
+    {
+        if( !aAction["sheetPath"].is_string() || aAction["sheetPath"].get<std::string>().empty() )
+            return false;
+
+        aOut.sheetPath = aAction["sheetPath"].get<std::string>();
+    }
+
+    if( aOut.op == "renamePin" || aOut.op == "renameLabel" )
+    {
+        if( !( aOut.to = cs::textOf( aAction["to"], 1, cs::TEXT_MAX ) ) )
+            return false;
+    }
+    else if( hasTo )
+    {
+        if( !( aOut.shape = cs::valueOf( sch::PORT_SHAPES, aAction["to"] ) ) )
+            return false;
+    }
+
+    return true;
+}
+
+/** Every action as ONE commit "Synchronize sheet pins"; record sheet-pins.json last. */
+void runApply( const std::string& aDir, const std::vector<SYNC_ACTION>& aActions )
+{
+    SCH_EDIT_FRAME* fr = schFrame();
+    int             applied = 0;
+
+    ensureRunDir( aDir );
+
+    if( fr )
+    {
+        SCH_COMMIT commit( fr );
+        std::vector<std::pair<SCH_SHEET*, SCH_SHEET_PIN*>> pinsToRemove;
+        std::set<SCH_ITEM*> removed;
+
+        for( const SYNC_ACTION& a : aActions )
+        {
+            if( a.op == "renamePin" || a.op == "shapePin" || a.op == "removePin" )
+            {
+                SCH_SHEET_PATH parent;
+                SCH_SHEET_PIN* pin = findPin( fr, a.uuid, parent );
+
+                if( !pin || removed.count( pin ) )
+                    continue;
+
+                SCH_SHEET* sheet = static_cast<SCH_SHEET*>( pin->GetParent() );
+                commit.Modify( sheet, parent.LastScreen() );
+
+                if( a.op == "renamePin" )
+                    pin->SetText( *a.to );
+                else if( a.op == "shapePin" )
+                    pin->SetShape( *a.shape );
+                else
+                {
+                    pinsToRemove.emplace_back( sheet, pin );
+                    removed.insert( pin );
+                }
+
+                ++applied;
+            }
+            else
+            {
+                SCH_SHEET_PATH path;
+                SCH_HIERLABEL* label = findLabel( fr, a.uuid, a.sheetPath, path );
+
+                if( !label || removed.count( label ) )
+                    continue;
+
+                if( a.op == "removeLabel" )
+                {
+                    commit.Remove( label, path.LastScreen() );
+                    removed.insert( label );
+                }
+                else
+                {
+                    commit.Modify( label, path.LastScreen() );
+
+                    if( a.op == "renameLabel" )
+                        label->SetText( *a.to );
+                    else
+                        label->SetShape( *a.shape );
+                }
+
+                ++applied;
+            }
+        }
+
+        // SCH_EDIT_TOOL::DoDelete's way with a sheet pin: the sheet staged, the pin taken off it.
+        for( auto& [sheet, pin] : pinsToRemove )
+            sheet->RemovePin( pin );
+
+        if( !commit.Empty() )
+            commit.Push( _( "Synchronize sheet pins" ) );
+
+        fr->GetCanvas()->Refresh();
+    }
+
+    json body;
+    body["applied"] = applied;
+    body["depth"] = fr ? (int) fr->GetUndoCommandCount() : 0;
+    writeRunDone( aDir, "sheet-pins.json", body );
+}
+
+} // namespace pins
+
+// syncPins: {"sheets"?: [{"uuid", "sheetPath"}]} (none: every sheet instance), sheetPath the
+// path the sheet sits on. Answers {"sheets": SheetPinsRow[], "truncated"}: each instance's
+// pins against its own file's hierarchical labels, paired by name. "" for any other JSON, no
+// frame or an open in flight. A read.
+std::string kicadSheetPinsGet( std::string aArgsJson )
+{
+    SCH_EDIT_FRAME* fr = schFrame();
+
+    if( !fr || pcbjam_open::busy() )
+        return "";
+
+    json args = json::parse( aArgsJson.empty() ? std::string( "{}" ) : aArgsJson, nullptr,
+                             /*allow_exceptions*/ false );
+
+    if( args.is_discarded() || !args.is_object() || !cc_symedit::onlyKeys( args, { "sheets" } ) )
+        return "";
+
+    std::set<std::pair<std::string, std::string>> wanted;
+
+    if( args.contains( "sheets" ) )
+    {
+        if( !args["sheets"].is_array() || args["sheets"].empty() || args["sheets"].size() > 4096 )
+            return "";
+
+        for( const json& s : args["sheets"] )
+        {
+            if( !cc_symedit::onlyKeys( s, { "uuid", "sheetPath" } )
+                    || !cc_symedit::hasKeys( s, { "uuid", "sheetPath" } ) || !s["uuid"].is_string()
+                    || !s["sheetPath"].is_string() || !isLowerUuid( s["uuid"].get<std::string>() ) )
+            {
+                return "";
+            }
+
+            wanted.emplace( s["uuid"].get<std::string>(), s["sheetPath"].get<std::string>() );
+        }
+    }
+
+    json rows = json::array();
+    bool truncated = false;
+
+    try
+    {
+        for( const pins::SHEET_AT& at : pins::sheetInstances( fr ) )
+        {
+            const std::string uuid = cc_symedit::utf8( at.sheet->m_Uuid.AsString() );
+            const std::string parent = cc_symedit::utf8( at.parent.PathAsString() );
+
+            if( !wanted.empty() && !wanted.count( { uuid, parent } ) )
+                continue;
+
+            json r;
+            r["sheet"] = uuid;
+            r["sheetPath"] = parent;
+            r["name"] = cc_symedit::utf8( at.sheet->GetName() );
+            r["file"] = cc_symedit::utf8( at.sheet->GetFileName() );
+            r["pairs"] = pins::pairsOf( at.sheet, truncated );
+            rows.push_back( r );
+        }
+    }
+    catch( ... )
+    {
+        return "";
+    }
+
+    json out;
+    out["sheets"] = rows;
+    out["truncated"] = truncated;
+    return out.dump( -1, ' ', false, json::error_handler_t::replace );
+}
+
+// syncPins: {"run", "dir": "/tmp/cc-sheet-pins/<n>", "actions": SyncAction[] (1 to 4,096)}.
+// Every pin and label named must exist (a label on its sheetPath). False (nothing queued) for
+// any other JSON; true once ONE commit "Synchronize sheet pins" is queued on the apply
+// coroutine, which writes sheet-pins.json {applied, depth} last.
+bool kicadSheetPinsApply( std::string aArgsJson )
+{
+    SCH_EDIT_FRAME* fr = schFrame();
+
+    if( !fr || pcbjam_open::busy() )
+        return false;
+
+    json args = json::parse( aArgsJson, nullptr, /*allow_exceptions*/ false );
+
+    if( args.is_discarded() || !args.is_object() || args.size() != 3 || !args.contains( "run" )
+            || !args.contains( "dir" ) || !args.contains( "actions" )
+            || !args["run"].is_number_integer() || args["run"].get<long long>() < 0
+            || !args["dir"].is_string() || !args["actions"].is_array()
+            || args["actions"].empty() || args["actions"].size() > pins::ACTIONS_MAX )
+    {
+        return false;
+    }
+
+    const std::string dir = args["dir"].get<std::string>();
+
+    if( !isRunDir( dir, pins::PINS_ROOT ) )
+        return false;
+
+    std::vector<pins::SYNC_ACTION> actions;
+
+    try
+    {
+        for( const json& a : args["actions"] )
+        {
+            pins::SYNC_ACTION action;
+
+            if( !pins::readAction( a, action ) )
+                return false;
+
+            SCH_SHEET_PATH where;
+
+            if( action.op.find( "Pin" ) != std::string::npos )
+            {
+                if( !pins::findPin( fr, action.uuid, where ) )
+                    return false;
+            }
+            else if( !pins::findLabel( fr, action.uuid, action.sheetPath, where ) )
+            {
+                return false;
+            }
+
+            actions.push_back( action );
+        }
+    }
+    catch( ... )
+    {
+        return false;
+    }
+
+    pcbjam_collab::runOnCoroutine( fr, [dir, actions]() { pins::runApply( dir, actions ); } );
+    return true;
+}
+
+// syncPins: {"sheet": uuid, "sheetPath" (the path the sheet sits on), "place": "pin"|"label",
+// "names": string[] (1 to 64)}. Arms K-SYNCPIN's template with the counterparts of the names
+// (for a pin the sub sheet's hierarchical labels, for a label the sheet's pins; each name must
+// have one), then, as doSyncSheetsPins' placement callback does, runs placeSheetPin over the
+// sheet or enters the sheet and runs placeHierLabel: each press places the next name, Esc
+// ends, KiCad's commit per placement. False for any other JSON, no frame or an open in flight.
+bool kicadSheetPinsPlace( std::string aArgsJson )
+{
+    SCH_EDIT_FRAME* fr = schFrame();
+
+    if( !fr || pcbjam_open::busy() )
+        return false;
+
+    json args = json::parse( aArgsJson, nullptr, /*allow_exceptions*/ false );
+
+    if( args.is_discarded() || !args.is_object() || args.size() != 4
+            || !cc_symedit::hasKeys( args, { "sheet", "sheetPath", "place", "names" } )
+            || !args["sheet"].is_string() || !args["sheetPath"].is_string()
+            || !args["place"].is_string() || !args["names"].is_array() || args["names"].empty()
+            || args["names"].size() > pins::NAMES_MAX )
+    {
+        return false;
+    }
+
+    const std::string place = args["place"].get<std::string>();
+    const std::string sheetId = args["sheet"].get<std::string>();
+    const std::string sheetPath = args["sheetPath"].get<std::string>();
+
+    if( place != "pin" && place != "label" )
+        return false;
+
+    std::vector<wxString> names;
+
+    for( const json& n : args["names"] )
+    {
+        std::optional<wxString> name = cc_symedit::textOf( n, 1, cc_symedit::TEXT_MAX );
+
+        if( !name )
+            return false;
+
+        names.push_back( *name );
+    }
+
+    auto counterparts =
+            [place, names]( SCH_SHEET* aSheet, std::vector<std::unique_ptr<SCH_HIERLABEL>>& aOut )
+            {
+                for( const wxString& name : names )
+                {
+                    SCH_HIERLABEL* found = nullptr;
+
+                    if( place == "pin" )
+                    {
+                        for( SCH_HIERLABEL* label : pins::uniqueLabels( aSheet ) )
+                        {
+                            if( label->GetText() == name )
+                                found = label;
+                        }
+                    }
+                    else
+                    {
+                        for( SCH_SHEET_PIN* pin : aSheet->GetPins() )
+                        {
+                            if( !found && pin->GetText() == name )
+                                found = pin;
+                        }
+                    }
+
+                    if( !found )
+                        return false;
+
+                    aOut.emplace_back( static_cast<SCH_HIERLABEL*>( found->Clone() ) );
+                }
+
+                return true;
+            };
+
+    sch::ITEM_HIT hit = sch::findItem( fr, sheetId, sheetPath );
+
+    if( !hit.item || hit.item->Type() != SCH_SHEET_T || sheetPath.empty() )
+        return false;
+
+    {
+        std::vector<std::unique_ptr<SCH_HIERLABEL>> probe;
+
+        if( !counterparts( static_cast<SCH_SHEET*>( hit.item ), probe ) )
+            return false;
+    }
+
+    pcbjam_collab::runOnCoroutine( fr, [sheetId, sheetPath, place, counterparts]() {
+        SCH_EDIT_FRAME* frame = schFrame();
+        sch::ITEM_HIT   live = sch::findItem( frame, sheetId, sheetPath );
+
+        if( !live.item || live.item->Type() != SCH_SHEET_T )
+            return;
+
+        SCH_SHEET*        sheet = static_cast<SCH_SHEET*>( live.item );
+        CC_SYNC_TEMPLATE& armed = CcSyncTemplate();
+
+        armed.EndPlacement();
+
+        if( !counterparts( sheet, armed.items ) )
+        {
+            armed.EndPlacement();
+            return;
+        }
+
+        TOOL_MANAGER*  tools = frame->GetToolManager();
+        SCH_SHEET_PATH parent = live.path;
+
+        if( place == "label" )
+        {
+            SCH_SHEET_PATH instance = parent;
+            instance.push_back( sheet );
+            tools->RunAction<SCH_SHEET_PATH*>( SCH_ACTIONS::changeSheet, &instance );
+            tools->RunAction( SCH_ACTIONS::placeHierLabel );
+        }
+        else
+        {
+            if( !( frame->GetCurrentSheet() == parent ) )
+                tools->RunAction<SCH_SHEET_PATH*>( SCH_ACTIONS::changeSheet, &parent );
+
+            tools->GetTool<SCH_SELECTION_TOOL>()->SyncSelection( {}, nullptr, { sheet } );
+            tools->RunAction( SCH_ACTIONS::placeSheetPin );
+        }
+    } );
+
+    return true;
+}
+
+
+// ── lo-e4-e: net names from the board back onto the schematic ─────────────────────────────
+
+namespace nets
+{
+constexpr size_t PADS_MAX = 32768;
+constexpr const char* RENAME_ROOT = "/tmp/cc-renameNets/";
+
+/** BACK_ANNOTATE's net name pass alone (no relink, no other property), over the pads handed
+ *  in; ONE commit "Update net names" unless a preview; renameNets.json written last. */
+void runRename( const std::string& aDir, bool aPreview,
+                const std::vector<BACK_ANNOTATE::CC_PAD_NET>& aPads, bool aTruncated )
+{
+    SCH_EDIT_FRAME* fr = schFrame();
+    json            rows = json::array();
+
+    ensureRunDir( aDir );
+
+    if( fr )
+    {
+        // Fresh connectivity, as the Update Schematic from PCB dialog leaves it before a pass.
+        fr->RecalculateConnections( nullptr, NO_CLEANUP );
+
+        NULL_REPORTER reporter;
+        BACK_ANNOTATE annotate( fr, reporter, /*aRelinkFootprints*/ false,
+                                /*aProcessFootprints*/ false, /*aProcessValues*/ false,
+                                /*aProcessReferences*/ false, /*aProcessNetNames*/ true,
+                                /*aProcessAttributes*/ false, /*aProcessOtherFields*/ false,
+                                /*aPreferUnitSwaps*/ false, /*aPreferPinSwaps*/ false,
+                                /*aDryRun*/ aPreview );
+        SCH_COMMIT    commit( fr );
+
+        for( const BACK_ANNOTATE::CC_NET_ROW& r : annotate.CcProcessNetNames( &commit, aPads ) )
+        {
+            json row;
+            row["ref"] = cc_symedit::utf8( r.ref );
+            row["pin"] = cc_symedit::utf8( r.pin );
+            row["from"] = cc_symedit::utf8( r.from );
+            row["to"] = cc_symedit::utf8( r.to );
+            row["sheetPath"] = cc_symedit::utf8( r.sheetPath );
+            row["outcome"] = cc_symedit::utf8( r.outcome );
+
+            if( r.label != niluuid )
+                row["label"] = cc_symedit::utf8( r.label.AsString() );
+
+            rows.push_back( row );
+        }
+
+        if( !aPreview && !commit.Empty() )
+        {
+            commit.Push( _( "Update net names" ) );
+            fr->RecalculateConnections( nullptr, LOCAL_CLEANUP );
+            fr->GetCanvas()->Refresh();
+        }
+    }
+
+    int applied = 0;
+
+    for( const json& r : rows )
+    {
+        if( r["outcome"] != "refused" )
+            ++applied;
+    }
+
+    json body;
+    body["preview"] = aPreview;
+    body["rows"] = rows;
+    body["applied"] = aPreview ? 0 : applied;
+    body["truncated"] = aTruncated;
+    body["depth"] = fr ? (int) fr->GetUndoCommandCount() : 0;
+    writeRunDone( aDir, "renameNets.json", body );
+}
+} // namespace nets
+
+// {"run", "dir": "/tmp/cc-renameNets/<n>", "preview": bool, "pads": [{ref, pad, net}] (1 to
+// 32,768, kicadBoardPadNets' rows)}. KiCad's Update Schematic from PCB net name pass alone:
+// each symbol pin whose schematic net name differs from its pad's has its driving label
+// renamed (or a label added, or is refused when a power pin drives the net), symbols matched
+// by reference. False (nothing queued) for any other JSON; true once queued on the apply
+// coroutine: a preview changes nothing, else ONE commit "Update net names" (one undo step);
+// renameNets.json {preview, rows: [{ref, pin, from, to, sheetPath, outcome, label?}],
+// applied, truncated, depth} written last.
+bool kicadSchRenameNets( std::string aArgsJson )
+{
+    SCH_EDIT_FRAME* fr = schFrame();
+
+    if( !fr || pcbjam_open::busy() )
+        return false;
+
+    json args = json::parse( aArgsJson, nullptr, /*allow_exceptions*/ false );
+
+    if( args.is_discarded() || !args.is_object() || args.size() != 4
+            || !cc_symedit::hasKeys( args, { "run", "dir", "preview", "pads" } )
+            || !args["run"].is_number_integer() || args["run"].get<long long>() < 0
+            || !args["dir"].is_string() || !args["preview"].is_boolean()
+            || !args["pads"].is_array() || args["pads"].empty()
+            || args["pads"].size() > nets::PADS_MAX )
+    {
+        return false;
+    }
+
+    const std::string dir = args["dir"].get<std::string>();
+
+    if( !isRunDir( dir, nets::RENAME_ROOT ) )
+        return false;
+
+    std::vector<BACK_ANNOTATE::CC_PAD_NET> pads;
+
+    try
+    {
+        for( const json& p : args["pads"] )
+        {
+            if( !cc_symedit::onlyKeys( p, { "ref", "pad", "net" } )
+                    || !cc_symedit::hasKeys( p, { "ref", "pad", "net" } ) )
+            {
+                return false;
+            }
+
+            std::optional<wxString> ref = cc_symedit::textOf( p["ref"], 1, cc_symedit::TEXT_MAX );
+            std::optional<wxString> pad = cc_symedit::textOf( p["pad"], 1, cc_symedit::TEXT_MAX );
+            std::optional<wxString> net = cc_symedit::textOf( p["net"], 1, cc_symedit::TEXT_MAX );
+
+            if( !ref || !pad || !net )
+                return false;
+
+            pads.push_back( { *ref, *pad, *net } );
+        }
+    }
+    catch( ... )
+    {
+        return false;
+    }
+
+    const bool preview = args["preview"].get<bool>();
+
+    pcbjam_collab::runOnCoroutine( fr, [dir, preview, pads]() {
+        nets::runRename( dir, preview, pads, false );
+    } );
+
+    return true;
+}
+
+
+// ── st-incanno-e: shift designators (KiCad's Increment Annotations From) ─────────────────
+
+// incrementAnnotations: {"first": "R10", "by": int (1 to 100,000), "allSheets": bool}, those
+// three keys only. SCH_EDITOR_CONTROL::IncrementAnnotations' body after its dialog: every
+// symbol whose designator has first's prefix and a number at or above first's moves up by
+// "by", on the shown sheet or every sheet; ONE commit "Increment Annotations" (none when
+// nothing matched). False (nothing queued) for any other JSON, a first with no number, no
+// frame or an open in flight. The host waits for kicadCollabBusy to clear, then reads back.
+bool kicadSchIncrementAnnotations( std::string aArgsJson )
+{
+    SCH_EDIT_FRAME* fr = schFrame();
+
+    if( !fr || pcbjam_open::busy() )
+        return false;
+
+    json args = json::parse( aArgsJson, nullptr, /*allow_exceptions*/ false );
+
+    if( args.is_discarded() || !args.is_object() || args.size() != 3
+            || !cc_symedit::hasKeys( args, { "first", "by", "allSheets" } )
+            || !args["by"].is_number_integer() || !args["allSheets"].is_boolean() )
+    {
+        return false;
+    }
+
+    std::optional<wxString> first = cc_symedit::textOf( args["first"], 2, 64 );
+    const long long         by = args["by"].get<long long>();
+
+    if( !first || by < 1 || by > 100000 )
+        return false;
+
+    SCH_REFERENCE startRef;
+    startRef.SetRef( *first );
+
+    if( !startRef.IsSplitNeeded() )
+        return false;
+
+    const bool allSheets = args["allSheets"].get<bool>();
+    const int  increment = static_cast<int>( by );
+    const wxString firstRef = *first;
+
+    pcbjam_collab::runOnCoroutine( fr, [firstRef, increment, allSheets]() {
+        SCH_EDIT_FRAME* frame = schFrame();
+
+        if( !frame )
+            return;
+
+        SCH_REFERENCE start;
+        start.SetRef( firstRef );
+
+        if( !start.IsSplitNeeded() )
+            return;
+
+        start.Split();
+
+        int startNum = atoi( start.GetRefNumber().utf8_string().c_str() );
+
+        SCH_COMMIT         commit( frame );
+        SCHEMATIC&         schematic = frame->Schematic();
+        SCH_REFERENCE_LIST references;
+
+        if( allSheets )
+            schematic.Hierarchy().GetSymbols( references, SYMBOL_FILTER_ALL );
+        else
+            schematic.CurrentSheet().GetSymbols( references, SYMBOL_FILTER_ALL );
+
+        references.SplitReferences();
+
+        for( SCH_REFERENCE& ref : references )
+        {
+            if( ref.GetRef() == start.GetRef() )
+            {
+                int num = atoi( ref.GetRefNumber().utf8_string().c_str() );
+
+                if( num >= startNum )
+                {
+                    const SCH_SHEET_PATH& sheet = ref.GetSheetPath();
+                    wxString              fullRef = ref.GetRef();
+
+                    num += increment;
+                    fullRef << num;
+
+                    commit.Modify( ref.GetSymbol(), sheet.LastScreen(), RECURSE_MODE::NO_RECURSE );
+                    ref.GetSymbol()->SetRef( &sheet, From_UTF8( fullRef.c_str() ) );
+                }
+            }
+        }
+
+        if( !commit.Empty() )
+            commit.Push( _( "Increment Annotations" ) );
+    } );
+
+    return true;
+}
+
 } // namespace cc_e8
 
 EMSCRIPTEN_BINDINGS( cc_e8_sch )
@@ -1528,4 +2355,9 @@ EMSCRIPTEN_BINDINGS( cc_e8_sch )
     function( "kicadSchItemSet", &cc_e8::kicadSchItemSet );
     function( "kicadSchPlaceImage", &cc_e8::kicadSchPlaceImage );
     function( "kicadHostSchItems", &cc_e8::kicadHostSchItems );
+    function( "kicadSheetPinsGet", &cc_e8::kicadSheetPinsGet );
+    function( "kicadSheetPinsApply", &cc_e8::kicadSheetPinsApply );
+    function( "kicadSheetPinsPlace", &cc_e8::kicadSheetPinsPlace );
+    function( "kicadSchRenameNets", &cc_e8::kicadSchRenameNets );
+    function( "kicadSchIncrementAnnotations", &cc_e8::kicadSchIncrementAnnotations );
 }
