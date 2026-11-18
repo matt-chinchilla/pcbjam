@@ -495,7 +495,9 @@ void runBusMigration( const BUS_ARGS& aArgs )
 // runs with no window and no backup, the rescuer takes every candidate with no
 // DIALOG_RESCUE_EACH, the legacy rescue and cache libraries become .kicad_sym with their
 // table rows; then KiCad's Save writes every sheet as KiCad 10 (.kicad_sch), the .kicad_pro
-// and the tables. Synchronous, as kicadImportSchematic (the open's own busy guard); no
+// and the tables. Run in the call, as kicadImportSchematic (the open's own busy guard), and
+// registered as it is with the PARKER policy: the open parks (a library read from the
+// engine's library provider waits on the page), so the call answers a Promise. No
 // commit (the undo list starts empty, as after any open). With a run folder, the record
 // <dir>/.cc-legacy.json {"opened", "saved", "files": [path], "lines": [{severity, text}]} is
 // written last. True only when the project opened and every sheet saved.
@@ -592,10 +594,13 @@ bool importLegacyProject( std::string aArgsJson )
 }
 
 
-// schematic.rescue (cap rescue), the read. aArgsJson exactly {}. Synchronous: KiCad's symbol
-// library table rescuer finds its candidates on the open design, a symbol's copy held in the
-// design standing as the cache a KiCad 6 or later design no longer carries in a cache library
-// (a symbol whose library is missing, or whose library copy's pins now differ). Answers
+// schematic.rescue (cap rescue), the read. aArgsJson exactly {}. Run in the call and
+// registered with the PARKER policy (it answers a Promise): each library symbol the rescuer
+// compares is read through the library provider, which parks for one not yet in memory.
+// KiCad's symbol library table rescuer finds its candidates on the open design, a symbol's
+// copy held in the design standing as the cache a KiCad 6 or later design no longer carries
+// in a cache library (a symbol whose library is missing, or whose library copy's pins now
+// differ). Answers
 // {"candidates": [{"name", "libId", "uses", "rescuedAs"}]} (at most 4,096; name the symbol's
 // own name, libId the LIB_ID the design names, uses how many placed symbols name it,
 // rescuedAs the LIB_ID KiCad's rescue gives it in <stem>-rescue). Nothing changes. "" with no
@@ -847,9 +852,11 @@ bool hostLegacy()
 
 EMSCRIPTEN_BINDINGS( cc_e9_sch )
 {
-    function( "kicadImportLegacyProject", &cc_e9::importLegacyProject );
+    // The open and the rescuer's library reads park (as kicadOpenFile), hence the PARKER
+    // policy: each of these two answers a Promise.
+    function( "kicadImportLegacyProject", &cc_e9::importLegacyProject PCBJAM_PARKER_POLICY );
     function( "kicadHostLegacy", &cc_e9::hostLegacy );
-    function( "kicadSchRescue", &cc_e9::schRescue );
+    function( "kicadSchRescue", &cc_e9::schRescue PCBJAM_PARKER_POLICY );
     function( "kicadSchRescueApply", &cc_e9::schRescueApply );
     function( "kicadBusMigrationGet", &cc_e9::busMigrationGet );
     function( "kicadBusMigrationApply", &cc_e9::busMigrationApply );
