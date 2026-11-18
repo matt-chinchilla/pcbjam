@@ -1,0 +1,47 @@
+<!-- Copyright (C) 2026 Circuit Center Inc -->
+<!-- SPDX-License-Identifier: GPL-3.0-or-later -->
+
+# Engine run 15, lane e11: 3D and outputs
+
+Worktrees: pcbjam `/home/matthew/cc-engine-wt/e11/pcbjam`, kicad `/home/matthew/cc-engine-wt/e11/kicad`, both on `seat/run15-e11`. Units in order: 3d-e1, 3d-e4 (build G gate code), 3d-e2, 3d-e5, lo-e3o-e, lo-e3r-e. The per unit note files the manifest names (`BUILD-NOTES-run15-3d-e1.md`, `-3d-e4.md`, `-3d-e2.md`, `-3d-e5.md`, `-outputs-faults.md`, `-pe23.md`) are the sections of this one file (the guide, section 2).
+
+## 3d-e1: the OpenCASCADE service built in our tree (gate code, build G)
+
+- Exports: none new. `occExport( board, paramsJson, models )` and `occLoadModel( bytes, ext )` are PCBJam's own, in `occ_service.wasm` (a separate module, never in kicad_editor), unchanged.
+- Files: none edited. PCBJam's recipe stands as it is in our tree, read end to end: `scripts/kicad/build-occ_service.sh` calls `build-kicad-target.sh occ_service`, which configures `-DKICAD_OCC_SERVICE_WASM=ON` (kicad `CMakeLists.txt` 80 and 1346 to 1351 add `wasm/occ-service/` after `pcbnew/`), builds its deps with `--with-occ` (every app does), links pcbnew's bindings object as compiled without `KICAD_MERGED_EMBIND` (`EMBIND_APP=pcbnew`, the syntax check's `occ` unit), and leaves the shadows `exporter_step_stub.cpp` and `oce_plugin_stub.cpp` out of that tree (kicad `pcbnew/CMakeLists.txt` 932 to 939) so it compiles the real exporters (`PCBNEW_OCC_EXPORTER_SRCS`, exported at 297 to 302). `-DKICAD_BUILD_3D_VIEWER_WASM` is passed to every app, so `3d-viewer` is in `PCBNEW_KIFACE_LIBRARIES` (1057 to 1059) and the render job of 3d-e4 links in the service too. The PCBJam files are edited only where the first build refuses them; none is edited before that.
+- The island's `scripts/engine/build.sh` edit (`occ_service` in `RECIPE_ARGS`, `occ_service.js` and `occ_service.wasm` in `FILES`) is E0-OCC's, not this unit's.
+- Gate 0 step 1 (owed on build G, this unit's): raw, `gzip -9` and brotli bytes of `occ_service.wasm` and `occ_service.js`, build time and peak memory. Stop: over 20 MB gzipped the owner hears the number before shipping. Filled in below once build G's files exist.
+- What the build train must probe: (1) build G's log shows the `occ_service` target linked (no undefined symbol; a missing `JOB_PCB_RENDER` or `RENDER_3D_RAYTRACE_RAM` symbol there means 3d-e4's render reached the service without its library); (2) `ls dist/<cc25 id>/` holds `occ_service.js` and `occ_service.wasm`, PIN.json's sha256 and bytes match `sha256sum` and `stat -c %s`; (3) `gzip -9 -c occ_service.wasm | wc -c` is within 1 percent of the number recorded here; (4) the 3d-i1 recipe boots the service in the island frame. Wrong if: the service does not link (then 3d-e1 and 3d-i1 leave run 15 and O25, O26 show the held line), or it is over 20 MB gzipped (the owner hears it).
+
+### Gate 0 step 1 measurements
+
+Not yet: build G has not run.
+
+## 3d-e4: KiCad's raytraced render compiled in (gate code, build G)
+
+- kicad `pcbnew/pcbnew_jobs_handler.cpp` (commit 2ea86e5d), every change under `__EMSCRIPTEN__`, KiCad's path word for word in the `#ifndef` halves (the diff only adds lines):
+  - the raytracer and track ball includes in an `#else` (plus `emscripten.h`, `emscripten/threading.h`, `<algorithm>`, `<functional>`);
+  - `Register( "render", ... )` in an `#else`: the handler calls `ccJobExportRender` with the handler's own `m_reporter` and two lambdas over its private `getBoard` and `resolveJobOutputPath` (a lambda in the constructor has the class's access), and the dialog answer is `false` (DIALOG_RENDER_JOB never opens);
+  - `ccJobExportRender`, a file static copy of `JobExportRender` (the header `pcbnew_jobs_handler.h` declares the member only outside `__EMSCRIPTEN__` and is no lane's file, so it is not edited: no wide recompile, nothing reported), the same body with `m_reporter` as `aReporter`, and in the pass loop: the raytracer's status reporter is `CC_RENDER_PASSES`, which keeps the percent of KiCad's own "Rendering: %.0f %%" line and reports nothing itself (KiCad's "Loading..." and "Rendering time" lines no longer reach the job's lines); after each pass `passes.ReportPercent( *aReporter )` writes one info line `Rendering <n> percent` when the percent moved, then `ccRenderYield()` turns the browser's event loop once: `wxWasmBeginWait( "render" )`, an `EM_JS` `cc_render_yield_start` that resolves the wait from a `setTimeout( ..., 0 )` through `globalThis.__wxScheduler.resolveWait`, `wxWasmYieldUntil` (the same scheduler wait the 3D service and model fetch bridges use; main thread only; a refused token goes on unyielded). The warnings reporter stays the job's reporter (a model it could not load is a warning line, as on desktop).
+  - The job's registry name is `pcb_render` (`REGISTER_JOB` in `common/jobs/job_pcb_render.cpp` 144); the handler's own name is `render`. `JOB_PCB_RENDER` now links because the handler names it (the registrar rides the same object).
+- pcbjam `wasm/bindings/cc_output_render.h` (commit 5e2e209): `ccFixPcbRender` takes `format` `png` or `jpeg` (KiCad's own enum names; `jpg` refused), `width` and `height` whole numbers 16 to 4,096, `preset` (KiCad's key; the value of Follow PCB Editor is `follow_pcb_editor`, `FOLLOW_PCB` in `eda_3d_viewer_settings.h` 32) empty, `follow_pcb_editor`, or the words `Follow PCB Editor` (normalized to `follow_pcb_editor`), `variant` empty. Refusal lines: "The picture is made as PNG or JPEG.", "The picture's width and height are 16 to 4,096 pixels.", "The render follows the board editor's look or none." A refusal makes nothing: the record's code -1 with that line (`ccRunBoardOutput`). `ccPcbRenderListed()` is now true, so `kicadOutputJobs()` lists `pcb_render` with its keys.
+- Exports: none new (`kicadExportBoardOutput`, `kicadOutputJobs` widened). Merged image only: nothing (the job handler is in every pcbnew tree, the occ service included).
+- Risk for gate 0 step 4 (200 ms): KiCad's own tracing pass runs blocks for up to 400 ms (750 ms over 40,000 blocks), `RENDER_3D_RAYTRACE_BASE::renderTracing`, `timeLimit`, and the main thread waits on the pool's futures for that pass. The yield sits between passes as the spec says; it does not shorten a pass. If build G measures a block over 200 ms, the lever is that time limit in `3d-viewer/3d_rendering/raytracing/render_3d_raytrace_base.cpp`, which is no file of this lane: the controller decides.
+- What the build train must probe (frame pcb, island harness, `tests/fixtures/glasgow`): (1) `JSON.parse(Module.kicadOutputJobs()).board.pcb_render` exists with the keys `side`, `zoom`, `perspective`, `quality`, `bg_style`, `width`, `height`, `pan_x`, `pivot_x`, `rotation_x`, `preset`, `format`; wrong if absent (the job did not link or `ccPcbRenderListed` is false). (2) `project.export` `pcb_render` `{format: 'png', width: 1600, height: 1200, quality: 'basic', side: 'top'}`: record code 0, lines hold `Rendering <n> percent` climbing to 100 and "Successfully created 3D render image"; the file `<board>-<side number>.png` in the run folder, IHDR (bytes 16 to 23) 1600 by 1200; no KiCad window; undo depth unchanged (a render is no edit; the board stays unmodified). Wrong if: no percent lines (the status reporter or the format string differs), the run never ends (the yield's wait never resolved: `__wxScheduler` missing), a dialog appears (the lambda), or code 2 "Failed to create output directory". (3) A longtask observer in the parent page during (2): no task over 200 ms (the risk above). (4) `width: 5000` answers code -1 with "The picture's width and height are 16 to 4,096 pixels." and no file; `format: 'jpeg'` answers a file starting FF D8 (wx's JPEG handler, `wxUSE_LIBJPEG` 1 in the wasm setup). (5) `quality: 'high'` on the same board ends with a file (shadows, reflections, procedural textures on).
+
+- Repair e11-1 (kicad a2fabc61): in the WebAssembly copy the size is bounded again where KiCad's code checks it (each side 1 to 4,096, `CC_RENDER_MAX_SIDE`; the host's settings already refuse outside 16 to 4,096 in `ccFixPcbRender`), the picture buffers are sized as `size_t`, a failed allocation frees what was taken and fails the job with KiCad's "Error creating 3D render image" (never a write through a null pointer), and a failed `SaveFile` fails the job too. Probe: `project.export` `pcb_render` at width 100000, height 100000 answers the refusal record (code -1, "The picture's width and height are 16 to 4,096 pixels.", no file) and the engine answers the next call (`Module.kicadOutputJobs()` still parses).
+
+### Checks (3d-e1, 3d-e4)
+
+Command, from `/home/matthew/cc-engine-wt/e11/pcbjam`: `/home/matthew/cc-wave2/bin/gate.sh scripts/kicad/syntax-check-run15.sh --kicad /home/matthew/cc-engine-wt/e11/kicad pcbnew occ kicad_editor --kicad-file pcbnew/pcbnew_jobs_handler.cpp`
+
+```
+PASS kicad_editor   kicad_editor_embind.cpp subdir=common  (6688 ms)
+PASS occ            pcbnew_embind.cpp subdir=pcbnew (17486 ms)
+PASS kicad pcbnew/pcbnew_jobs_handler.cpp (13540 ms)
+syntax-check: 0 failed
+```
+
+(the pcbnew unit's PASS line scrolled off this run; the handover runs `all` and pastes every line.)
+
+Export check, after `git merge run15/main` in both worktrees: `scripts/kicad/check-run15-exports.sh --since run15/main --kicad /home/matthew/cc-engine-wt/e11/kicad --kicad-since run15/main` printed `146 names registered in the merged image (139 kicad names), 1 of 110 run 15 names, 0 failures`.
