@@ -319,3 +319,77 @@ kicadImportSession (cc_e9_pcb), kicadSchRescue, kicadSchRescueApply, kicadBusMig
 kicadBusMigrationApply, kicadHostBusMigration (cc_e9_sch). None is merged image only.
 Nothing reported to E0 (no include path, CMake line, build script line or new name needed).
 The one KiCad header changed is specctra.h (reach: the specctra_import_export sources).
+
+## Repair e9-1 (2026-11-18): the PARKER policy on the two exports that park
+
+Fault (build G probe, `/home/matthew/cc-wave2/engine/fix/e9-1.md`): on `legacy_demos/ecc83` and
+`electric`, `kicadImportLegacyProject` threw `SuspendError: trying to suspend without
+WebAssembly.promising` after about 1.5 s; only `~ecc83-pp.sch.lck` was written.
+
+Cause, verified in the code: `cc_e9_sch` registered the export with no
+`PCBJAM_PARKER_POLICY` (`pcbjam_async_policy.h`: `, emscripten::async()`). Its body calls
+`SCH_EDIT_FRAME::OpenProjectFiles`, the same call `kicadOpenFile` makes (registered PARKER,
+`eeschema_embind.cpp` 7216, as `kicadImportSchematic` 7179). The park inside the open: a symbol
+read on the main thread through `SCH_IO_PCBJAM_LIB::loadOne` goes to
+`pcbjam_libs_request_dispatch` (`eeschema/sch_io/pcbjam_lib/sch_io_pcbjam_lib.cpp` 215), which
+on the main runtime thread waits with `wxWasmBeginWait` and `wxWasmYieldUntil` (a JSPI
+suspension). Without the policy the invoker is not wrapped in `WebAssembly.promising`, so
+that first wait throws.
+
+The same miss in a second export: `kicadSchRescue` runs `RESCUE_SYMBOL_LIB_TABLE_CANDIDATE::
+FindRescues` in the call, which reads each library symbol through `SchGetLibSymbol` (
+`project_rescue.cpp` 431), that is `SCH_IO_PCBJAM_LIB::LoadSymbol`, the same wait for a symbol
+not yet in the provider's cache. Registered PARKER too. The other lane exports do not park in
+the call: `kicadSchRescueApply`, `kicadBusMigrationApply` and `kicadImportSession` only queue
+their run on the apply coroutine (`pcbjam_collab::runOnCoroutine`, run from the event loop);
+`kicadBusMigrationGet` reads the connection graph only; `kicadHostLegacy` and
+`kicadHostBusMigration` return true. They stay as they were.
+
+Change (pcbjam 5bac987, `wasm/bindings/cc_e9_sch.inc`): both registrations carry
+`PCBJAM_PARKER_POLICY`; the two bodies are unchanged (KiCad's open and save, KiCad's rescuer).
+No KiCad file changed.
+
+What this changes for the island: `kicadImportLegacyProject` now answers `Promise<boolean>` and
+`kicadSchRescue` `Promise<string>`. The island's import and rescue paths must `await` both (as
+they await `kicadImportSchematic` and `kicadSimNetlist`); a caller that reads the return
+synchronously sees a Promise object, never `true` or the candidates JSON.
+
+Checks (from the pcbjam worktree, after `git merge run15/main` in both worktrees):
+
+```
+/home/matthew/cc-wave2/bin/gate.sh scripts/kicad/syntax-check-run15.sh --kicad /home/matthew/cc-engine-wt/e9/kicad all
+PASS pcbnew         pcbnew_embind.cpp subdir=pcbnew -DKICAD_MERGED_EMBIND (21913 ms)
+PASS eeschema       eeschema_embind.cpp subdir=eeschema -DKICAD_MERGED_EMBIND (16500 ms)
+PASS symedit        symedit_embind.cpp subdir=eeschema  (8800 ms)
+PASS fpedit         fpedit_embind.cpp subdir=pcbnew  (8736 ms)
+PASS dsedit         dsedit_embind.cpp subdir=pagelayout_editor  (1546 ms)
+PASS kicad_editor   kicad_editor_embind.cpp subdir=common  (6461 ms)
+PASS occ            pcbnew_embind.cpp subdir=pcbnew (15416 ms)
+syntax-check: 0 failed
+```
+
+```
+scripts/kicad/check-run15-exports.sh --since run15/main --kicad /home/matthew/cc-engine-wt/e9/kicad --kicad-since run15/main
+check-run15-exports: 205 names registered in the merged image (198 kicad names), 60 of 110 run 15 names, 0 failures
+```
+
+What the next build must probe:
+
+1. Gate 0.6 as the fix note ran it, now awaited: `await Module.kicadImportLegacyProject(
+   JSON.stringify({path: '/tmp/p/ecc83/ecc83-pp.pro', run: 1, dir: '/tmp/cc-legacy/1'}))`. A
+   pass: no `SuspendError`; the call resolves `true`; no window of any kind (registry empty,
+   no `ev.menu`); `/tmp/p/ecc83/` holds `ecc83-pp.kicad_sch`, `ecc83-pp.kicad_pro`,
+   `sym-lib-table` (a row `ecc83-pp-rescue`, type KiCad, `${KIPRJMOD}/ecc83-pp-rescue.kicad_sym`)
+   and `ecc83-pp-rescue.kicad_sym`; `/tmp/cc-legacy/1/.cc-legacy.json` `opened: true`,
+   `saved: true`, those files and the rescue lines; every `lib_id` in the saved sheet names
+   `ecc83-pp-rescue:<name>`; undo depth 0. Then the rest of this lane's st-open-kicad5-e list
+   (items 2 to 6 above), `electric/` resolving `true` with its `.kicad_sch` saved.
+2. A failure that means the repair is wrong or incomplete: any `SuspendError` (then another
+   call in the open path parks outside the policy's wrap, a fresh JS entry such as a timer:
+   its stack names it), the call returning a value that is not a Promise, or `saved: false`.
+   A window or a missing `-rescue.kicad_sym` is the K-REMAP body, read for the first time in
+   this build (the fix note: gate 0.6 was unread).
+3. `kicadSchRescue`: `await Module.kicadSchRescue('{}')` on the st-rescue-myparts fixture
+   with the engine's library set present (a symbol of `Device` not yet loaded makes the read
+   park): resolves to the candidates JSON of the st-rescue-e list above, no `SuspendError`.
+   `kicadSchRescue('{"x":1}')` resolves `""`.
