@@ -167,3 +167,25 @@ Syntax check at this commit (the lane's full faces):
 `/home/matthew/cc-wave2/bin/gate.sh scripts/kicad/syntax-check-run15.sh --kicad /home/matthew/cc-engine-wt/e12/kicad all`:
 `PASS pcbnew (11213 ms)`, `PASS eeschema (11440 ms)`, `PASS symedit (7048 ms)`, `PASS fpedit (6779 ms)`,
 `PASS dsedit (1000 ms)`, `PASS kicad_editor (4615 ms)`, `PASS occ (11128 ms)`, `syntax-check: 0 failed`.
+
+## State for the relay (after st-editprefs-e)
+
+Done and committed: lo-e3s-e (3558c9e), st-routing-e (fe4e114), st-origins-e (134c8f1),
+st-editprefs-e (1833c6d); each has its status file. Then `git merge run15/main` (pcbjam fc22233;
+kicad fast forward to caf17fbe, no kicad commit of this lane yet). After that merge:
+`scripts/kicad/check-run15-exports.sh --since run15/main --kicad /home/matthew/cc-engine-wt/e12/kicad --kicad-since run15/main`:
+`154 names registered in the merged image (147 kicad names), 9 of 110 run 15 names, 0 failures`;
+syntax check `all`: PASS pcbnew (21951 ms), eeschema (12995 ms), symedit (7926 ms), fpedit
+(7148 ms), dsedit (1031 ms), kicad_editor (5119 ms), occ (13272 ms), `syntax-check: 0 failed`.
+
+Not done: m7-e (the eight sections of addendum-properties-setup.md 5.2 and `kicadTuningSolve`
+5.3, with the lane's one KiCad file `pcbnew/dialogs/panel_setup_tuning_profile_info.cpp`:
+lift `calculateTrackParametersForCell`, line 702, into a free function under `#ifdef
+__EMSCRIPTEN__`, the panel calling it), then m8-e (`kicadSettingsRead`, 6.2; the guide's
+section 2 allows widening `CC_PCB_SECTION` and `CC_SCH_SECTION` with a reader of a given BOARD
+and PROJECT at the END of the struct, defaulted). `kicadTuningSolve` is a board export (register
+in `cc_e12_pcb`); `kicadSettingsRead` is both frames (halves in the pcb and sch incs, the
+dispatcher picks one in `cc_e12_dispatch`). Helpers the relay can reuse: `cc_e12::pcb::
+patchKeysIn`, `readPoint`, `pointJson`, `prefSection` style JSON sections over run 14's
+`ccPcbJsonGet` / `ccPcbJsonSet` and the sch twins `ccJsonSectionGet` / `ccJsonSectionSet`.
+Watch: the scratchpad folder of the seat sessions is shared; keep per unit file copies elsewhere.
