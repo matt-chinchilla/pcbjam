@@ -104,10 +104,29 @@ bool designBlockSave( std::string aArgsJson )
     return false;
 }
 
+// e-block-place (DB1, K-B1). kicadDesignBlockPlace( {"dir", "name", "asSheet",
+// "keepAnnotations", "asGroup"} ) on whichever editor is live: the board half (cc_e7_pcb.inc,
+// merged image only) places the block's layout, the schematic half (cc_e7_sch.inc) its
+// schematic. Each half reads the arguments whole and the block itself before anything is queued.
+bool blockPlacePcb( std::string aArgsJson );
+bool blockPlaceSch( std::string aArgsJson );
+
+bool designBlockPlace( std::string aArgsJson )
+{
+    if( pcbEditorActive() )
+        return blockPlacePcb( aArgsJson );
+
+    if( schEditorActive() )
+        return blockPlaceSch( aArgsJson );
+
+    return false;
+}
+
 } // namespace cc_e7
 
 EMSCRIPTEN_BINDINGS( cc_e7_dispatch )
 {
+    emscripten::function( "kicadDesignBlockPlace", &cc_e7::designBlockPlace );
     emscripten::function( "kicadDesignBlockSave", &cc_e7::designBlockSave );
     emscripten::function( "kicadLibsRemoveEntry", &cc_e7::libsRemoveEntry );
     emscripten::function( "kicadPathVarsSet", &cc_e7::pathVarsSet );

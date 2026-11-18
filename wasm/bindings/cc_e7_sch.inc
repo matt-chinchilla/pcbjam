@@ -10,7 +10,10 @@
 // translation unit holds every lane's face) and every name registers in the block below,
 // never in a shared block. The rules: BUILD-NOTES-run15.md.
 
+#include <cc_host_design_block.h>
 #include <cc_sch_design_block_write.h>
+#include <design_block_io.h>
+#include <tools/sch_actions.h>
 
 namespace cc_e7
 {
@@ -107,6 +110,64 @@ static void writeBlockSaveRecord( const std::string& aDir, bool aOk,
     cc_output::WriteRecord( aDir, ".cc-block.json", record );
 }
 
+
+// The arguments of kicadDesignBlockPlace, read whole: exactly dir (a run folder under
+// /tmp/cc-block/ holding <name>.kicad_block/), name (as kicadDesignBlockSave's), asSheet,
+// keepAnnotations and asGroup (booleans). Then the block is read by KiCad's own reader
+// (DESIGN_BLOCK_IO::DesignBlockLoad); nullptr for any other shape or a block it cannot read.
+static std::unique_ptr<DESIGN_BLOCK> readBlockPlaceArgs( const std::string& aArgsJson,
+                                                         CC_HOST_DESIGN_BLOCK_OPTIONS& aOptions )
+{
+    json args = json::parse( aArgsJson, nullptr, /*allow_exceptions*/ false );
+
+    if( args.is_discarded() || !args.is_object() || args.size() != 5 )
+        return nullptr;
+
+    auto dir = args.find( "dir" );
+    auto name = args.find( "name" );
+    auto asSheet = args.find( "asSheet" );
+    auto keep = args.find( "keepAnnotations" );
+    auto asGroup = args.find( "asGroup" );
+
+    if( dir == args.end() || !dir->is_string() || name == args.end() || !name->is_string()
+            || asSheet == args.end() || !asSheet->is_boolean() || keep == args.end()
+            || !keep->is_boolean() || asGroup == args.end() || !asGroup->is_boolean() )
+    {
+        return nullptr;
+    }
+
+    const std::string d = dir->get<std::string>();
+    const std::string n = name->get<std::string>();
+    const wxString    wname = wxString::FromUTF8( n.c_str() );
+
+    if( !cc_output::IsRunDir( d, "/tmp/cc-block/" ) || n.empty() || wname.empty()
+            || wname.length() > 120 || n == "." || n == ".."
+            || n.find_first_of( std::string( "/\\:\0", 4 ) ) != std::string::npos )
+    {
+        return nullptr;
+    }
+
+    aOptions.asSheet = asSheet->get<bool>();
+    aOptions.keepAnnotations = keep->get<bool>();
+    aOptions.asGroup = asGroup->get<bool>();
+
+    std::unique_ptr<DESIGN_BLOCK_IO> io(
+            DESIGN_BLOCK_IO_MGR::FindPlugin( DESIGN_BLOCK_IO_MGR::KICAD_SEXP ) );
+
+    if( !io )
+        return nullptr;
+
+    try
+    {
+        return std::unique_ptr<DESIGN_BLOCK>(
+                io->DesignBlockLoad( wxString::FromUTF8( d.c_str() ), wname ) );
+    }
+    catch( const IO_ERROR& )
+    {
+        return nullptr;
+    }
+}
+
 } // namespace sch
 
 // e-block-save, the schematic half of kicadDesignBlockSave. Scopes: sheet (the sheet at
@@ -161,6 +222,45 @@ bool blockSaveSch( std::string aArgsJson )
         }
 
         sch::writeBlockSaveRecord( a.dir, ok, lines );
+    } );
+
+    return true;
+}
+
+// e-block-place (DB1, K-B1), the schematic half of kicadDesignBlockPlace: the block read from
+// dir by KiCad's reader must hold a schematic; it is handed with the host's options (as a sheet,
+// keep designators) to Place Design Block (SCH_DRAWING_TOOLS takes it before the pane: the
+// schematic hunk of K-B1, lane e8's e-block-place-sch) and the tool started on the apply
+// coroutine: the block hangs off the pointer and the reader's press commits ONE undo step.
+bool blockPlaceSch( std::string aArgsJson )
+{
+    SCH_EDIT_FRAME* fr = schFrame();
+
+    if( !fr || pcbjam_open::busy() )
+        return false;
+
+    CC_HOST_DESIGN_BLOCK_OPTIONS  options;
+    std::unique_ptr<DESIGN_BLOCK> block = sch::readBlockPlaceArgs( aArgsJson, options );
+
+    if( !block || block->GetSchematicFile().IsEmpty()
+            || !wxFileName::FileExists( block->GetSchematicFile() ) )
+    {
+        return false;
+    }
+
+    auto held = std::make_shared<std::unique_ptr<DESIGN_BLOCK>>( std::move( block ) );
+
+    pcbjam_collab::runOnCoroutine( fr, [held, options]() {
+        SCH_EDIT_FRAME* f = schFrame();
+
+        if( !f || !*held )
+            return;
+
+        ccSetHostDesignBlock( std::move( *held ), options );
+        f->GetToolManager()->RunAction( SCH_ACTIONS::placeDesignBlock );
+
+        // The tool took the block at its start; a tool that did not start leaves none behind.
+        ccSetHostDesignBlock( nullptr );
     } );
 
     return true;

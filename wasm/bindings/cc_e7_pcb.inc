@@ -11,7 +11,10 @@
 // never in a shared block. The rules: BUILD-NOTES-run15.md.
 
 #ifdef KICAD_MERGED_EMBIND
+#include <cc_host_design_block.h>
 #include <cc_pcb_design_block_write.h>
+#include <design_block_io.h>
+#include <tools/pcb_actions.h>
 #endif
 
 namespace cc_e7
@@ -111,6 +114,64 @@ static void writeBlockSaveRecord( const std::string& aDir, bool aOk,
     cc_output::WriteRecord( aDir, ".cc-block.json", record );
 }
 
+
+// The arguments of kicadDesignBlockPlace, read whole: exactly dir (a run folder under
+// /tmp/cc-block/ holding <name>.kicad_block/), name (as kicadDesignBlockSave's), asSheet,
+// keepAnnotations and asGroup (booleans). Then the block is read by KiCad's own reader
+// (DESIGN_BLOCK_IO::DesignBlockLoad); nullptr for any other shape or a block it cannot read.
+static std::unique_ptr<DESIGN_BLOCK> readBlockPlaceArgs( const std::string& aArgsJson,
+                                                         CC_HOST_DESIGN_BLOCK_OPTIONS& aOptions )
+{
+    json args = json::parse( aArgsJson, nullptr, /*allow_exceptions*/ false );
+
+    if( args.is_discarded() || !args.is_object() || args.size() != 5 )
+        return nullptr;
+
+    auto dir = args.find( "dir" );
+    auto name = args.find( "name" );
+    auto asSheet = args.find( "asSheet" );
+    auto keep = args.find( "keepAnnotations" );
+    auto asGroup = args.find( "asGroup" );
+
+    if( dir == args.end() || !dir->is_string() || name == args.end() || !name->is_string()
+            || asSheet == args.end() || !asSheet->is_boolean() || keep == args.end()
+            || !keep->is_boolean() || asGroup == args.end() || !asGroup->is_boolean() )
+    {
+        return nullptr;
+    }
+
+    const std::string d = dir->get<std::string>();
+    const std::string n = name->get<std::string>();
+    const wxString    wname = wxString::FromUTF8( n.c_str() );
+
+    if( !cc_output::IsRunDir( d, "/tmp/cc-block/" ) || n.empty() || wname.empty()
+            || wname.length() > 120 || n == "." || n == ".."
+            || n.find_first_of( std::string( "/\\:\0", 4 ) ) != std::string::npos )
+    {
+        return nullptr;
+    }
+
+    aOptions.asSheet = asSheet->get<bool>();
+    aOptions.keepAnnotations = keep->get<bool>();
+    aOptions.asGroup = asGroup->get<bool>();
+
+    std::unique_ptr<DESIGN_BLOCK_IO> io(
+            DESIGN_BLOCK_IO_MGR::FindPlugin( DESIGN_BLOCK_IO_MGR::KICAD_SEXP ) );
+
+    if( !io )
+        return nullptr;
+
+    try
+    {
+        return std::unique_ptr<DESIGN_BLOCK>(
+                io->DesignBlockLoad( wxString::FromUTF8( d.c_str() ), wname ) );
+    }
+    catch( const IO_ERROR& )
+    {
+        return nullptr;
+    }
+}
+
 } // namespace pcb
 
 // e-block-save, the board half of kicadDesignBlockSave (merged image only: its kicad half lives
@@ -149,6 +210,46 @@ bool blockSavePcb( std::string aArgsJson )
             ok = CcWritePcbSelectionDesignBlock( f, a.scope == "linkedGroup", folder, name, lines );
 
         pcb::writeBlockSaveRecord( a.dir, ok, lines );
+    } );
+
+    return true;
+}
+
+// e-block-place (DB1, K-B1), the board half of kicadDesignBlockPlace (merged image only): the
+// block read from dir by KiCad's reader must hold a layout; it is handed to Place Design Block
+// (PCB_CONTROL::AppendDesignBlock takes it before the pane, with the host's asGroup) and the
+// tool started on the apply coroutine: the layout hangs off the pointer and the reader's press
+// commits it as ONE undo step (Esc cancels with none). asSheet and keepAnnotations are the
+// schematic's options (KiCad's board placement reads neither).
+bool blockPlacePcb( std::string aArgsJson )
+{
+    PCB_EDIT_FRAME* fr = pcbFrame();
+
+    if( !fr || !fr->GetBoard() || pcbjam_open::busy() )
+        return false;
+
+    CC_HOST_DESIGN_BLOCK_OPTIONS  options;
+    std::unique_ptr<DESIGN_BLOCK> block = pcb::readBlockPlaceArgs( aArgsJson, options );
+
+    if( !block || block->GetBoardFile().IsEmpty()
+            || !wxFileName::FileExists( block->GetBoardFile() ) )
+    {
+        return false;
+    }
+
+    auto held = std::make_shared<std::unique_ptr<DESIGN_BLOCK>>( std::move( block ) );
+
+    pcbjam_collab::runOnCoroutine( fr, [held, options]() {
+        PCB_EDIT_FRAME* f = pcbFrame();
+
+        if( !f || !*held )
+            return;
+
+        ccSetHostDesignBlock( std::move( *held ), options );
+        f->GetToolManager()->RunAction( PCB_ACTIONS::placeDesignBlock );
+
+        // The tool took the block at its start; a tool that did not start leaves none behind.
+        ccSetHostDesignBlock( nullptr );
     } );
 
     return true;
