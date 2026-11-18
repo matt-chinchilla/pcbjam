@@ -4147,23 +4147,31 @@ void ccRunBoardUpdate( const CC_UPDATE_ARGS& aArgs )
 
             // KiCad's Update PCB dialog: each added group that links a design block is selected
             // alone and laid out by Apply Design Block Layout (its own commit, as there); the
-            // host's reporter takes its summary and info bar lines in place of KiCad's windows.
+            // host's reporter takes its summary and info bar lines in place of KiCad's windows,
+            // one report per run (the tool sets its counts), summed here.
             if( aArgs.applyDesignBlockLayouts )
             {
                 PCB_SELECTION_TOOL* selTool = toolMgr->GetTool<PCB_SELECTION_TOOL>();
 
+                for( PCB_GROUP* group : updater.GetAddedGroups() )
                 {
-                    CC_HOST_BLOCK_LAYOUT_SCOPE scope( &layouts );
+                    if( !group->HasDesignBlockLink() )
+                        continue;
 
-                    for( PCB_GROUP* group : updater.GetAddedGroups() )
+                    CC_HOST_BLOCK_LAYOUT_REPORT one;
+
                     {
-                        if( !group->HasDesignBlockLink() )
-                            continue;
-
+                        CC_HOST_BLOCK_LAYOUT_SCOPE scope( &one );
                         toolMgr->RunAction( ACTIONS::selectionClear );
                         selTool->select( group );
                         toolMgr->RunAction( PCB_ACTIONS::applyDesignBlockLayout );
                     }
+
+                    layouts.applied += one.applied;
+                    layouts.failures.insert( layouts.failures.end(), one.failures.begin(),
+                                             one.failures.end() );
+                    layouts.lines.insert( layouts.lines.end(), one.lines.begin(),
+                                          one.lines.end() );
                 }
 
                 toolMgr->RunAction( ACTIONS::selectionClear );
