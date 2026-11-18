@@ -73,3 +73,37 @@ check-run15-exports: 154 names registered in the merged image (147 kicad names),
 ```
 
 Reported to E0: nothing (no include path, CMake or build line needed: both new KiCad headers sit in their subdirs, already on the include lists).
+
+## e-block-place (DB1, K-B1)
+
+Commits: kicad a0bd3c27 (the early header, merged as c57840f9), cedda45b; pcbjam ebda9f7.
+
+Kicad:
+- `include/cc_host_design_block.h` (the early commit): the slot `ccHostDesignBlockSlot()`, `ccHostDesignBlock()`, `ccHostDesignBlockOptions()`, `ccSetHostDesignBlock( block, options )`, `ccTakeHostDesignBlock( &options )`, options `{ asSheet, keepAnnotations, asGroup }`.
+- `pcbnew/tools/pcb_control.cpp` `PCB_CONTROL::AppendDesignBlock` (about 1430): under `__EMSCRIPTEN__` it first takes the host block (`ccTakeHostDesignBlock`); with one it checks its layout file and calls `AppendBoard` once (never repeated), the pane never read and no info bar line shown. A file static `s_ccHostPlaceAsGroup`, set by an RAII guard for that call, stands in for `m_DesignBlockChooserPanel.place_as_group` in `AppendBoard` (about 2225). With no host block KiCad's path runs word for word. Recompile reach: that one .cpp.
+- The schematic hunk (`eeschema/tools/sch_drawing_tools.cpp` 790 to 815, `SCH_DRAWING_TOOLS` taking the host block and its asSheet and keepAnnotations) is lane e8's (e-block-place-sch). Until it lands, the schematic half below starts KiCad's tool, which reads the pane as before and leaves the host block unused (the half then clears the slot).
+
+PCBJam:
+- `kicadDesignBlockPlace( argsJson )` registered in `cc_e7_dispatch` (`cc_e7::designBlockPlace`): `pcbEditorActive()` -> `cc_e7::blockPlacePcb` (`cc_e7_pcb.inc`, merged image only), `schEditorActive()` -> `cc_e7::blockPlaceSch` (`cc_e7_sch.inc`), else false.
+- Args read whole: exactly `dir` (a run folder under `/tmp/cc-block/`), `name` (the save's rule), `asSheet`, `keepAnnotations`, `asGroup` (booleans). The block is read synchronously by `DESIGN_BLOCK_IO::DesignBlockLoad( dir, name )`; false when it cannot be read or holds no file for the frame (`.kicad_pcb` on the board, `.kicad_sch` on the schematic), with no frame, or an open in flight. Then on the apply coroutine: `ccSetHostDesignBlock( block, options )`, `RunAction( PCB_ACTIONS::placeDesignBlock )` or `SCH_ACTIONS::placeDesignBlock`, then the slot cleared (a tool that did not start leaves no stale block for the pane's own placement).
+- The block's `LIB_ID` is the reader's: an empty nickname and the block's name. A group placed as a group therefore carries no design block LINK (`EDA_GROUP::HasDesignBlockLink` wants a nickname): Apply its layout and Save to its block need a group linked by Update from the schematic or by KiCad's pane. Open question for the site: the contract has no library nickname key.
+
+What the build train must probe:
+1. Frame sch on blocks-small, LDO's files written under `/tmp/cc-block/1/LDO.kicad_block/`: `Module.kicadDesignBlockPlace(JSON.stringify({dir:'/tmp/cc-block/1',name:'LDO',asSheet:true,keepAnnotations:false,asGroup:false}))` answers true, the block hangs off the pointer, a press commits ONE undo step, no dialog and no pane. Needs e8's e-block-place-sch merged; without it the tool reads the pane (wrong if seen on the joined build).
+2. keepAnnotations true: the designators are kept.
+3. Frame pcb, a block with a layout: asGroup true places ONE group named after the block (two or more items), one undo step; asGroup false places loose items; Esc cancels with no undo step.
+4. False at once: a block with no `.kicad_pcb` in frame pcb, a missing block, `dir` `/tmp/cc-place/1`, a sixth key, a non boolean option.
+5. After a refusal or a cancel, KiCad's own pane placement (if any door reaches it) places the pane's block, never a stale host one.
+6. The island e2e `blocks-place.spec.ts`.
+
+Checks: `syntax-check-run15.sh --kicad /home/matthew/cc-engine-wt/e7/kicad pcbnew eeschema kicad_editor occ --kicad-file pcbnew/tools/pcb_control.cpp`:
+
+```
+PASS pcbnew         pcbnew_embind.cpp subdir=pcbnew -DKICAD_MERGED_EMBIND (12123 ms)
+PASS eeschema       eeschema_embind.cpp subdir=eeschema -DKICAD_MERGED_EMBIND (12261 ms)
+PASS kicad_editor   kicad_editor_embind.cpp subdir=common  (5146 ms)
+PASS occ            pcbnew_embind.cpp subdir=pcbnew (11872 ms)
+PASS kicad pcbnew/tools/pcb_control.cpp (10240 ms)
+syntax-check: 0 failed
+```
+(the handover runs `all`.)
