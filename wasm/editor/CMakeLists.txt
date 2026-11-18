@@ -1,7 +1,10 @@
 # Merged pcbnew+eeschema WASM editor (editor-unification Part 2).
 #
-# ONE executable links THREE kifaces (pcbnew, eeschema, cvpcb); the editor frame
-# (PCB / Footprint / Schematic / Symbol) is chosen at runtime by single_top.cpp's
+# Modified by Circuit Center Inc on 2026-11-18: the drawing sheet editor (pl_editor) is a
+# fourth kiface of the image, booted by --frame=ds (engine run 15).
+#
+# ONE executable links FOUR kifaces (pcbnew, eeschema, cvpcb, pl_editor); the editor frame
+# (PCB / Footprint / Schematic / Symbol / Drawing sheet) is chosen at runtime by single_top.cpp's
 # --frame flag, while cvpcb only opens in-session via eeschema's Assign Footprints
 # (KIWAY::Player( FRAME_CVPCB )). Added from the kicad fork's top-level CMakeLists.txt
 # via add_subdirectory( ${KICAD_WASM_LAYER}/editor ) when EMSCRIPTEN AND
@@ -39,10 +42,11 @@ set_source_files_properties( ${CMAKE_SOURCE_DIR}/common/single_top.cpp PROPERTIE
     COMPILE_DEFINITIONS "TOP_FRAME=FRAME_PCB_EDITOR;KICAD_MERGED_KIFACES"
     )
 
-# All three kifaces' full library sets (exported CACHE INTERNAL by pcbnew/, eeschema/
-# and cvpcb/). The overlap (common, kicommon, gal, ...) is deduped; generator-expression
+# All four kifaces' full library sets (exported CACHE INTERNAL by pcbnew/, eeschema/,
+# cvpcb/ and pagelayout_editor/). The overlap (common, kicommon, gal, ...) is deduped; generator-expression
 # entries (native-only pads_common/pcm) are inert strings that evaluate to nothing here.
-set( KICAD_EDITOR_LIBS ${PCBNEW_KIFACE_LIBRARIES} ${EESCHEMA_KIFACE_LIBRARIES} ${CVPCB_KIFACE_LIBRARIES} )
+set( KICAD_EDITOR_LIBS ${PCBNEW_KIFACE_LIBRARIES} ${EESCHEMA_KIFACE_LIBRARIES} ${CVPCB_KIFACE_LIBRARIES}
+     ${PL_EDITOR_KIFACE_LIBRARIES} )
 list( REMOVE_DUPLICATES KICAD_EDITOR_LIBS )
 
 target_link_libraries( kicad_editor PRIVATE ${KICAD_EDITOR_LIBS} )
