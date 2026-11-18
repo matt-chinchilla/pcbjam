@@ -255,9 +255,23 @@ bool microwaveArm( std::string aArgsJson )
     return true;
 }
 
+
+/**
+ * kicadAutoplaceQuiet() -> bool, a marker (st-ap-e, K-AP): this engine's auto-placer
+ * (pcbnew.Autoplacer.autoplaceOffboard, autoplaceSelected) runs with no KiCad progress window
+ * (kicad pcbnew/autorouter/autoplace_tool.cpp, AUTOPLACE_TOOL::autoplace, under
+ * __EMSCRIPTEN__), so the island may list its cap autoplace and the page show its own working
+ * state. Always true.
+ */
+bool autoplaceQuiet()
+{
+    return true;
+}
+
 } // namespace cc_e2
 
 EMSCRIPTEN_BINDINGS( cc_e2_pcb )
 {
     emscripten::function( "kicadMicrowaveArm", &cc_e2::microwaveArm );
+    emscripten::function( "kicadAutoplaceQuiet", &cc_e2::autoplaceQuiet );
 }
