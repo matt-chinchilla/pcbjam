@@ -11,10 +11,50 @@
 // translation unit holds every lane's face) and every name registers in the block below,
 // never in a shared block. The rules: BUILD-NOTES-run15.md.
 
+#include <string>
+
 namespace cc_e10
 {
+// The halves, defined in cc_e10_pcb.inc and cc_e10_sch.inc (external linkage).
+std::string comparePcb( std::string aArgsJson );
+std::string compareSch( std::string aArgsJson );
+std::string findPcb( std::string aArgsJson );
+std::string findSch( std::string aArgsJson );
+
+/**
+ * kicadCompareWithSource (st-compare-e, cap compare): a placed symbol or a footprint against
+ * its source, 7.4's CompareResult. The board and schematic editors only; "" in any other frame
+ * (the footprint, symbol and drawing sheet editors read FALSE on both probes).
+ */
+std::string compareWithSource( std::string aArgsJson )
+{
+    if( pcbEditorActive() )
+        return comparePcb( aArgsJson );
+
+    if( schEditorActive() )
+        return compareSch( aArgsJson );
+
+    return "";
+}
+
+/**
+ * kicadFind (st-find-e-e, cap find): 7.1's FindArgs over the live document, the board or the
+ * schematic editor; "" in any other frame.
+ */
+std::string findDispatch( std::string aArgsJson )
+{
+    if( pcbEditorActive() )
+        return findPcb( aArgsJson );
+
+    if( schEditorActive() )
+        return findSch( aArgsJson );
+
+    return "";
+}
 } // namespace cc_e10
 
 EMSCRIPTEN_BINDINGS( cc_e10_dispatch )
 {
+    function( "kicadCompareWithSource", &cc_e10::compareWithSource );
+    function( "kicadFind", &cc_e10::findDispatch );
 }
