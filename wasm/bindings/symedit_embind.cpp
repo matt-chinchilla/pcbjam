@@ -16,12 +16,16 @@
  * 2026-11-16-symbol-editor-design.md, section 5.1, of the Circuit Center site).
  * Modified by Circuit Center Inc on 2026-11-18: the JSON readers, tokens and the text, text
  * box, shape, stroke and fill readers and appliers moved to symedit_common.h (cc_symedit).
+ * Modified by Circuit Center Inc on 2026-11-18: sy4-e, a placed part's reference prefix is read,
+ * set and checked as its prefix (never its designator), and a new De Morgan symbol has two
+ * body styles.
  */
 
 #ifdef __EMSCRIPTEN__
 
 #include <emscripten.h>
 #include <emscripten/bind.h>
+#include <refdes_utils.h>
 
 #include <algorithm>
 #include <array>
@@ -639,12 +643,31 @@ const char* fieldKindOf( const SCH_FIELD& aField )
     }
 }
 
-json symbolPropsJson( LIB_SYMBOL* aSymbol )
+/**
+ * sy4-e: a placed part opened in the editor carries its designator in the reference field
+ * (LoadSymbolFromSchematic's copy of the instance's fields, "U1"); its prefix is the field's
+ * text less the designator's number (KiCad's UTIL::GetRefDesPrefix, "U"). A library symbol's
+ * field is its prefix already.
+ */
+wxString refPrefixOf( const LIB_SYMBOL* aSymbol, bool aPlaced )
+{
+    const wxString text = aSymbol->GetReferenceField().GetText();
+    return aPlaced ? UTIL::GetRefDesPrefix( text ) : text;
+}
+
+/** The designator's number a placed part keeps when its prefix changes ("1" of "U1"). */
+wxString refSuffixOf( const LIB_SYMBOL* aSymbol )
+{
+    const wxString text = aSymbol->GetReferenceField().GetText();
+    return text.Mid( UTIL::GetRefDesPrefix( text ).length() );
+}
+
+json symbolPropsJson( LIB_SYMBOL* aSymbol, bool aPlaced = false )
 {
     json out = json::object();
 
     out["name"] = utf8( aSymbol->GetName() );
-    out["refPrefix"] = utf8( aSymbol->GetReferenceField().GetText() );
+    out["refPrefix"] = utf8( refPrefixOf( aSymbol, aPlaced ) );
     out["value"] = utf8( aSymbol->GetValueField().GetText() );
     out["footprint"] = utf8( aSymbol->GetFootprintField().GetText() );
     out["datasheet"] = utf8( aSymbol->GetDatasheetField().GetText() );
@@ -1734,6 +1757,12 @@ static bool kicadSymEditNew( std::string aArgsJson )
     if( !created )
         return false;
 
+    // sy4-e: CreateSymbol duplicates the pins for a second body style but leaves the De Morgan
+    // flag off, so the symbol counted one body style; set it as KiCad's symbol properties
+    // dialog does beside the same SetBodyStyleCount( 2, false, true ).
+    if( !parentChain.symbol() && bodies == "demorgan" )
+        created->SetHasDeMorganBodyStyles( true );
+
     if( !parentChain.symbol() )
     {
         if( power == "local" )
@@ -2191,7 +2220,7 @@ static std::string kicadSymEditSymbolGet()
     if( !symbol )
         return "";
 
-    return dumpJson( symbolPropsJson( symbol ) );
+    return dumpJson( symbolPropsJson( symbol, fr->IsSymbolFromSchematic() ) );
 }
 
 // symedit.symbol.set: {set: SymbolSet}, that key only; ONE commit "Symbol properties", with
@@ -2237,7 +2266,13 @@ static bool kicadSymEditSymbolSet( std::string aArgsJson )
         SCH_COMMIT commit( frame );
         commit.Modify( live, frame->GetScreen() );
 
-        applySymbolSet( live, set );
+        // sy4-e: a placed part's prefix is set before its designator's number, which it keeps.
+        SYMBOL_SET placedSet = set;
+
+        if( frame->IsSymbolFromSchematic() && placedSet.refPrefix )
+            placedSet.refPrefix = *placedSet.refPrefix + refSuffixOf( live );
+
+        applySymbolSet( live, placedSet );
 
         commit.Push( wxS( "Symbol properties" ) );
 
@@ -2411,14 +2446,28 @@ static std::string kicadSymEditCheck()
     std::vector<wxString>             messages;
     std::vector<SYMBOL_CHECK_FINDING> findings;
 
+    // sy4-e: a placed part is checked with its prefix in the reference field, as the library
+    // symbol it came from carries it; the designator is put back at once (a read, no commit).
+    const bool     placed = fr->IsSymbolFromSchematic();
+    const wxString designator = symbol->GetReferenceField().GetText();
+
+    if( placed )
+        symbol->GetReferenceField().SetText( refPrefixOf( symbol, true ) );
+
     try
     {
         CheckLibSymbol( symbol, messages, grid, fr, &findings );
     }
     catch( ... )
     {
+        if( placed )
+            symbol->GetReferenceField().SetText( designator );
+
         return "";
     }
+
+    if( placed )
+        symbol->GetReferenceField().SetText( designator );
 
     json list = json::array();
 
