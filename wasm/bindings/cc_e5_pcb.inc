@@ -12,6 +12,7 @@
 
 #include <pcb_io/pcb_io.h>
 #include <pcb_io/pcb_io_mgr.h>
+#include <tools/pcb_control.h>
 #include <wx/dialog.h>
 #include <wx/filename.h>
 #include <wx/log.h>
@@ -640,6 +641,62 @@ inline bool extract( EMBEDDED_FILES* aFiles, const std::string& aArgsJson )
 } // namespace embfiles
 } // namespace cc_e5::pcb
 
+namespace cc_e5::pcb
+{
+namespace placefile
+{
+using json = nlohmann::json;
+
+constexpr size_t    PATH_MAX_CHARS = 1024;
+constexpr long long BYTES_MAX = 25ll * 1024ll * 1024ll;   // place.file's bound
+
+/**
+ * kicadPlaceFromFile's closed shape, exactly {"kind": aKind, "path"}: path a regular file of at
+ * most 25 MB directly inside a stage run folder (/tmp/cc-stage/<n>, the island's, never the
+ * project folder), its extension aExt. The path, or nothing.
+ */
+inline std::optional<std::string> pathOf( const std::string& aArgsJson, const char* aKind,
+                                          const char* aExt )
+{
+    json args = json::parse( aArgsJson, nullptr, /*allow_exceptions*/ false );
+
+    if( args.is_discarded() || !args.is_object() || args.size() != 2 || !args.contains( "kind" )
+            || !args.contains( "path" ) || args["kind"] != json( aKind ) || !args["path"].is_string() )
+    {
+        return std::nullopt;
+    }
+
+    const std::string path = args["path"].get<std::string>();
+    const size_t      slash = path.rfind( '/' );
+    const std::string ext = aExt;
+
+    if( path.size() > PATH_MAX_CHARS || path.find( '\0' ) != std::string::npos
+            || slash == std::string::npos
+            || !cc_output::IsRunDir( path.substr( 0, slash ), "/tmp/cc-stage/" ) )
+    {
+        return std::nullopt;
+    }
+
+    // A file name of at least one character before the extension.
+    const std::string name = path.substr( slash + 1 );
+
+    if( name.size() <= ext.size() || name.compare( name.size() - ext.size(), ext.size(), ext ) != 0 )
+        return std::nullopt;
+
+    struct stat st;
+
+    if( ::stat( path.c_str(), &st ) != 0 || !S_ISREG( st.st_mode )
+            || static_cast<long long>( st.st_size ) > BYTES_MAX )
+    {
+        return std::nullopt;
+    }
+
+    return path;
+}
+
+} // namespace placefile
+} // namespace cc_e5::pcb
+
 namespace cc_e5
 {
 
@@ -1119,6 +1176,42 @@ bool embeddedFileExtractPcb( std::string aArgsJson )
         return false;
 
     return pcb::embfiles::extract( fr->GetBoard()->GetEmbeddedFiles(), aArgsJson );
+}
+
+// ── st-placefile-e: Append Board from a staged file (kicadPlaceFromFile, the board half) ──────
+
+/**
+ * The board half of kicadPlaceFromFile: exactly {"kind": "board", "path": "/tmp/cc-stage/<n>/
+ * <file>.kicad_pcb"}. On the apply coroutine PCB_CONTROL::AppendBoard with the KiCad plugin
+ * for the path (AppendBoardFromFile's own choice, KICTL_KICAD_ONLY, in place of its file
+ * dialog): the board's items on the pointer, ONE commit "Append Board" on the press (a cancel
+ * reverts). False for any other shape, kind or path, no ready frame.
+ */
+bool placeFromFilePcb( std::string aArgsJson )
+{
+    std::optional<std::string> path = pcb::placefile::pathOf( aArgsJson, "board", ".kicad_pcb" );
+    PCB_EDIT_FRAME*            fr = pcb::readyBoardFrame();
+
+    if( !path || !fr || !fr->GetToolManager()->GetTool<PCB_CONTROL>() )
+        return false;
+
+    const wxString file = wxString::FromUTF8( path->c_str() );
+
+    pcbjam_collab::runOnCoroutine( fr, [file]() {
+        PCB_EDIT_FRAME* frame = pcbFrame();   // re-resolved on the coroutine
+        PCB_CONTROL*    control = frame ? frame->GetToolManager()->GetTool<PCB_CONTROL>() : nullptr;
+
+        if( !control )
+            return;
+
+        PCB_IO_MGR::PCB_FILE_T type = PCB_IO_MGR::FindPluginTypeFromBoardPath( file, KICTL_KICAD_ONLY );
+        IO_RELEASER<PCB_IO>    pi( PCB_IO_MGR::FindPlugin( type ) );
+
+        if( pi )
+            control->AppendBoard( *pi, file );
+    } );
+
+    return true;
 }
 
 /** The board half of kicadFootprintConvert (cc_e5_dispatch.inc picks it in a board frame). */

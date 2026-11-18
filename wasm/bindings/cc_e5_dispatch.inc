@@ -75,6 +75,22 @@ bool embeddedFileExtract( std::string aArgsJson )
 
     return false;
 }
+// st-placefile-e: Import > A sheet or Another board (sch or pcb), the halves in the board and
+// schematic faces; the footprint and symbol editors read false on both probes.
+bool placeFromFilePcb( std::string aArgsJson );
+bool placeFromFileSch( std::string aArgsJson );
+
+/** kicadPlaceFromFile (st-placefile-e): a staged sheet or board onto the pointer. */
+bool placeFromFile( std::string aArgsJson )
+{
+    if( pcbEditorActive() )
+        return placeFromFilePcb( aArgsJson );
+
+    if( schEditorActive() )
+        return placeFromFileSch( aArgsJson );
+
+    return false;
+}
 } // namespace cc_e5
 
 EMSCRIPTEN_BINDINGS( cc_e5_dispatch )
@@ -83,4 +99,5 @@ EMSCRIPTEN_BINDINGS( cc_e5_dispatch )
     function( "kicadEmbeddedFilesGet", &cc_e5::embeddedFilesGet );
     function( "kicadEmbeddedFilesSet", &cc_e5::embeddedFilesSet );
     function( "kicadEmbeddedFileExtract", &cc_e5::embeddedFileExtract );
+    function( "kicadPlaceFromFile", &cc_e5::placeFromFile );
 }
