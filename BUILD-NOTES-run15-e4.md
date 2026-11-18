@@ -66,3 +66,52 @@ What the build train must probe (the fixture `fpedit-small`, an `?frame=fpedit` 
 - `kicadFpEditMarkSaved("t2")` after an edit: modified false, depth unchanged; `"wrong"` answers false.
 - `kicadFpEditSelect( JSON.stringify({ uuids: [<a pad uuid>], zoom: true }) )`, then `kicadFpEditSelection()` lists it; an unknown uuid answers false.
 - Fifty open and take cycles: `Module.HEAP8.length` flat past noise.
+
+## fp-e-items: the kind table and the four item exports (FP spec 7.2)
+
+Commit `fc24faa` (`cc_e4_fpedit.inc`, `cc_fp_items.h`).
+
+`cc_fp_items.h` (lane e4's after the seams) keeps E0's declarations and gains ONE declaration,
+`const char* ccItemKindName( const BOARD_ITEM* )` (the kind name by KiCad type: `PCB_PAD_T` pad,
+`PCB_FIELD_T` field, `PCB_TEXT_T` text, `PCB_TEXTBOX_T` textbox, `PCB_SHAPE_T` shape, the five
+`PCB_DIM_*_T` dimension, `PCB_ZONE_T` zone, `PCB_TABLE_T` table, `PCB_BARCODE_T` barcode,
+`PCB_REFERENCE_IMAGE_T` image, `PCB_POINT_T` point), and the BODIES' CONTRACT every kind and
+every caller keeps (written in the header):
+
+- `get` answers the record WITHOUT `kind` and `uuid`; `ccFpItemJson` writes both after it.
+- `set` takes the patch alone; it checks EVERY key before changing anything, a refusal stages and
+  changes nothing, a taken patch calls `aCommit.Modify( item )` BEFORE the change. A key the
+  item lacks is a refusal (FP spec: a set over several uuids carries only keys every one has).
+- `add` takes the record less `kind` and `uuid` and answers a NEW item parented to the
+  footprint and NOT yet added to it (nullptr when refused); the caller stamps the page's uuid and
+  stages `aCommit.Add( item )`, whose Push puts it into the footprint (in the footprint editor
+  `BOARD_COMMIT::Push` adds a CHT_ADD item to `GetFirstFootprint()`) or the board.
+
+Lanes e5 (the shape, dimension, zone, image and point rows, `cc_item_shape.h`) and e3 (m4-e,
+the board face over the table) write against this; reported to E0.
+
+Definitions (`namespace cc_fpitems` in `cc_e4_fpedit.inc`): the table is a function local static
+`std::vector<CcItemKind>` in `kindTable()`; `ccRegisterItemKind` refuses a row with a null name
+or body and keeps the first row of a name; `ccFpItemJson` answers a null json for an item with no
+row; `ccFpItemApply` refuses a patch that is not a non empty object or holds `kind` or `uuid`.
+
+| export | signature | body |
+|---|---|---|
+| `kicadFpEditItemsGet` | `std::string (std::string)` | `{uuids?[1..4096], kinds?[1..11], layers?[1..256]}`; the footprint's own items by `RunOnChildren( NO_RECURSE )` (fields, pads, zones, groups skipped, points, drawings: KiCad's child order) that have a row; a listed uuid not an item answers ""; layers keeps an item whose `GetLayerSet()` meets the list; positions relative to `footprint->GetPosition()` |
+| `kicadFpEditItemsSet` | `bool (std::string)` | `{uuids[1..4096], set}`; every uuid a top item, all of one kind; a dry run of the patch on a `Clone()` of the first item on a scratch `BOARD_COMMIT` never pushed (in the footprint editor `undoLevelItem` is the item itself, so the commit copies the clone alone and frees the copy) answers false before anything is queued; on the coroutine every item through `ccFpItemApply` in ONE commit `Edit`, reverted whole on any refusal |
+| `kicadFpEditItemsAdd` | `bool (std::string)` | `{items[1..512]}`; each `{kind, uuid, ...}`, the uuid lowercase, new to the footprint (recursive, the footprint's own included) and unique; each made once by its row and thrown away before queuing; on the coroutine made again and `commit.Add` in ONE commit `Add` |
+| `kicadFpEditItemsRemove` | `bool (std::string)` | `{uuids[1..4096]}`; every uuid a top item with a row, never the Reference or Value field (`PCB_FIELD::IsReference`, `IsValue`); the selection cleared, `commit.Remove` each, ONE commit `Delete` |
+
+Syntax check (`--kicad /home/matthew/cc-engine-wt/e0-kicad fpedit pcbnew occ`, the header is
+included by the merged pcbnew TU): `PASS pcbnew pcbnew_embind.cpp subdir=pcbnew
+-DKICAD_MERGED_EMBIND`, `PASS fpedit fpedit_embind.cpp subdir=pcbnew`, `PASS occ
+pcbnew_embind.cpp subdir=pcbnew`, `syntax-check: 0 failed`. Export check after merging
+run15/main 9f3a5d9: `0 failures`.
+
+What the build train must probe (fixture `fpedit-small`, the SOIC open; every kind row merged):
+
+- `kicadFpEditItemsGet("{}")`: every item with `kind` and `uuid`, fields first, then the 8 pads, then the drawings; `{"kinds":["pad"]}` the 8 pads only; `{"layers":["F.SilkS"]}` only silk items; `{"uuids":[<one pad>]}` that pad; `{"uuids":[<unknown>]}` answers "". Wrong: an item twice, a group or table cell listed, a missing kind or uuid.
+- `kicadFpEditItemsSet` over two pads `{set:{x: ...}}` is ONE undo step labeled Edit (depth +1, one Ctrl+Z restores both); a patch with a key no pad has answers false and depth stays.
+- `kicadFpEditItemsSet` over a pad and a field answers false (two kinds).
+- `kicadFpEditItemsAdd` of two shapes with page made uuids: ONE undo step Add, both read back with those uuids; a uuid already in the footprint answers false.
+- `kicadFpEditItemsRemove` of the Reference field's uuid answers false; of a silk line, one step Delete.
