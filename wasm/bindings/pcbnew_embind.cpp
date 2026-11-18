@@ -14,7 +14,7 @@
  * is obtained through other means (e.g., from the UI).
  *
  * Modified by Circuit Center Inc on 2026-11-18: lane e11's leased bodies, the board outputs'
- * per format 3D file check.
+ * per format 3D file check, the footprint export counting each library footprint once.
  */
 
 #ifdef __EMSCRIPTEN__
@@ -5832,8 +5832,10 @@ int ccRunOurBoardOutput( PCB_EDIT_FRAME* aFrame, BOARD* aBoard, const CC_BOARD_O
         // PCB_EDIT_FRAME::ExportFootprintsToLibrary without its library chooser, its boxes and
         // any library table: each footprint copied and reset as KiCad resets it, written by
         // the KiCad S-expression writer into <board>.pretty/. The folder is made first (a
-        // save into a folder that is missing asks in a box). Two footprints of one name: the
-        // first is kept and the rest are named in one warning line.
+        // save into a folder that is missing asks in a box). Each library footprint is written
+        // once: a footprint placed twice (the same library and name) is one footprint, with no
+        // line. Two footprints of one name from different libraries: the first is kept and
+        // the rest are named in one warning line.
         const wxString   stem = wxFileName( aBoard->GetFileName() ).GetName();
         wxFileName       lib;
         lib.AssignDir( wxString::FromUTF8( aArgs.dir.c_str() ) );
@@ -5843,8 +5845,8 @@ int ccRunOurBoardOutput( PCB_EDIT_FRAME* aFrame, BOARD* aBoard, const CC_BOARD_O
 
         io.CreateLibrary( libPath );   // throws IO_ERROR, an error line in the caller
 
-        std::set<wxString> saved;
-        wxArrayString      twins;
+        std::map<wxString, wxString> saved;   // footprint name -> the library footprint kept
+        wxArrayString                twins;
 
         for( FOOTPRINT* footprint : aBoard->Footprints() )
         {
@@ -5852,14 +5854,18 @@ int ccRunOurBoardOutput( PCB_EDIT_FRAME* aFrame, BOARD* aBoard, const CC_BOARD_O
                 continue;
 
             const wxString name = footprint->GetFPID().GetUniStringLibItemName();
+            const wxString libraryFootprint = footprint->GetFPID().GetUniStringLibId();
+            auto           kept = saved.find( name );
 
-            if( !saved.insert( name ).second )
+            if( kept != saved.end() )
             {
-                if( twins.Index( name ) == wxNOT_FOUND )
+                if( kept->second != libraryFootprint && twins.Index( name ) == wxNOT_FOUND )
                     twins.Add( name );
 
                 continue;
             }
+
+            saved.emplace( name, libraryFootprint );
 
             std::unique_ptr<FOOTPRINT> copy(
                     static_cast<FOOTPRINT*>( footprint->Duplicate( IGNORE_PARENT_GROUP ) ) );
