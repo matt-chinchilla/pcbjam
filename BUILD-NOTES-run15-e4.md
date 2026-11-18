@@ -285,3 +285,26 @@ no recorded results in the plan, report or engine folders; item 2 is read on bui
 07:16 was queued behind the gate slots (`/home/matthew/cc-engine/out/run15-launcher.log`) and has
 not answered. The next seat writes the report once build G answers and the t0 results are found
 (or run by whoever owns the GPU window): plan A (coded) or plan B, and whether fp-f1 is built.
+
+## Handover checks (2026-11-18)
+
+After git merge run15/main in the lane worktrees, run by the controller on the lane tips. Every code unit of the lane is committed. The unit fp-e0 is the gate 0 report (BUILD-NOTES-run15-fp-gate0.md), a measurement write up that changes no code: it is still owed and does not hold the merge.
+
+The syntax check all:
+
+```
+PASS pcbnew         pcbnew_embind.cpp subdir=pcbnew -DKICAD_MERGED_EMBIND (13110 ms)
+PASS eeschema       eeschema_embind.cpp subdir=eeschema -DKICAD_MERGED_EMBIND (12648 ms)
+PASS symedit        symedit_embind.cpp subdir=eeschema  (6621 ms)
+PASS fpedit         fpedit_embind.cpp subdir=pcbnew  (8567 ms)
+PASS dsedit         dsedit_embind.cpp subdir=pagelayout_editor  (952 ms)
+PASS kicad_editor   kicad_editor_embind.cpp subdir=common  (4787 ms)
+PASS occ            pcbnew_embind.cpp subdir=pcbnew (12081 ms)
+syntax-check: 0 failed
+```
+
+The export check:
+
+```
+check-run15-exports: 237 names registered in the merged image (230 kicad names), 92 of 111 run 15 names, 0 failures
+```
