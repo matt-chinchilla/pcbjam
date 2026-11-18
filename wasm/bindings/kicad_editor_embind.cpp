@@ -996,6 +996,7 @@ static std::string settingsSections()
 #include "cc_e7_dispatch.inc"
 #include "cc_e10_dispatch.inc"
 #include "cc_e12_dispatch.inc"
+#include "cc_boot_dispatch.inc"
 
 EMSCRIPTEN_BINDINGS(kicad_editor) {
     // Apply-queue idle probe (drift-trio finding #10b): a scratch save taken
