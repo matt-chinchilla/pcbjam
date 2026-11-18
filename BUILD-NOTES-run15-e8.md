@@ -45,3 +45,18 @@ Commits: kicad c2cd9e93 (K-SITEM, K-SHEETFILE), pcbjam e4c177c (`cc_e8_sch.inc`)
 - Sheet file: set `file` to an existing sub sheet's file with `fileMode: "useExisting"`: the sheet links (renamed lists it, depth unchanged as KiCad's own); with `rename` to a new name: the new file written on disk. A file another sheet shows with `rename`: `items.json` error `in_use`, nothing changed.
 - `kicadSchPlaceImage({"path":"/tmp/cc-schimage/a.png"})` with a PNG written there: the picture hangs on the pointer, a click places it (one undo step). A non image file: false.
 - Failure signs: a KiCad dialog or message box on any road; two undo steps for one set; a set that changes nothing yet answers true with applied 0 for a valid item.
+
+## sy4-e: symbol editor faults (SY4)
+
+Commit: pcbjam f4f875d (`wasm/bindings/symedit_embind.cpp` only; no export, no KiCad file). The lane file stands for `BUILD-NOTES-run15-sy4.md` (the unit's ownedPaths name it; written here instead, one notes file per lane).
+
+- The prefix: a placed part opened in the editor (`IsSymbolFromSchematic()`) carries its designator in the reference field (LoadSymbolFromSchematic's copy, "U1"). `refPrefixOf` answers KiCad's `UTIL::GetRefDesPrefix` of it ("U") in `kicadSymEditSymbolGet`'s `refPrefix`; a `symbol.set` `refPrefix` in placed mode keeps the designator's number (`refSuffixOf`: "R" on "U1" sets "R1"), so the push back keeps the part's designator; `kicadSymEditCheck` runs KiCad's `CheckLibSymbol` with the prefix in the field and puts the designator back at once (a read, no commit). A library symbol is unchanged.
+- De Morgan on new: `LIB_SYMBOL_LIBRARY_MANAGER::CreateSymbol` calls `SetBodyStyleCount( 2, false, true )` (pins duplicated) but never `SetHasDeMorganBodyStyles( true )`, and `GetBodyStyleCount` counts names or the flag, so the symbol had one body style. `kicadSymEditNew` now sets the flag after CreateSymbol for `bodyStyles: "demorgan"` with no parent (KiCad's symbol properties dialog pairs the same two calls).
+
+**Syntax check**: `symedit`: `PASS symedit symedit_embind.cpp subdir=eeschema (8342 ms)`, `syntax-check: 0 failed`.
+
+**What the build train must probe** (symedit-small fixture and any schematic with U1):
+- `symbol.forEditor` on U1, `symedit.open` mode placed, `kicadSymEditSymbolGet()`: `refPrefix` "U" (failure: "U1"). `kicadSymEditCheck()`: no `reference_prefix_digit` finding (failure: one). The field on the canvas still reads U1.
+- `symbol.set` `{refPrefix: "IC"}` in placed mode, then push: the part reads IC1 on the schematic (failure: "IC" with no number, or the part unannotated).
+- `kicadSymEditNew` with `bodyStyles: "demorgan"`: the state's body style count is 2 and `bodyStyles.mode` "demorgan"; the body style press steps between 1 and 2 (failure: one body style). With "one": one.
+- A library symbol (mode library) reads its field unchanged.
