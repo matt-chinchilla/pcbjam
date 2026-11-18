@@ -336,7 +336,7 @@ KiCad file of the lane, `pcbnew/dialogs/panel_setup_tuning_profile_info.cpp`, ha
 change (one object recompiles). Nothing to report to E0: no include path, CMake or build script
 line, no new export name.
 
-## State for the relay (after st-editprefs-e)
+## State for the relay (after st-editprefs-e; kept for its history, the handover above is current)
 
 Done and committed: lo-e3s-e (3558c9e), st-routing-e (fe4e114), st-origins-e (134c8f1),
 st-editprefs-e (1833c6d); each has its status file. Then `git merge run15/main` (pcbjam fc22233;
