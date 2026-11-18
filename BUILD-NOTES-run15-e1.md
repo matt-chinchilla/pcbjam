@@ -147,3 +147,32 @@ What the build train must probe:
 - A message raised while an entry answer is applied (an entry the dialog refuses with a message box): the entry's refusal carries that sentence and no `message` ask arrives.
 - Schematic, right click a wire, Assign a net class: `ask` `assignNetclass`, `record.pattern` the wire's net, `record.netclasses[0]` `Default`; `{"pattern":"<net>","netclass":"Default"}` accepted, Schematic Setup's net class assignments list the pattern; `{"netclass":"Nope"}` refuses with field `netclass`. Wrong: the netclass list doubled after a not taken ask (no listener: KiCad's dialog must list each class once).
 - No listener: every message box and the netclass dialog show as before.
+
+## Relay point (after m1x-e2)
+
+Both worktrees merged `run15/main` (pcbjam c7e3948, kicad 67c9069b) and clean. From `/home/matthew/cc-engine-wt/e1/pcbjam`:
+
+`/home/matthew/cc-wave2/bin/gate.sh scripts/kicad/syntax-check-run15.sh --kicad /home/matthew/cc-engine-wt/e1/kicad all --kicad-file common/tool/tool_manager.cpp --kicad-file common/kidialog.cpp --kicad-file common/confirm.cpp --kicad-file common/dialogs/dialog_assign_netclass.cpp`
+
+```
+PASS pcbnew         pcbnew_embind.cpp subdir=pcbnew -DKICAD_MERGED_EMBIND (15500 ms)
+PASS eeschema       eeschema_embind.cpp subdir=eeschema -DKICAD_MERGED_EMBIND (15135 ms)
+PASS symedit        symedit_embind.cpp subdir=eeschema  (8679 ms)
+PASS fpedit         fpedit_embind.cpp subdir=pcbnew  (8253 ms)
+PASS dsedit         dsedit_embind.cpp subdir=pagelayout_editor  (1289 ms)
+PASS kicad_editor   kicad_editor_embind.cpp subdir=common  (5967 ms)
+PASS occ            pcbnew_embind.cpp subdir=pcbnew (13647 ms)
+PASS kicad common/tool/tool_manager.cpp (6352 ms)
+PASS kicad common/kidialog.cpp (3455 ms)
+PASS kicad common/confirm.cpp (2408 ms)
+PASS kicad common/dialogs/dialog_assign_netclass.cpp (4645 ms)
+syntax-check: 0 failed
+```
+
+`scripts/kicad/check-run15-exports.sh --since run15/main --kicad /home/matthew/cc-engine-wt/e1/kicad --kicad-since run15/main`: `163 names registered in the merged image (156 kicad names), 18 of 110 run 15 names, 0 failures`.
+
+Units left for the relay seat, in order: m12-e, st-keys-e, m6-e3. Read for m12-e so far:
+
+- The CSV builder is NOT in `include/tool/edit_table_tool_base.h`: it is written twice, inside `SCH_EDIT_TABLE_TOOL::ExportTableToCSV` (`eeschema/tools/sch_edit_table_tool.cpp`, from the `wxFileDialog` at about 119; cell text `GetShownText( nullptr, &currentSheet, false, 0 )`) and `PCB_EDIT_TABLE_TOOL::ExportTableToCSV` (`pcbnew/tools/pcb_edit_table_tool.cpp` about 162; `GetShownText( false, 0 )`), each with the same `escapeCSV` lambda (quote a field holding a comma, quote or newline, quotes doubled), fields joined by `,`, rows ended by `\n`. Neither tool .cpp is in this lane's files (no author holds them, `mq.py grep` finds none). The plan: lift the builder into `edit_table_tool_base.h` as a free template under `__EMSCRIPTEN__` (the one builder `kicadTableCsv` calls, given the cell text reader), and REPORT to E0 that making KiCad's two actions call it needs those two tool files (or accept that the action's own copy stays, the action being held by the island under cap `tableCsv`).
+- `kicadTableCsv` is an export of both frames: declare `tableCsvPcb` and `tableCsvSch` in `cc_e1_dispatch.inc`, define them in `cc_e1_pcb.inc` and `cc_e1_sch.inc` (record `{ name, text }` for `{ uuid }`).
+- The schematic table dialog (`eeschema/dialogs/dialog_table_properties.cpp`) fills the grid in `TransferDataToWindow` (covered cells get a color string), reads it back in `TransferDataFromWindow` with `m_grid->CommitPendingChanges()` first and `ConvertRefsToKIIDs`; strokes through `m_borderCheckbox`, `m_headerBorder`, `m_borderWidth`, `m_borderColorSwatch`, `m_borderStyleCombo` (index into `lineTypeNames`), the same for separators. Per the manifest note, each of the four dialogs overrides both `ShowModal` and `ShowQuasiModal` under `__EMSCRIPTEN__` (the board shows them quasi modal); copy the m1x-e1 receiver pattern (`dialog_text_entry.cpp`).
