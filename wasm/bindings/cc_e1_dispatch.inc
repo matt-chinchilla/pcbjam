@@ -12,6 +12,11 @@
 // never in a shared block. The rules: BUILD-NOTES-run15.md.
 
 #include <host_prompt.h>
+#include <tool/host_context_menu.h>
+#include <wx/dialog.h>
+#include <wx/toplevel.h>
+#include "collab_common.h"
+#include "open_gate.h"
 
 namespace cc_e1
 {
@@ -63,6 +68,76 @@ bool heldMenus()
 {
     return true;
 }
+
+// ---- m1-e: K-MENU (kicad include/tool/host_context_menu.h, canvas addendum 3.1) ----------------
+
+// A marker: this engine reports every canvas context menu and clarify list to the page first
+// (window.kicadHostMenu.onMenu) and shows KiCad's popup only when the page does not take it.
+bool hostContextMenu()
+{
+    return true;
+}
+
+// The page's choice in the parked menu (-1 cancels): 0 done, 1 stale, 2 no item with that id,
+// 3 disabled, 4 a submenu or separator.
+int contextMenuChoose( int aToken, int aId )
+{
+    return CcHostMenuChoose( aToken, aId );
+}
+
+// The item under the page's pointer in the parked menu (the clarify list brightens it): the
+// codes of contextMenuChoose.
+int contextMenuHighlight( int aToken, int aId )
+{
+    return CcHostMenuHighlight( aToken, aId );
+}
+
+// True while a modal KiCad dialog shows on the port.
+static bool modalDialogUp()
+{
+    for( wxWindowList::compatibility_iterator node = wxTopLevelWindows.GetFirst(); node;
+         node = node->GetNext() )
+    {
+        wxDialog* dialog = dynamic_cast<wxDialog*>( node->GetData() );
+
+        if( dialog && dialog->IsModal() )
+            return true;
+    }
+
+    return false;
+}
+
+// Run one tool action of the live frame by name, as a menu press would (on its own coroutine,
+// from the frame's event loop, so an action that opens a window may suspend): 0 dispatched,
+// 1 not a tool action of this frame (nothing run), 3 busy (a parked menu, a parked prompt, a
+// modal dialog, KiCad's own popup or an open in flight), 4 no frame. Never asks
+// hostHoldsAction: the island refuses held names first.
+int runAction( std::string aName )
+{
+    KIWAY_PLAYER* frame =
+            wxTheApp ? dynamic_cast<KIWAY_PLAYER*>( wxTheApp->GetTopWindow() ) : nullptr;
+    TOOL_MANAGER* toolMgr = frame ? frame->GetToolManager() : nullptr;
+
+    if( !toolMgr || !toolMgr->GetActionManager() )
+        return 4;
+
+    if( !toolMgr->GetActionManager()->FindAction( aName ) )
+        return 1;
+
+    if( CcHostMenuParked() || CcHostPromptModalParked() || toolMgr->IsContextMenuActive()
+            || modalDialogUp() || frame->Kiway().GetBlockingDialog() || pcbjam_open::busy() )
+    {
+        return 3;
+    }
+
+    pcbjam_collab::runOnCoroutine( frame,
+            [toolMgr, aName]()
+            {
+                toolMgr->RunAction( aName );
+            } );
+
+    return 0;
+}
 } // namespace cc_e1
 
 EMSCRIPTEN_BINDINGS( cc_e1_dispatch )
@@ -72,4 +147,8 @@ EMSCRIPTEN_BINDINGS( cc_e1_dispatch )
     emscripten::function( "kicadPromptCancel", &cc_e1::promptCancel );
     emscripten::function( "kicadPromptPick", &cc_e1::promptPick );
     emscripten::function( "kicadHeldMenus", &cc_e1::heldMenus );
+    emscripten::function( "kicadHostContextMenu", &cc_e1::hostContextMenu );
+    emscripten::function( "kicadContextMenuChoose", &cc_e1::contextMenuChoose );
+    emscripten::function( "kicadContextMenuHighlight", &cc_e1::contextMenuHighlight );
+    emscripten::function( "kicadRunAction", &cc_e1::runAction );
 }
