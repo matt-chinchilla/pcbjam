@@ -16,7 +16,25 @@ using namespace emscripten;
 
 namespace cc_e6
 {
+// Bumped by the frame's change hook (PL_EDITOR_FRAME::OnModify, below): every change of the
+// sheet, by a tool, an undo or redo, or an export, counts once. kicadDsEditState reads it.
+static unsigned long long g_dsChangeCount = 0;
+
+unsigned long long dsChangeCount()
+{
+    return g_dsChangeCount;
+}
 } // namespace cc_e6
+
+
+// The drawing sheet frame's change hook. The fork's pagelayout_editor/pl_editor_frame.cpp
+// calls it from PL_EDITOR_FRAME::OnModify() under __EMSCRIPTEN__; the standalone pl_editor
+// image defined it in pl_editor_embind.cpp (the collaboration bridge), which the merged image
+// does not link. Here it only counts: no JS listener, no collaboration bridge.
+extern "C" void kicadCollabOnModify()
+{
+    ++cc_e6::g_dsChangeCount;
+}
 
 EMSCRIPTEN_BINDINGS( cc_e6_dsedit )
 {
