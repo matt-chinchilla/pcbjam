@@ -172,3 +172,12 @@ PASS kicad_editor   kicad_editor_embind.cpp subdir=common  (4621 ms)
 PASS occ            pcbnew_embind.cpp subdir=pcbnew (11118 ms)
 syntax-check: 2 failed
 ```
+
+## fp-e8 green (relay seat, 2026-11-18)
+
+After E0 dca68eb added -I thirdparty/dxflib_qcad, git merge run15/main in both worktrees (pcbjam and kicad), then the syntax check:
+
+    PASS fpedit         fpedit_embind.cpp subdir=pcbnew
+    PASS eeschema       eeschema_embind.cpp subdir=eeschema -DKICAD_MERGED_EMBIND
+
+fp-e8 code is 9c1570e (kicad: none). Still owed at the handover: the syntax check all, the export check, e6.done. sy2-e stays held (no diagnosis says to build it).
