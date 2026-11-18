@@ -19,8 +19,15 @@
 // (ccRegisterPcbSection), consulted after the built-in sections by the get, the set (before
 // Board Setup's OK steps, ccPcbSettingsChanged) and the list (ccPcbSections,
 // pcbSettingsSections for the export kicadSettingsSections).
+//
+// Modified by Circuit Center Inc on 2026-11-18: a board settings set ends with KiCad's tool
+// reset (Board Setup's OK path: ResetTools MODEL_RELOAD and the model change event, so the
+// router reads the new rules), the stackup and finish sets included; the stackup set adds and
+// removes a dielectric sublayer (Board Setup's Add and Remove Dielectric Layer); the reannotate
+// op's duplicate check skips empty and invalid designators as the dialog's does.
 
 #include <board_stackup_manager/board_stackup.h>
+#include <board_stackup_manager/stackup_predefined_prms.h>
 #include <cleanup_item.h>
 #include <collectors.h>
 #include <common.h>
@@ -1887,15 +1894,16 @@ void ccOpReannotate( PCB_EDIT_FRAME* aFrame, BOARD_COMMIT& aCommit, const CC_BOA
             }
         }
 
+        // The dialog's scope choice overrides the designator's own state (an empty or invalid
+        // designator in scope is numbered, one out of scope is excluded).
         if( fp->IsLocked() && a.skipLocked )
             info.action = 3;
-        else if( a.scope == "selected"
-                 && !( a.net.uuids.empty() ? fp->IsSelected() : a.net.uuids.count( fp->m_Uuid ) > 0 ) )
-            info.action = 3;
+        else if( a.scope == "selected" )
+            info.action = ( a.net.uuids.empty() ? fp->IsSelected() : a.net.uuids.count( fp->m_Uuid ) > 0 ) ? 0 : 3;
         else if( a.scope == "front" )
-            info.action = info.front ? info.action : 3;
+            info.action = info.front ? 0 : 3;
         else if( a.scope == "back" )
-            info.action = info.front ? 3 : info.action;
+            info.action = info.front ? 3 : 0;
 
         ( info.front ? front : back ).push_back( info );
     }
@@ -1979,18 +1987,26 @@ void ccOpReannotate( PCB_EDIT_FRAME* aFrame, BOARD_COMMIT& aCommit, const CC_BOA
     build( front, a.frontStart, a.frontPrefix, a.removeFrontPrefix );
     build( back, a.backStart, a.backPrefix, a.removeBackPrefix );
 
-    // Two parts ending with one designator stops the run (the dialog's duplicate check).
-    std::map<wxString, int> uses;
+    // Two parts ending with one designator stops the run (the dialog's duplicate check). As the
+    // dialog's scan of its change array, a designator left empty or invalid (no digit, as the
+    // seven REF** logos of Glasgow) never starts a duplicate: the run 14 count took every
+    // footprint and answered duplicate_designator on Glasgow for REF** alone.
+    std::map<wxString, std::pair<int, bool>> uses;   // count, and one entry of it numbered or kept
 
-    for( FOOTPRINT* fp : board->Footprints() )
+    for( const std::vector<CC_REFDES_INFO>* list : { &front, &back } )
     {
-        auto it = next.find( fp );
-        uses[it == next.end() ? fp->GetReference() : it->second]++;
+        for( const CC_REFDES_INFO& info : *list )
+        {
+            auto                   it = next.find( info.fp );
+            std::pair<int, bool>& use = uses[it == next.end() ? info.ref : it->second];
+            use.first++;
+            use.second = use.second || ( info.action != 1 && info.action != 2 );
+        }
     }
 
-    for( const auto& [ref, count] : uses )
+    for( const auto& [ref, use] : uses )
     {
-        if( count > 1 && !ref.IsEmpty() )
+        if( use.first > 1 && use.second && !ref.IsEmpty() )
         {
             aLines.emplace_back( RPT_SEVERITY_ERROR, wxString::Format( wxS( "Duplicate instances of %s" ), ref ) );
             aBlocked = true;
@@ -2862,6 +2878,97 @@ void ccPcbSettingsChanged( PCB_EDIT_FRAME* aFrame )
     aFrame->GetCanvas()->GetView()->UpdateAllItems( KIGFX::REPAINT );
     aFrame->GetCanvas()->Refresh();
     aFrame->UpdateUserInterface();
+
+    // Engine run 15 (lo-e3s-e, PE31): the rest of the dialog's OK path. The tools reset on the
+    // model and the model change event makes the router reload its design rules; without them
+    // a live router kept the rules it read before the set. (The dialog also rebuilds the aux
+    // toolbar, a protected member of the frame and chrome the engine never shows.)
+
+    if( TOOL_MANAGER* tools = aFrame->GetToolManager() )
+    {
+        tools->ResetTools( TOOL_BASE::MODEL_RELOAD );
+
+        TOOL_EVENT toolEvent( TC_COMMAND, TA_MODEL_CHANGE, AS_ACTIVE );
+        toolEvent.SetHasPosition( false );
+        tools->ProcessEvent( toolEvent );
+    }
+}
+
+/** Engine run 15 (lo-e3s-e): Board Setup's Add Dielectric Layer and Remove Dielectric Layer
+ *  (PANEL_SETUP_BOARD_STACKUP onAddDielectricLayer, onRemoveDielectricLayer) as one edit.
+ *  aValue is exactly {"addDielectric": {"after": index}} or {"removeDielectric": {"index",
+ *  "sub"}}, index a stackup item as the stackup section's rows name it. Add takes an enabled
+ *  dielectric and puts a new sublayer after its last one (the dialog lists each sublayer, the
+ *  wire names the item); Remove takes a sublayer of an enabled dielectric that has two or more,
+ *  as the dialog's list does. The new sublayer's material is KiCad's "not specified" keyword
+ *  (the panel's transfer writes it for an empty field). Empty when the value is anything else. */
+std::function<void()> ccStackupDielectricEdit( BOARD_STACKUP& aStackup, const json& aValue )
+{
+    if( !aValue.is_object() || aValue.size() != 1 )
+        return {};
+
+    const std::vector<BOARD_STACKUP_ITEM*>& list = aStackup.GetList();
+
+    auto dielectricAt =
+            [&]( const json& aIndex ) -> BOARD_STACKUP_ITEM*
+            {
+                if( !aIndex.is_number_integer() || aIndex.get<long long>() < 0
+                        || aIndex.get<long long>() >= (long long) list.size() )
+                {
+                    return nullptr;
+                }
+
+                BOARD_STACKUP_ITEM* item = list[(size_t) aIndex.get<long long>()];
+
+                return item && item->IsEnabled() && item->GetType() == BS_ITEM_TYPE_DIELECTRIC ? item
+                                                                                                : nullptr;
+            };
+
+    if( aValue.contains( "addDielectric" ) )
+    {
+        const json& add = aValue["addDielectric"];
+
+        if( !add.is_object() || add.size() != 1 || !add.contains( "after" ) )
+            return {};
+
+        BOARD_STACKUP_ITEM* item = dielectricAt( add["after"] );
+        int                 rows = 0;
+
+        for( BOARD_STACKUP_ITEM* each : list )
+            rows += each->GetSublayersCount();
+
+        if( !item || rows >= 256 )   // the stackup section reads at most 256 rows
+            return {};
+
+        return [item]()
+               {
+                   const int at = item->GetSublayersCount();
+
+                   item->AddDielectricPrms( at );
+                   item->SetMaterial( NotSpecifiedPrm(), at );
+               };
+    }
+
+    if( aValue.contains( "removeDielectric" ) )
+    {
+        const json& remove = aValue["removeDielectric"];
+
+        if( !remove.is_object() || remove.size() != 2 || !remove.contains( "index" )
+                || !remove.contains( "sub" ) || !remove["sub"].is_number_integer() )
+        {
+            return {};
+        }
+
+        BOARD_STACKUP_ITEM* item = dielectricAt( remove["index"] );
+        const long long     sub = remove["sub"].get<long long>();
+
+        if( !item || item->GetSublayersCount() < 2 || sub < 0 || sub >= item->GetSublayersCount() )
+            return {};
+
+        return [item, sub]() { item->RemoveDielectricPrms( (int) sub ); };
+    }
+
+    return {};
 }
 
 /** The rules text parsed as Board Setup's Check rules does; each error a {line, column, message}. */
@@ -3319,17 +3426,34 @@ void ccRunPcbSettingsSet( const CC_PCB_SETTINGS_ARGS& a )
             }
             else if( a.section == "stackup" )
             {
-                // {rows?: [{index, sub?, material?, thickness?, epsilon?, lossTangent?, color?}]}
+                // {rows: [{index, sub?, material?, thickness?, epsilon?, lossTangent?, color?}]},
+                // or exactly one of {addDielectric: {after}} and {removeDielectric: {index, sub}}
+                // (engine run 15, lo-e3s-e).
                 BOARD_STACKUP& stackup = bds.GetStackupDescriptor();
                 const auto&    list = stackup.GetList();
 
-                ok = a.value.is_object() && a.value.size() == 1 && a.value.contains( "rows" )
-                     && a.value["rows"].is_array() && !a.value["rows"].empty()
-                     && a.value["rows"].size() <= 256;
-
                 std::vector<std::function<void()>> edits;
+                const bool dielectric = a.value.is_object() && a.value.size() == 1
+                                        && ( a.value.contains( "addDielectric" )
+                                             || a.value.contains( "removeDielectric" ) );
 
-                for( size_t i = 0; ok && i < a.value["rows"].size(); ++i )
+                if( dielectric )
+                {
+                    std::function<void()> edit = ccStackupDielectricEdit( stackup, a.value );
+                    ok = (bool) edit;
+
+                    if( ok )
+                        edits.push_back( std::move( edit ) );
+                }
+                else
+                {
+                    ok = a.value.is_object() && a.value.size() == 1 && a.value.contains( "rows" )
+                         && a.value["rows"].is_array() && !a.value["rows"].empty()
+                         && a.value["rows"].size() <= 256;
+                }
+
+                for( size_t i = 0; ok && !dielectric && i < a.value["rows"].size(); ++i )
+
                 {
                     const json& row = a.value["rows"][i];
                     ok = row.is_object() && row.contains( "index" ) && row["index"].is_number_integer();
@@ -3402,8 +3526,7 @@ void ccRunPcbSettingsSet( const CC_PCB_SETTINGS_ARGS& a )
                         edit();
 
                     bds.SetBoardThickness( stackup.BuildBoardThicknessFromStackup() );
-                    fr->OnModify();
-                    fr->GetCanvas()->Refresh();
+                    ccPcbSettingsChanged( fr );   // Board Setup's OK steps, the tool reset among them
                 }
             }
             else if( a.section == "finish" )
@@ -3477,9 +3600,7 @@ void ccRunPcbSettingsSet( const CC_PCB_SETTINGS_ARGS& a )
                     for( const std::function<void()>& edit : edits )
                         edit();
 
-                    fr->OnModify();
-                    fr->GetCanvas()->GetView()->UpdateAllItems( KIGFX::REPAINT );
-                    fr->GetCanvas()->Refresh();
+                    ccPcbSettingsChanged( fr );   // Board Setup's OK steps, the tool reset among them
                 }
             }
             else if( a.section == "customRules" )
