@@ -60,3 +60,72 @@ Commit: pcbjam f4f875d (`wasm/bindings/symedit_embind.cpp` only; no export, no K
 - `symbol.set` `{refPrefix: "IC"}` in placed mode, then push: the part reads IC1 on the schematic (failure: "IC" with no number, or the part unannotated).
 - `kicadSymEditNew` with `bodyStyles: "demorgan"`: the state's body style count is 2 and `bodyStyles.mode` "demorgan"; the body style press steps between 1 and 2 (failure: one body style). With "one": one.
 - A library symbol (mode library) reads its field unchanged.
+
+## m9-e: sheet pins against labels
+
+Commits: kicad 402fb267 (K-SYNCPIN), pcbjam 234c890 (`cc_e8_sch.inc`).
+
+**KiCad (under `#ifdef __EMSCRIPTEN__`):**
+- `eeschema/tools/sch_item_host.h`: `CC_SYNC_TEMPLATE` (owned copies of the counterparts, `Current()`, `CanPlaceMore()`, `EndPlaceItem()`, `EndPlacement()`) and `CcSyncTemplate()`, the one armed template.
+- `eeschema/tools/sch_drawing_tools.cpp`: `ccSyncPlacementTemplate( dialog )` (the dialog's template first, else the armed one) read at the hierarchical label template site and the sheet pin from label site of `TwoClickPlace`; after a placement with the armed template, `EndPlaceItem()` and the next name (`goto PLACE_NEXT`) or the tool pops (as the dialog's path, without `Show`); at the tool's end `EndPlacement()` (Esc ends, nothing stays armed).
+
+**PCBJam, `cc_e8_sch.inc` (not merged only):**
+- `kicadSheetPinsGet( std::string )`: `{}` or `{"sheets": [{uuid, sheetPath}]}` (sheetPath = the path the sheet sits on). Answers `{"sheets": [{sheet, sheetPath, name, file, pairs: [{name, pin, label, pinShape, labelShape}]}], "truncated"}`. Pairing: PANEL_SYNC_SHEET_PINS::UpdateForms' rule first (labels de-duplicated by name, StrNumCmp order; same name AND shape pair), then the same name with differing shapes paired into one row (spec 7.3's "a dot where the shapes differ"), then singles. At most 4,096 pairs a sheet.
+- `kicadSheetPinsApply( std::string )`: `{run, dir: "/tmp/cc-sheet-pins/<n>", actions (1 to 4,096)}`, actions as spec 7.3 (closed per op; every pin and label must exist when called). ONE `SCH_COMMIT` "Synchronize sheet pins": a pin staged through its sheet (`Modify( sheet )`), removed as `SCH_EDIT_TOOL::DoDelete` does (`RemovePin` after staging); a label `Modify` or `Remove`. Record `sheet-pins.json` `{applied, depth}` last.
+- `kicadSheetPinsPlace( std::string )`: `{sheet, sheetPath, place: "pin"|"label", names (1 to 64)}`; every name needs its counterpart (for a pin: a hierarchical label of that name in the sub sheet; for a label: a pin of that name), else false. On the coroutine, as `doSyncSheetsPins`' placement callback: arms the template with copies of the counterparts; label: `changeSheet` into the sheet, `placeHierLabel`; pin: `changeSheet` to the parent when not shown, `SyncSelection( {}, nullptr, { sheet } )`, `placeSheetPin`. Each press places the next name; KiCad's commit per placement.
+
+**Syntax check** (`all --kicad-file eeschema/sheet.cpp --kicad-file eeschema/tools/sch_edit_tool.cpp --kicad-file eeschema/tools/sch_drawing_tools.cpp --kicad-file eeschema/tools/backannotate.cpp`, `--kicad /home/matthew/cc-engine-wt/e8/kicad`, after merging run15/main in both worktrees): `PASS pcbnew`, `PASS eeschema`, `PASS symedit`, `PASS fpedit`, `PASS dsedit`, `PASS kicad_editor`, `PASS occ`, `PASS kicad eeschema/sheet.cpp`, `PASS kicad eeschema/tools/sch_edit_tool.cpp`, `PASS kicad eeschema/tools/sch_drawing_tools.cpp`, `PASS kicad eeschema/tools/backannotate.cpp`, `syntax-check: 0 failed`. (Two earlier runs were refused by the check while an engine build ran.)
+
+**What the build train must probe** (sheet-pins/ fixture):
+- `kicadSheetPinsGet("{}")`: sheet IO with pairs A (pin and label, both uuids), B (label only, `pin` null), C (both, `pinShape` and `labelShape` differ), D (pin only), E and E1 (two singles). Bad JSON: "".
+- `kicadSheetPinsApply({run:1, dir:"/tmp/cc-sheet-pins/1", actions:[{op:"removePin", pin:D}, {op:"shapePin", pin:C, to:"output"}]})` true; `sheet-pins.json` applied 2, depth +1; ONE Ctrl+Z brings D back and C's old shape (failure: two undo steps, or D gone after undo).
+- `kicadSheetPinsPlace({sheet, sheetPath, place:"pin", names:["B"]})` true: a pin named B hangs on the pointer at the sheet's edge; a press places it (one undo step); the tool ends; no KiCad dialog. With `place:"label"` and a pin-only name: the editor enters the sub sheet and a hierarchical label of that name hangs on the pointer. Esc mid placement: nothing stays armed (a later S or H tool behaves as KiCad's own). A name with no counterpart: false.
+
+## lo-e4-e: net names from the board onto the schematic
+
+Commits: kicad be29acad (`backannotate.h`, `backannotate.cpp`), pcbjam 234c890 (`cc_e8_pcb.inc`, `cc_e8_sch.inc`).
+
+**KiCad (under `#ifdef __EMSCRIPTEN__`):** `BACK_ANNOTATE` gains `CC_PAD_NET`, `CC_NET_ROW`, `CcProcessNetNames( SCH_COMMIT*, pads )` and two members (`m_ccLastLabel`, `m_ccLastOutcome`). `CcProcessNetNames` is applyChangelist's net name loop (a pin's `Connection( &sheetPath )->Name( true )` against the pad's net, `processNetNameChange` when they differ) over the host's pads, symbols matched by reference (`GetSymbols( SYMBOL_FILTER_NON_POWER )`, each unit tried until one holds the pin). `processNetNameChange` records its outcome (`rename` with the label's uuid, `add`, `refused` for a power pin) beside its own lines. **Header change:** `eeschema/tools/backannotate.h` (class `BACK_ANNOTATE`) is included only by `backannotate.cpp` and `dialogs/dialog_update_from_pcb.cpp`: two files recompile.
+
+**PCBJam:**
+- `kicadBoardPadNets()` in `cc_e8_pcb.inc`, block `cc_e8_pcb` (pcbnew TU; not merged only, it calls only the board): `{"pads": [{ref, pad, net}], "truncated"}`, the board's `MAIL_PCB_GET_NETLIST` reply's facts (board only footprints left out, `GetShortNetname`, pads with no net left out), at most 32,768. A read.
+- `kicadSchRenameNets( std::string )` in `cc_e8_sch.inc`: `{run, dir: "/tmp/cc-renameNets/<n>", preview, pads (1 to 32,768)}`. On the coroutine: `RecalculateConnections( NO_CLEANUP )`, a `BACK_ANNOTATE` with net names alone (no relink, no other property, no swaps), `aDryRun` = preview; the rows; ONE commit "Update net names" when not a preview. Record `renameNets.json` `{preview, rows: [{ref, pin, from, to, sheetPath, outcome, label?}], applied, truncated, depth}` last. `outcome` is ADDED beyond the manifest's row (for lo-e4-i).
+
+Syntax check: as m9-e's (the same run).
+
+**What the build train must probe** (a board and schematic pair where a board net was renamed, e.g. Glasgow with one net renamed on the board):
+- `kicadBoardPadNets()` in the pcb frame: rows `{ref, pad, net}` with short names; `truncated` false.
+- In the sch frame, `kicadSchRenameNets({run:1, dir:"/tmp/cc-renameNets/1", preview:true, pads})`: `renameNets.json` rows for the renamed net's pins (`outcome` "rename" with the label's uuid), `applied` 0, depth unchanged, the schematic unchanged.
+- The same with `preview:false`: the label renamed, depth +1, one Ctrl+Z restores it. A net driven by a power symbol: `outcome` "refused", nothing changed. A net with no label driver: a label added at the pin (`outcome` "add").
+- Failure signs: a kiway call or a KiCad dialog; two undo steps; rows in a preview that changed the drawing.
+
+## st-incanno-e: shift designators
+
+Commit: pcbjam 234c890 (`cc_e8_sch.inc`; no KiCad file).
+
+- `kicadSchIncrementAnnotations( std::string )`: `{first, by, allSheets}` exactly (the manifest's args; no run folder, the host reads back as after `symbol.set`). `first` must split into a prefix and a number (`SCH_REFERENCE::IsSplitNeeded`), else false; `by` 1 to 100,000 (KiCad's dialog spins 1 to 64; the spec's test shifts by 100, so the bound is wider than the dialog's). On the coroutine, `SCH_EDITOR_CONTROL::IncrementAnnotations`' body after its dialog, line for line: the references of the shown sheet or every sheet, split; each with first's prefix and a number at or above it moves up by `by`; ONE commit "Increment Annotations", none when nothing matched.
+
+Syntax check: as m9-e's (the same run).
+
+**What the build train must probe** (Glasgow): `kicadSchIncrementAnnotations({first:"R10", by:100, allSheets:true})` true; R10 and above become R110 and above, R1 to R9 unchanged, one Ctrl+Z restores all. `first:"R"` (no number): false. `by:0`: false. A first that matches nothing: true, no undo step.
+
+## e-block-place-sch: K-B1's schematic hunk
+
+Commit: kicad 402fb267 (`eeschema/tools/sch_drawing_tools.cpp`; no pcbjam file, no export: `kicadDesignBlockPlace` is e7's). Needs e7's `include/cc_host_design_block.h`, taken by `git merge run15/main` in the kicad worktree (merge efe741e8, kicad run15/main c57840f9 and after).
+
+Under `#ifdef __EMSCRIPTEN__`: `ImportSheet` for `placeDesignBlock` takes the host block first (`ccHostDesignBlock()`, `ccTakeHostDesignBlock( &options )`): the Design Blocks pane is never read for it; a block with no schematic file ends the tool quietly (no info bar). Its options stand where KiCad reads the chooser's settings: `asSheet` (false: `placeSheetContents` once, no repeat), `keepAnnotations` and `asGroup` (contents path and `DrawSheet`'s sheet path), and a host block is placed once (no repeated placement). The options live in a file static `s_ccBlockOptions`, reset at every pane placement and after the host block's placement, so a pane block never reads them.
+
+Syntax check: as m9-e's (the same run, `--kicad-file eeschema/tools/sch_drawing_tools.cpp`).
+
+**What the build train must probe** (with e7's `kicadDesignBlockPlace` on the joined build): place a block as a sheet (`asSheet` true): the sheet hangs on the pointer, a click places it, one undo step, the pane never opened; with `keepAnnotations` true the designators are kept, false they are renumbered; with `asGroup` true the sheet sits in a group named after the block; `asSheet` false: the contents hang on the pointer once (no second placement after the click). A pane block afterwards (desktop path, not reachable in the browser) reads the chooser settings again. Failure: the pane read, an info bar, or a second placement of a host block.
+
+## Handover
+
+Both worktrees merged `run15/main` (pcbjam merge 44190d2, kicad merge efe741e8) before the final checks.
+
+- Syntax check `all` with the four changed KiCad files: every PASS line in m9-e's section above, `syntax-check: 0 failed`.
+- Export check `scripts/kicad/check-run15-exports.sh --since run15/main --kicad /home/matthew/cc-engine-wt/e8/kicad --kicad-since run15/main`: `check-run15-exports: 164 names registered in the merged image (157 kicad names), 19 of 110 run 15 names, 0 failures`.
+- The lane's ten names, all registered in `cc_e8_sch` (`kicadSchItemGet`, `kicadSchItemSet`, `kicadSchPlaceImage`, `kicadHostSchItems`, `kicadSheetPinsGet`, `kicadSheetPinsApply`, `kicadSheetPinsPlace`, `kicadSchRenameNets`, `kicadSchIncrementAnnotations`) and `cc_e8_pcb` (`kicadBoardPadNets`). None is merged image only: each calls only its own TU and KiCad.
+- Header changes and their reach: `eeschema/tools/sch_item_host.h` (new; included by sheet.cpp, sch_edit_tool.cpp, sch_drawing_tools.cpp and eeschema_embind.cpp through the inc), `eeschema/tools/backannotate.h` (class member additions under `__EMSCRIPTEN__`; two KiCad files include it, plus eeschema_embind.cpp through the inc). No widely included header changed.
+- Reported to E0: nothing needed (no include path, CMake line, build script line or new name; `<backannotate.h>` resolves through the TU's `eeschema/tools` include directory).
+- For the island seats (keys added beyond the spec's records): `color` on text and text box records (m5); `replaced` in `items.json` (m5); `outcome` in `renameNets.json` rows (lo-e4); table and table cell records are read only (RULINGS 2).
