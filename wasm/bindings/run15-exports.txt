@@ -124,6 +124,7 @@ new kicadMultichannel e13 st-mc-e
 new kicadMultichannelApply e13 st-mc-e
 new kicadSimUserSignals e13 m11-e
 new kicadSettingsSections e0 E0-R7
+new kicadBootCanvasOnly boot boot-e1
 
 run14 kicadAnnotate
 run14 kicadBoardEdit
