@@ -249,6 +249,91 @@ Link reach the train must watch (nothing a syntax check sees): the fpedit TU now
 the libraries the merged image links for the board editor's own plot and checks; a missing one
 shows as an undefined symbol at the merged link.
 
+## fp-e4b: the shape kinds (BUILD-NOTES-run15-fp-e4b.md)
+
+Relay seat. Commit pcbjam `47bb3a4` (`wasm/bindings/cc_item_shape.h` new, `cc_e5_fpedit.inc`).
+No new export, no marker, no host ask, no KiCad file. The five rows `shape`, `dimension`,
+`zone`, `image`, `point` are registered once from `cc_e5_fpedit.inc`
+(`cc_e5::kShapeKindsRegistered`, five `cc_fpitems::ccRegisterItemKind` calls) in the fpedit
+TU; their bodies are inline in `cc_item_shape.h`, namespace `cc_e5::fp::shapekind`, included by
+`cc_e5_fpedit.inc` alone. They are reached through e4's item exports and e3's board face via
+the table only. Merged image only (the fpedit TU is merged only).
+
+Coded to e4's widened contract of `cc_fp_items.h` (seat/run15-e4 `d22c98d`, not yet on
+run15/main at this commit): get answers the record WITHOUT `kind` and `uuid`; set reads and
+checks every key on a CLONE of the item first (`kindSet`), so a refused patch stages and
+changes nothing, then `aCommit.Modify( item )` and the same patch on the item; add answers a
+NEW item parented to the footprint (or the board item container) and not added, nullptr on a
+refused record. A key of another subtype is a refusal.
+
+The records and the KiCad code each follows (the header's comment lists every key):
+
+- shape: `DIALOG_SHAPE_PROPERTIES::TransferDataFromWindow` (dialog_shape_properties.cpp 1160)
+  and its `Validate` (1225): corner radius, fill, locked, width, style, layer, solder mask,
+  margin, `RebuildBezierToSegmentsPointsList`, net -1 off copper. Refusals: segment or arc
+  width 0; an unfilled circle, rect, polygon or bezier width 0; corner radius over half the
+  short side; a filled segment or arc; `shape` changed; `points` of the wrong count, a
+  degenerate segment, circle, rect or arc (three points on a line); `points` on a polygon of
+  several outlines. Keys beyond FP 7.2's FpShape, from the dialog: `fill` (the five
+  UI_FILL_MODE names; `filled` is fill != none, both given must agree), `cornerRadius` (rect),
+  `hasSolderMask`, `solderMaskMargin` (null = the board's). Add: `new PCB_SHAPE( parent,
+  shape )`, the layer's line thickness, LINE_STYLE::DEFAULT, no fill (the drawing tool's).
+- dimension: `DIALOG_DIMENSION_PROPERTIES::updateDimensionFromDialog`
+  (dialog_dimension_properties.cpp 376) in its order, then `Update()`; geometry keys `start`,
+  `end`, `height`, `orientation`, `leaderLength` set first (the point editor's part).
+  `textPos` refused unless the final mode is manual (a leader always takes it). `precision` is
+  DIM_PRECISION's index 0 to 9. Add: `DRAWING_TOOL::DrawDimension`'s attributes (1745 to 1797),
+  refused when start equals end.
+- zone: `DIALOG_RULE_AREA_PROPERTIES::TransferDataFromWindow` (dialog_rule_area_properties.cpp
+  419) on `ZONE_SETTINGS zs; zs << *zone;` then `zs.ExportSetting( *zone )` (as
+  `FOOTPRINT_EDIT_FRAME::OnEditItemRequest`, footprint_editor_utils.cpp 225 to 243). Refusals:
+  no layer, hatch pitch outside 0.1 to 2.0 mm, `ruleArea` changed, a rule area key on a filled
+  zone, `points` on a zone with holes or several outlines, under 3 points. Add: a rule area
+  with `ZONE_CREATE_HELPER::createNewZone`'s settings (the board's default zone settings, the
+  given layers, no layer properties, net -1).
+- image: `DIALOG_REFERENCE_IMAGE_PROPERTIES::TransferDataFromWindow` and
+  `PANEL_IMAGE_EDITOR::CheckValues` (a scaled side under 15 pixels refused; the editor's "very
+  large, are you sure" question past 6000 pixels is the page's to ask: the set is taken),
+  `grayscale: true` is the editor's Convert to grayscale button (`BITMAP_BASE::
+  ConvertToGreyscale`), `locked` only in the board frame (the dialog hides it in the footprint
+  editor; a set of it there is refused). `png` is the PNG's base64 (the stored data when the
+  picture is a PNG, else re-encoded as PNG), present only up to 64 kB, `bytes` its size. Add:
+  `png` required, base64 strict, decoded at most 4 MB and starting with the PNG signature,
+  read by `REFERENCE_IMAGE::ReadImageFile( wxMemoryBuffer& )` (a buffer of the exact size: that
+  reader reads `GetBufSize()` bytes); `png` on a set is refused.
+- point: KiCad has no point dialog; its one property is Size (pcb_point.cpp 253). Keys x, y,
+  layer, size (above 0), locked. Add: `POINT_PLACER::CreateItem`'s (KiCad's 1 mm default).
+
+Syntax check (iterating, the fpedit unit; the lane's full `all` run is in the hand over section):
+
+```
+/home/matthew/cc-wave2/bin/gate.sh scripts/kicad/syntax-check-run15.sh --kicad /home/matthew/cc-engine-wt/e0-kicad fpedit
+PASS fpedit         fpedit_embind.cpp subdir=pcbnew  (10537 ms)
+syntax-check: 0 failed
+```
+
+What the build train must probe (fp-i2a's e2e on fpedit-small, through e4's item exports
+`kicadFpEditItemsAdd`, `kicadFpEditItemsGet`, `kicadFpEditItemsSet`):
+
+- add one shape of each type on F.SilkS (segment, rect, arc, circle, polygon, bezier), read
+  back: `points` as given (an arc's mid may move by rounding), width, style, `filled`; each one
+  undo step; Ctrl+Z removes it. A set `{width: 0}` on the segment answers false and the undo
+  depth does not change. A set `{fill: "solid"}` on the circle then `{width: 0}` is taken.
+- an aligned dimension `{dimType: "aligned", layer: "F.Fab", start: [0,0], end: [5,0]}`: read
+  back with `height` 0 and the board's units; `{override: true, value: "X"}` then a read shows
+  `value` "X"; `{textPos: [1,1]}` with mode outside answers false.
+- a rule area `{kind: "zone", layers: ["F.Cu"], points: [[0,0],[3,0],[3,3]], noTracks: true}`:
+  read back `ruleArea` true, `noTracks` true, `hatchPitch` within 0.1 to 2.0; `{layers: []}`
+  answers false.
+- a picture with mark.png on User.1: read back `bytes` equal to the file's size (KiCad keeps
+  the PNG's own bytes) and `png` equal to the given base64; a set `{scale: 0.0001}` answers
+  false (under 15 pixels), `{grayscale: true}` is one undo step and changes `png`; a picture
+  over 64 kB reads with `bytes` and no `png`. `locked` in the footprint editor answers false.
+- a point `{layer: "F.Fab"}`: `size` 1, a set `{size: 0}` answers false.
+- the failure that means it is wrong: a refused set that still leaves an undo step or changes
+  the item (the clone probe broken), a picture whose read `bytes` is 0 (the PNG encode of a
+  JPEG or a missing PNG handler in the engine), any KiCad window.
+
 ## Hand over state (this seat, 2026-11-18)
 
 Done: fp-e7 (earlier seat), fp-e5, fp-e6. Not started, for the relay on this same branch, in
