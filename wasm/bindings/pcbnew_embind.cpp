@@ -16,6 +16,11 @@
  * Modified by Circuit Center Inc on 2026-11-18: lane e11's leased bodies, the board outputs'
  * per format 3D file check, the footprint export counting each library footprint once, the
  * rules answer's solder mask figure and a pair's layers limited to the board's.
+ *
+ * Modified by Circuit Center Inc on 2026-11-18: lane e7's leased bodies, Update PCB's two
+ * options Keep groups and Apply design block layouts in the board update (transferGroups,
+ * applyDesignBlockLayouts), the added groups laid out as KiCad's Update PCB dialog does, their
+ * records under layouts in report.json and the two options folded into the preview's token.
  */
 
 #ifdef __EMSCRIPTEN__
@@ -3972,6 +3977,8 @@ struct CC_UPDATE_ARGS
     bool        replaceFootprints = true;
     bool        deleteExtra = false;
     bool        relinkByReference = false;
+    bool        transferGroups = false;            // Update PCB's Keep groups
+    bool        applyDesignBlockLayouts = false;   // its Apply design block layouts (needs groups)
     std::string token;
 };
 
@@ -3981,7 +3988,11 @@ struct CC_UPDATE_ARGS
  * an apply checks the token, runs it for real (one BOARD_COMMIT "Update Netlist"), then
  * OnNetlistChanged (nets, classes, rules) and ccPlaceNewFootprints. Writes <dir>/report.json
  * (the engine report) when the updater ran (and for a preview stopped by parts with no number,
- * so it can list them), then <dir>/.cc-update.json LAST: {error, message, lines}.
+ * so it can list them), then <dir>/.cc-update.json LAST: {error, message, lines}. With
+ * transferGroups the updater keeps the schematic's groups; with applyDesignBlockLayouts too, an
+ * apply lays out each group it added that links a design block (KiCad's Update PCB dialog,
+ * dialog_update_pcb.cpp, after OnNetlistChanged) under the host's reporter, and report.json
+ * carries layouts {applied, failures: [{uuid, reason}]} whenever transferGroups was asked.
  */
 void ccRunBoardUpdate( const CC_UPDATE_ARGS& aArgs )
 {
@@ -4080,9 +4091,12 @@ void ccRunBoardUpdate( const CC_UPDATE_ARGS& aArgs )
         netlist.SetFindByTimeStamp( !aArgs.relinkByReference );
         netlist.SetReplaceFootprints( aArgs.replaceFootprints );
 
-        const std::string token = ccUpdateToken( netlist, aArgs.replaceFootprints,
-                                                 aArgs.deleteExtra, aArgs.relinkByReference,
-                                                 fr->GetBoard()->GetTimeStamp() );
+        const std::string token =
+                ccDigest( ccUpdateToken( netlist, aArgs.replaceFootprints, aArgs.deleteExtra,
+                                         aArgs.relinkByReference,
+                                         fr->GetBoard()->GetTimeStamp() )
+                          + ( aArgs.transferGroups ? "|g1" : "|g0" )
+                          + ( aArgs.applyDesignBlockLayouts ? "|b1" : "|b0" ) );
 
         if( aArgs.apply && token != aArgs.token )
         {
@@ -4110,14 +4124,15 @@ void ccRunBoardUpdate( const CC_UPDATE_ARGS& aArgs )
         updater.SetReplaceFootprints( aArgs.replaceFootprints );
         updater.SetDeleteUnusedFootprints( aArgs.deleteExtra );
         updater.SetLookupByTimestamp( !aArgs.relinkByReference );
-        updater.SetTransferGroups( false );
-        updater.SetApplyDesignBlockLayouts( false );
+        updater.SetTransferGroups( aArgs.transferGroups );
+        updater.SetApplyDesignBlockLayouts( aArgs.applyDesignBlockLayouts );
         updater.SetOverrideLocks( false );
         updater.SetUpdateFields( true );
         updater.SetRemoveExtraFields( false );
         updater.UpdateNetlist( netlist );
 
-        json added = json::array();
+        json                        added = json::array();
+        CC_HOST_BLOCK_LAYOUT_REPORT layouts;
 
         if( aArgs.apply )
         {
@@ -4129,6 +4144,45 @@ void ccRunBoardUpdate( const CC_UPDATE_ARGS& aArgs )
 
             for( FOOTPRINT* fp : fresh )
                 added.push_back( ccText( fp->GetReference() ) );
+
+            // KiCad's Update PCB dialog: each added group that links a design block is selected
+            // alone and laid out by Apply Design Block Layout (its own commit, as there); the
+            // host's reporter takes its summary and info bar lines in place of KiCad's windows,
+            // one report per run (the tool sets its counts), summed here.
+            if( aArgs.applyDesignBlockLayouts )
+            {
+                PCB_SELECTION_TOOL* selTool = toolMgr->GetTool<PCB_SELECTION_TOOL>();
+
+                for( PCB_GROUP* group : updater.GetAddedGroups() )
+                {
+                    if( !group->HasDesignBlockLink() )
+                        continue;
+
+                    CC_HOST_BLOCK_LAYOUT_REPORT one;
+
+                    {
+                        CC_HOST_BLOCK_LAYOUT_SCOPE scope( &one );
+                        toolMgr->RunAction( ACTIONS::selectionClear );
+                        selTool->select( group );
+                        toolMgr->RunAction( PCB_ACTIONS::applyDesignBlockLayout );
+                    }
+
+                    layouts.applied += one.applied;
+                    layouts.failures.insert( layouts.failures.end(), one.failures.begin(),
+                                             one.failures.end() );
+                    layouts.lines.insert( layouts.lines.end(), one.lines.begin(),
+                                          one.lines.end() );
+                }
+
+                toolMgr->RunAction( ACTIONS::selectionClear );
+
+                // The new parts stay selected beside the board, as ccPlaceNewFootprints left them.
+                EDA_ITEMS items( fresh.begin(), fresh.end() );
+                toolMgr->RunAction<EDA_ITEMS*>( ACTIONS::selectItems, &items );
+
+                for( const wxString& line : layouts.lines )
+                    lines.Report( line, RPT_SEVERITY_INFO );
+            }
         }
 
         json changes = problems;
@@ -4158,6 +4212,24 @@ void ccRunBoardUpdate( const CC_UPDATE_ARGS& aArgs )
         report["truncated"] = truncated;
         report["unmapped"] =
                 counter.m_actions + counter.m_warnings + counter.m_errors - (int) log.size();
+
+        if( aArgs.transferGroups )
+        {
+            json failures = json::array();
+
+            for( const CC_HOST_BLOCK_LAYOUT_FAILURE& failure : layouts.failures )
+            {
+                json f = json::object();
+                f["uuid"] = ccText( failure.uuid.AsString() );
+                f["reason"] = ccText( failure.reason );
+                failures.push_back( std::move( f ) );
+            }
+
+            json l = json::object();
+            l["applied"] = layouts.applied;
+            l["failures"] = std::move( failures );
+            report["layouts"] = std::move( l );
+        }
 
         ccWriteJson( aArgs.dir, "report.json", report );
     }
@@ -5460,7 +5532,8 @@ bool pcbUpdateBoardFromSchematic( std::string aArgsJson )
 
     json args = json::parse( aArgsJson, nullptr, /*allow_exceptions*/ false );
 
-    if( args.is_discarded() || !args.is_object() || args.size() != 7 )
+    // Run 14's seven keys, or those and both of Update PCB's group options (engine run 15).
+    if( args.is_discarded() || !args.is_object() || ( args.size() != 7 && args.size() != 9 ) )
         return false;
 
     CC_UPDATE_ARGS a;
@@ -5486,6 +5559,15 @@ bool pcbUpdateBoardFromSchematic( std::string aArgsJson )
             || !flag( "replaceFootprints", a.replaceFootprints )
             || !flag( "deleteExtra", a.deleteExtra )
             || !flag( "relinkByReference", a.relinkByReference ) )
+    {
+        return false;
+    }
+
+    // KiCad's dialog enables Apply design block layouts only while Keep groups is on.
+    if( args.size() == 9
+            && ( !flag( "transferGroups", a.transferGroups )
+                 || !flag( "applyDesignBlockLayouts", a.applyDesignBlockLayouts )
+                 || ( a.applyDesignBlockLayouts && !a.transferGroups ) ) )
     {
         return false;
     }
