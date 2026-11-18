@@ -167,7 +167,7 @@ inline void ensureDesignBlockAdapter()
  * used), loads the entry through the provider bridge, and re-syncs any open
  * editor tree. Idempotent: an existing nickname is a no-op.
  *
- * @param aKind "symbol" | "footprint" | "design_block" — which lib table gets the row.
+ * @param aKind "symbol" | "footprint" | "design_block": which lib table gets the row.
  *   A design_block row is a KiCad row (KiCad's own DESIGN_BLOCK_IO reads the folder): its uri
  *   is a real `.kicad_blocks` folder in the engine's file system, not a PCBJAM mount.
  * @param aNickname the lib-table row name (LibInfo.name on the JS side).
