@@ -15,8 +15,8 @@ Files of the lane: `wasm/bindings/cc_e5_pcb.inc` (block `cc_e5_pcb`), `cc_e5_fpe
 
 ## fp-e7: the board round trip and footprint file conversion (BUILD-NOTES-run15-fp-e7.md)
 
-Commits: pcbjam c188111 (board face, the dispatcher's board half), 3b0e6f1 or later (see `git log
---grep fp-e7`; the footprint editor half). No KiCad change, no host ask, no marker.
+Commits: pcbjam c188111 (board face, the dispatcher's board half), 72d05a0 (the footprint editor half).
+No KiCad change, no host ask, no marker.
 
 Exports:
 
@@ -79,3 +79,18 @@ What the build train must probe (island fixtures `tests/fixtures/fpedit-small/`,
    `/tmp/cc-import/1/legacy.mod`): `format` "Legacy", one footprint; on `package.lbr`: `format`
    "Eagle", one footprint whose text parses back through `kicadFpEditOpen`. A path outside
    `/tmp/cc-import/<n>/` answers "". Wrong if the format reads "KiCad" for either.
+
+Syntax check (`gate.sh scripts/kicad/syntax-check-run15.sh --kicad /home/matthew/cc-engine-wt/e0-kicad all`, on ff543c3 plus the notes):
+
+```
+PASS pcbnew         pcbnew_embind.cpp subdir=pcbnew -DKICAD_MERGED_EMBIND (32562 ms)
+PASS eeschema       eeschema_embind.cpp subdir=eeschema -DKICAD_MERGED_EMBIND (16190 ms)
+PASS symedit        symedit_embind.cpp subdir=eeschema  (9811 ms)
+PASS fpedit         fpedit_embind.cpp subdir=pcbnew  (87620 ms)
+PASS dsedit         dsedit_embind.cpp subdir=pagelayout_editor  (1931 ms)
+PASS kicad_editor   kicad_editor_embind.cpp subdir=common  (6988 ms)
+PASS occ            pcbnew_embind.cpp subdir=pcbnew (16161 ms)
+syntax-check: 0 failed
+```
+
+Export check (`scripts/kicad/check-run15-exports.sh --since run15/main`): `149 names registered in the merged image (142 kicad names), 4 of 110 run 15 names, 0 failures`.
