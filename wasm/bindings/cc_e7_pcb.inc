@@ -10,7 +10,11 @@
 // translation unit holds every lane's face) and every name registers in the block below,
 // never in a shared block. The rules: BUILD-NOTES-run15.md.
 
+#include <base_screen.h>
 #include <cc_paste_special.h>
+#include <drawing_sheet/ds_data_model.h>
+#include <drawing_sheet/ds_proxy_view_item.h>
+#include <filename_resolver.h>
 
 #ifdef KICAD_MERGED_EMBIND
 #include <cc_host_block_layout.h>
@@ -44,6 +48,48 @@ bool pastePcb( int aMode, bool aClearNets )
         ccPasteSpecialSlot() = CC_PASTE_SPECIAL{ aMode, aClearNets };
         f->GetToolManager()->RunAction( ACTIONS::pasteSpecial );
         ccPasteSpecialSlot().reset();
+    } );
+
+    return true;
+}
+
+// e-sheetreload, the board half of kicadDrawingSheetReload: on the apply coroutine, the body of
+// PCB_EDIT_FRAME::LoadDrawingSheet (pcbnew_config.cpp) with its message kept in place of its
+// info bar (DS_DATA_MODEL falls back to KiCad's default sheet as it does there), the name kept
+// in BASE_SCREEN as PCB_EDIT_FRAME::LoadProjectSettings keeps it (so a later project save writes
+// the name the document holds), then the drawing sheet's view item repainted.
+bool sheetReloadPcb()
+{
+    PCB_EDIT_FRAME* fr = pcbFrame();
+
+    if( !fr || !fr->GetBoard() || pcbjam_open::busy() )
+        return false;
+
+    pcbjam_collab::runOnCoroutine( fr, []() {
+        PCB_EDIT_FRAME* f = pcbFrame();
+
+        if( !f || !f->GetBoard() )
+            return;
+
+        PROJECT_FILE& project = f->Prj().GetProjectFile();
+
+        BASE_SCREEN::m_DrawingSheetFileName = project.m_BoardDrawingSheetFile;
+
+        FILENAME_RESOLVER resolver;
+        resolver.SetProject( &f->Prj() );
+        resolver.SetProgramBase( &Pgm() );
+
+        wxString filename = resolver.ResolvePath( project.m_BoardDrawingSheetFile,
+                                                  f->Prj().GetProjectPath(),
+                                                  { f->GetBoard()->GetEmbeddedFiles() } );
+        wxString msg;
+
+        DS_DATA_MODEL::GetTheInstance().LoadDrawingSheet( filename, &msg );
+
+        if( DS_PROXY_VIEW_ITEM* ds = f->GetCanvas()->GetDrawingSheet() )
+            f->GetCanvas()->GetView()->Update( ds, KIGFX::REPAINT );
+
+        f->GetCanvas()->Refresh();
     } );
 
     return true;
@@ -155,14 +201,18 @@ static void writeBlockSaveRecord( const std::string& aDir, bool aOk,
 
 // The arguments of kicadDesignBlockPlace, read whole: exactly dir (a run folder under
 // /tmp/cc-block/ holding <name>.kicad_block/), name (as kicadDesignBlockSave's), asSheet,
-// keepAnnotations and asGroup (booleans). Then the block is read by KiCad's own reader
-// (DESIGN_BLOCK_IO::DesignBlockLoad); nullptr for any other shape or a block it cannot read.
+// keepAnnotations and asGroup (booleans), and optionally nickname (the block's library row, 1 to
+// 120 characters LIB_ID takes as a nickname). Then the block is read by KiCad's own reader
+// (DESIGN_BLOCK_IO::DesignBlockLoad) and, with a nickname, its LIB_ID given that nickname as
+// DESIGN_BLOCK_LIBRARY_ADAPTER::LoadDesignBlock gives it on the Design Blocks pane's path, so a
+// group placed as a group carries the design block link; nullptr for any other shape or a block
+// it cannot read.
 static std::unique_ptr<DESIGN_BLOCK> readBlockPlaceArgs( const std::string& aArgsJson,
                                                          CC_HOST_DESIGN_BLOCK_OPTIONS& aOptions )
 {
     json args = json::parse( aArgsJson, nullptr, /*allow_exceptions*/ false );
 
-    if( args.is_discarded() || !args.is_object() || args.size() != 5 )
+    if( args.is_discarded() || !args.is_object() || ( args.size() != 5 && args.size() != 6 ) )
         return nullptr;
 
     auto dir = args.find( "dir" );
@@ -189,6 +239,29 @@ static std::unique_ptr<DESIGN_BLOCK> readBlockPlaceArgs( const std::string& aArg
         return nullptr;
     }
 
+    UTF8 nickname;
+
+    if( args.size() == 6 )
+    {
+        auto nick = args.find( "nickname" );
+
+        if( nick == args.end() || !nick->is_string() )
+            return nullptr;
+
+        const std::string nk = nick->get<std::string>();
+        const wxString    wnick = wxString::FromUTF8( nk.c_str() );
+        LIB_ID            probe;
+
+        if( nk.empty() || wnick.empty() || wnick.length() > 120
+                || nk.find( '\0' ) != std::string::npos
+                || probe.SetLibNickname( UTF8( wnick ) ) != -1 )
+        {
+            return nullptr;
+        }
+
+        nickname = UTF8( wnick );
+    }
+
     aOptions.asSheet = asSheet->get<bool>();
     aOptions.keepAnnotations = keep->get<bool>();
     aOptions.asGroup = asGroup->get<bool>();
@@ -201,8 +274,13 @@ static std::unique_ptr<DESIGN_BLOCK> readBlockPlaceArgs( const std::string& aArg
 
     try
     {
-        return std::unique_ptr<DESIGN_BLOCK>(
+        std::unique_ptr<DESIGN_BLOCK> block(
                 io->DesignBlockLoad( wxString::FromUTF8( d.c_str() ), wname ) );
+
+        if( block && !nickname.empty() && block->GetLibId().SetLibNickname( nickname ) != -1 )
+            return nullptr;
+
+        return block;
     }
     catch( const IO_ERROR& )
     {
