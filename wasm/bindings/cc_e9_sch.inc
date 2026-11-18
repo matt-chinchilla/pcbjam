@@ -16,6 +16,8 @@
 #include <libraries/library_manager.h>
 #include <project_rescue.h>
 #include <symbol_viewer_frame.h>
+#include <connection_graph.h>
+#include <sch_connection.h>
 
 // K-REMAP's switch, defined in kicad eeschema/files-io.cpp under __EMSCRIPTEN__ (the same image):
 // between Begin and End, SCH_EDIT_FRAME::OpenProjectFiles and SaveProject open and save a
@@ -27,6 +29,11 @@ void CcLegacyHostEnd();
 // as lines on a reporter, and the design's own copy of a symbol as the rescuer's cache.
 void CcSetRescueHeadless( REPORTER* aReporter );
 void CcSetRescueFromDesign( bool aFromDesign );
+
+// K-MIGRATE, defined in kicad eeschema/dialogs/dialog_migrate_buses.cpp under __EMSCRIPTEN__:
+// DIALOG_MIGRATE_BUSES' proposal rule as a free function.
+std::vector<wxString> ccProposedBusLabels( CONNECTION_GRAPH* aGraph,
+                                           const std::vector<wxString>& aLabelList );
 
 namespace cc_e9
 {
@@ -370,6 +377,115 @@ void runRescue( const RESCUE_ARGS& aArgs )
     finish();
 }
 
+
+struct BUS_CHOICE
+{
+    std::vector<std::string> labels;
+    std::string              name;
+};
+
+
+struct BUS_ARGS
+{
+    long long               run = 0;
+    std::string             dir;
+    std::vector<BUS_CHOICE> choices;
+};
+
+
+/**
+ * The bus naming apply, on the apply coroutine: every label of every choice resolved first
+ * (a uuid that names no label refuses the whole apply, nothing changed), then each label set
+ * to its choice's name in ONE SCH_COMMIT "Name buses" (KiCad's dialog sets them with no undo
+ * step; this is one), and the connections recalculated. Writes <dir>/buses.json {applied,
+ * labels, depth, lines} then <dir>/.cc-buses.json LAST {error, message, lines}.
+ */
+void runBusMigration( const BUS_ARGS& aArgs )
+{
+    cc_output::LINES_REPORTER lines;
+    std::string               error;
+    std::string               message;
+    json                      report;
+
+    cc_output::EnsureDir( aArgs.dir );
+
+    auto finish = [&]()
+                  {
+                      if( !report.is_null() )
+                      {
+                          report["lines"] = cc_output::LinesJson( lines );
+                          cc_output::WriteRecord( aArgs.dir, "buses.json", report );
+                      }
+
+                      json done = json::object();
+                      done["error"] = error;
+                      done["message"] = message;
+                      done["lines"] = cc_output::LinesJson( lines );
+                      cc_output::WriteRecord( aArgs.dir, ".cc-buses.json", done );
+                  };
+
+    SCH_EDIT_FRAME* fr = schFrame();   // re-resolved on the coroutine (S4)
+
+    if( !fr )
+    {
+        error = "island_error";
+        message = "no schematic editor";
+        finish();
+        return;
+    }
+
+    struct TARGET
+    {
+        SCH_LABEL_BASE* label;
+        SCH_SCREEN*     screen;
+        wxString        name;
+    };
+
+    std::vector<TARGET>       targets;
+    std::set<SCH_LABEL_BASE*> seen;
+
+    for( const BUS_CHOICE& choice : aArgs.choices )
+    {
+        for( const std::string& id : choice.labels )
+        {
+            SCH_SHEET_PATH path;
+            SCH_ITEM*      item = fr->Schematic().ResolveItem(
+                    KIID( wxString::FromUTF8( id.c_str() ) ), &path, true );
+            SCH_LABEL_BASE* label = dynamic_cast<SCH_LABEL_BASE*>( item );
+
+            if( !label || !path.LastScreen() )
+            {
+                error = "bus_label_unknown";
+                message = "no label " + id;
+                finish();
+                return;
+            }
+
+            if( seen.insert( label ).second )
+                targets.push_back( { label, path.LastScreen(), wxString::FromUTF8( choice.name.c_str() ) } );
+        }
+    }
+
+    SCH_COMMIT commit( fr );
+
+    for( const TARGET& target : targets )
+    {
+        commit.Modify( target.label, target.screen );
+        target.label->SetText( target.name );
+    }
+
+    commit.Push( _( "Name buses" ) );
+
+    fr->RecalculateConnections( nullptr, NO_CLEANUP );
+    fr->GetCanvas()->Refresh();
+
+    report = json::object();
+    report["run"] = aArgs.run;
+    report["applied"] = (int) aArgs.choices.size();
+    report["labels"] = (int) targets.size();
+    report["depth"] = fr->GetUndoCommandCount();
+    finish();
+}
 } // namespace sch
 
 
@@ -580,6 +696,148 @@ bool schRescueApply( std::string aArgsJson )
 }
 
 
+// buses.migration.get (cap busMigration), a read. Synchronous: the connection graph's buses
+// that carry more than one vector label of different names (GetBusesNeedingMigration, the
+// list DIALOG_MIGRATE_BUSES shows), each with KiCad's proposals (ccProposedBusLabels):
+// {"buses": [{"id", "sheetPath", "labels": [{"uuid", "text"}], "proposals": [string]}]}, at
+// most 1,024. Nothing changes. "" with no schematic frame or while an open is in flight.
+std::string busMigrationGet()
+{
+    SCH_EDIT_FRAME* fr = schFrame();
+
+    if( !fr || pcbjam_open::busy() )
+        return "";
+
+    CONNECTION_GRAPH* graph = fr->Schematic().ConnectionGraph();
+
+    if( !graph )
+        return "";
+
+    json buses = json::array();
+    int  id = 0;
+
+    for( const CONNECTION_SUBGRAPH* subgraph : graph->GetBusesNeedingMigration() )
+    {
+        if( buses.size() >= 1024 )
+            break;
+
+        json                  labels = json::array();
+        std::vector<wxString> texts;
+
+        for( SCH_ITEM* item : subgraph->GetVectorBusLabels() )
+        {
+            SCH_LABEL_BASE* label = static_cast<SCH_LABEL_BASE*>( item );
+            json            row = json::object();
+            row["uuid"] = toUtf8( label->m_Uuid.AsString() );
+            row["text"] = toUtf8( label->GetText() );
+            labels.push_back( std::move( row ) );
+            texts.push_back( label->GetText() );
+        }
+
+        json proposals = json::array();
+
+        for( const wxString& proposal : ccProposedBusLabels( graph, texts ) )
+            proposals.push_back( toUtf8( proposal ) );
+
+        json bus = json::object();
+        bus["id"] = id++;
+        bus["sheetPath"] = toUtf8( subgraph->GetSheet().PathHumanReadable() );
+        bus["labels"] = labels;
+        bus["proposals"] = proposals;
+        buses.push_back( std::move( bus ) );
+    }
+
+    json out = json::object();
+    out["buses"] = buses;
+    return out.dump( -1, ' ', false, json::error_handler_t::replace );
+}
+
+
+// buses.migration.apply (cap busMigration). aArgsJson exactly {"run": int >= 0, "dir":
+// "/tmp/cc-buses/<n>", "choices": [1 to 1,024 of {"labels": [1 to 64 uuid strings], "name":
+// 1 to 1,024 bytes, no line break}]}. False (nothing queued) for any other JSON, with no
+// schematic frame or while an open is in flight; true once the run is queued on the apply
+// coroutine (the host waits for <dir>/.cc-buses.json).
+bool busMigrationApply( std::string aArgsJson )
+{
+    SCH_EDIT_FRAME* fr = schFrame();
+
+    if( !fr || pcbjam_open::busy() )
+        return false;
+
+    json args = json::parse( aArgsJson, nullptr, /*allow_exceptions*/ false );
+
+    if( args.is_discarded() || !args.is_object() || args.size() != 3 )
+        return false;
+
+    auto run = args.find( "run" );
+    auto dir = args.find( "dir" );
+    auto choices = args.find( "choices" );
+
+    if( run == args.end() || !run->is_number_integer() || run->get<long long>() < 0
+            || dir == args.end() || !dir->is_string() || choices == args.end()
+            || !choices->is_array() || choices->empty() || choices->size() > 1024 )
+    {
+        return false;
+    }
+
+    sch::BUS_ARGS a;
+    a.run = run->get<long long>();
+    a.dir = dir->get<std::string>();
+
+    if( !isRunDir( a.dir, "/tmp/cc-buses/" ) )
+        return false;
+
+    for( const json& choice : *choices )
+    {
+        if( !choice.is_object() || choice.size() != 2 )
+            return false;
+
+        auto labels = choice.find( "labels" );
+        auto name = choice.find( "name" );
+
+        if( labels == choice.end() || !labels->is_array() || labels->empty()
+                || labels->size() > 64 || name == choice.end() || !name->is_string() )
+        {
+            return false;
+        }
+
+        sch::BUS_CHOICE c;
+        c.name = name->get<std::string>();
+
+        if( c.name.empty() || c.name.size() > 1024
+                || c.name.find_first_of( "\r\n" ) != std::string::npos )
+        {
+            return false;
+        }
+
+        for( const json& id : *labels )
+        {
+            if( !id.is_string() || id.get<std::string>().empty()
+                    || id.get<std::string>().size() > 64 )
+            {
+                return false;
+            }
+
+            c.labels.push_back( id.get<std::string>() );
+        }
+
+        a.choices.push_back( std::move( c ) );
+    }
+
+    pcbjam_collab::runOnCoroutine( fr, [a]() { sch::runBusMigration( a ); } );
+    return true;
+}
+
+
+// Marker (cap busMigration): this engine never shows KiCad's Migrate Buses window (K-MIGRATE)
+// and names buses through kicadBusMigrationApply.
+bool hostBusMigration()
+{
+    return true;
+}
+
+
 // Marker (cap importLegacy): this engine opens a KiCad 5 project with no window.
 bool hostLegacy()
 {
@@ -593,4 +851,7 @@ EMSCRIPTEN_BINDINGS( cc_e9_sch )
     function( "kicadHostLegacy", &cc_e9::hostLegacy );
     function( "kicadSchRescue", &cc_e9::schRescue );
     function( "kicadSchRescueApply", &cc_e9::schRescueApply );
+    function( "kicadBusMigrationGet", &cc_e9::busMigrationGet );
+    function( "kicadBusMigrationApply", &cc_e9::busMigrationApply );
+    function( "kicadHostBusMigration", &cc_e9::hostBusMigration );
 }
