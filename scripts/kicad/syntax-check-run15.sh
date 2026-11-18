@@ -8,7 +8,7 @@
 # worktrees mounted read only, nothing written anywhere but the container's own layer.
 #
 #   scripts/kicad/syntax-check-run15.sh --kicad <kicad worktree> [--wx <wxWidgets tree>]
-#       [all | pcbnew eeschema symedit fpedit dsedit kicad_editor ...]
+#       [all | pcbnew eeschema symedit fpedit dsedit kicad_editor occ ...]
 #       [--kicad-file <path in kicad> ...]
 #
 # Run it from the pcbjam worktree whose bindings are checked (this script's own repository),
@@ -17,7 +17,8 @@
 # The binding TUs are compiled by build-kicad-target.sh's OWN compile_embind_tu and its OWN
 # merged image call list (the kicad_editor branch of step 7.1), both read from that script at
 # run time and never retyped, with EXTRA_FLAGS, KICAD_TU_ABI_FLAGS and WX_CXXFLAGS as the Debug
-# build sets them; em++ then gets -fsyntax-only in place of -c and -o. A KiCad source is
+# build sets them; em++ then gets -fsyntax-only in place of -c and -o. "occ" is pcbnew_embind.cpp
+# as occ_service compiles it (standalone: no -DKICAD_MERGED_EMBIND). A KiCad source is
 # compiled with its own compile_commands.json line (the precompiled header flags dropped; its
 # --use-port=zlib makes emcc fetch that port into the container's layer, so that mode alone has
 # the network).
@@ -40,8 +41,8 @@ while [ $# -gt 0 ]; do
     --kicad) KICAD="${2:?}"; shift 2 ;;
     --wx) WX="${2:?}"; shift 2 ;;
     --kicad-file) KFILES+=("${2:?}"); shift 2 ;;
-    all) TUS+=(pcbnew eeschema symedit fpedit dsedit kicad_editor); shift ;;
-    pcbnew|eeschema|symedit|fpedit|dsedit|kicad_editor) TUS+=("$1"); shift ;;
+    all) TUS+=(pcbnew eeschema symedit fpedit dsedit kicad_editor occ); shift ;;
+    pcbnew|eeschema|symedit|fpedit|dsedit|kicad_editor|occ) TUS+=("$1"); shift ;;
     *) die "unknown argument $1" ;;
   esac
 done
@@ -115,6 +116,16 @@ compile_embind_tu() {
   fi
 }
 eval "$CALLS"
+# occ: pcbnew_embind.cpp as occ_service links it (EMBIND_APP pcbnew, the include subdir pcbnew,
+# NO -DKICAD_MERGED_EMBIND: the single app branch of step 7.1).
+case "$WANT" in *" occ "*)
+  t0=$(date +%s%N)
+  if build_compile_embind_tu "$PROJECT_ROOT/wasm/bindings/pcbnew_embind.cpp" "$STUBS_BUILD/pcbnew_embind.o" pcbnew; then
+    printf "PASS %-14s %s subdir=%s (%s ms)\n" occ pcbnew_embind.cpp pcbnew "$(ms $t0)"
+  else
+    printf "FAIL %-14s %s subdir=%s\n" occ pcbnew_embind.cpp pcbnew; fails=$((fails+1))
+  fi ;;
+esac
 for f in $CC_KFILES; do
   if python3 - "$KICAD_BUILD/compile_commands.json" "/workspace/kicad/$f" > /tmp/cmd <<"PY"
 import json, shlex, sys
