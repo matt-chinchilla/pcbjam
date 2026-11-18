@@ -200,3 +200,47 @@ PASS kicad pcbnew/dialogs/dialog_non_copper_zones_properties.cpp (4811 ms)
 PASS kicad pcbnew/dialogs/dialog_rule_area_properties.cpp (5897 ms)
 syntax-check: 0 failed
 ```
+
+## Handover
+
+Both worktrees merged `run15/main` (pcbjam 48e664e, kicad caf17fbe) before the checks. Units done: st-mw-e, m6-e2, m6-e1, m3-e2, m3-e1, st-ap-e. Reported to E0: `microwave_inductor.cpp` (st-mw-e, inside the unit's owned folder, not in the lane list); the `g_ccZoneSettingsHost` hook shape (m3-e2). Merged image only: m3-e2's zone ask. Learn cards owed: none (engine lane).
+
+**Syntax check** (from this worktree, through the gate: `scripts/kicad/syntax-check-run15.sh --kicad /home/matthew/cc-engine-wt/e2/kicad all --kicad-file` each of the 21 KiCad sources below):
+
+```
+PASS pcbnew         pcbnew_embind.cpp subdir=pcbnew -DKICAD_MERGED_EMBIND (13922 ms)
+PASS eeschema       eeschema_embind.cpp subdir=eeschema -DKICAD_MERGED_EMBIND (13753 ms)
+PASS symedit        symedit_embind.cpp subdir=eeschema  (8425 ms)
+PASS fpedit         fpedit_embind.cpp subdir=pcbnew  (7927 ms)
+PASS dsedit         dsedit_embind.cpp subdir=pagelayout_editor  (1372 ms)
+PASS kicad_editor   kicad_editor_embind.cpp subdir=common  (5511 ms)
+PASS occ            pcbnew_embind.cpp subdir=pcbnew (13297 ms)
+PASS kicad pcbnew/microwave/microwave_tool.cpp (7651 ms)
+PASS kicad pcbnew/microwave/microwave_footprint.cpp (6672 ms)
+PASS kicad pcbnew/microwave/microwave_inductor.cpp (6602 ms)
+PASS kicad pcbnew/microwave/microwave_polygon.cpp (6100 ms)
+PASS kicad pcbnew/dialogs/dialog_create_array.cpp (6712 ms)
+PASS kicad pcbnew/tools/array_tool.cpp (7072 ms)
+PASS kicad pcbnew/dialogs/dialog_position_relative.cpp (6367 ms)
+PASS kicad pcbnew/tools/position_relative_tool.cpp (7034 ms)
+PASS kicad pcbnew/dialogs/dialog_move_exact.cpp (4726 ms)
+PASS kicad pcbnew/dialogs/dialog_offset_item.cpp (4563 ms)
+PASS kicad pcbnew/dialogs/dialog_filter_selection.cpp (4915 ms)
+PASS kicad pcbnew/dialogs/dialog_get_footprint_by_name.cpp (4406 ms)
+PASS kicad pcbnew/tools/edit_tool.cpp (9610 ms)
+PASS kicad pcbnew/tools/edit_tool_move_fct.cpp (8002 ms)
+PASS kicad pcbnew/tools/pcb_selection_tool.cpp (10008 ms)
+PASS kicad pcbnew/tools/convert_tool.cpp (8147 ms)
+PASS kicad pcbnew/dialogs/dialog_outset_items.cpp (6074 ms)
+PASS kicad pcbnew/dialogs/dialog_copper_zones.cpp (6476 ms)
+PASS kicad pcbnew/dialogs/dialog_non_copper_zones_properties.cpp (5317 ms)
+PASS kicad pcbnew/dialogs/dialog_rule_area_properties.cpp (6721 ms)
+PASS kicad pcbnew/autorouter/autoplace_tool.cpp (6901 ms)
+syntax-check: 0 failed
+```
+
+**Export check** (`scripts/kicad/check-run15-exports.sh --since run15/main --kicad /home/matthew/cc-engine-wt/e2/kicad --kicad-since run15/main`):
+
+```
+check-run15-exports: 156 names registered in the merged image (149 kicad names), 11 of 110 run 15 names, 0 failures
+```
