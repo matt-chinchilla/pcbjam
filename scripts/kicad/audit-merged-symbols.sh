@@ -8,6 +8,10 @@
 # every collision is a conscious decision (the known set is renamed per-engine via
 # KICAD_WASM_PCB_SIDE_RENAMES in kicad/CMakeLists.txt).
 #
+# Modified by Circuit Center Inc on 2026-11-18: a fourth set, the pl_editor kiface (the
+# drawing sheet editor, engine run 15), read from the merged tree itself and intersected with
+# pcbnew, eeschema and cvpcb; the expected output stays empty.
+#
 # Run INSIDE the build container (needs $EMSDK llvm-nm and the per-app build trees):
 #   docker compose -f docker/docker-compose.yml exec kicad-wasm-builder \
 #       /workspace/scripts/kicad/audit-merged-symbols.sh
@@ -169,6 +173,83 @@ if [ -d "${M}/cvpcb/CMakeFiles/cvpcb_kiface_objects.dir" ]; then
         | grep -vE 'magic_enum|wxEventFunctorMethod|wxNavigationEnabled|wxSimplebook|wxDataView|wxMenuBar|wxVector|KIFACE|COLLECTOR|RC_JSON|PARAM_SCALED|EDA_|BOX2|WX_MENUBAR|SEARCH_HANDLER|FOOTPRINT_|LISTBOX|PCB_BASE_FRAME|PCB_VIEWER_TOOLS|PCB_EDITOR_CONDITIONS|COMMON_CONTROL|CVPCB_SETTINGS|7ACTIONS|7NETLIST' || true
 else
     echo "== cvpcb audit SKIPPED (no merged kicad-kicad_editor tree with cvpcb_kiface_objects under ${BUILD_ROOT})" >&2
+fi
+
+# -------------------------------------------------------------------------
+# pl_editor fourth-kiface audit (engine run 15: --frame=ds). Like cvpcb, its
+# kiface objects exist only in the merged kicad-kicad_editor tree, where its
+# renames (KICAD_WASM_PL_SIDE_RENAMES, pagelayout_editor/CMakeLists.txt) are
+# applied, so no standalone pl_editor tree is built for it. The pcbnew and
+# eeschema sets are read from the same merged tree. Expected output: EMPTY
+# strong intersections against pcbnew, eeschema and cvpcb.
+if [ -d "${M}/pagelayout_editor/CMakeFiles/pl_editor_kiface_objects.dir" ]; then
+    echo "== collecting pl_editor symbols from merged tree (llvm-nm)..." >&2
+
+    pl_files() {
+        find "${M}/pagelayout_editor/CMakeFiles/pl_editor_kiface_objects.dir" -name '*.o'
+        ls "${M}/pagelayout_editor/navlib/libpl_editor_navlib.a" 2>/dev/null || true
+    }
+    plm_pcb_files() {
+        find "${M}/pcbnew/CMakeFiles/pcbnew_kiface_objects.dir" -name '*.o'
+        ls "${M}/common/libpcbcommon.a" \
+           "${M}/pcbnew/connectivity/libconnectivity.a" \
+           "${M}/pcbnew/router/libpnsrouter.a" \
+           "${M}/pcbnew/navlib/libpcbnew_navlib.a" \
+           "${M}/utils/idftools/libidf3.a" \
+           "${M}"/pcbnew/pcb_io/*/*.a 2>/dev/null || true
+        find "${M}/3d-viewer" -name '*.o' 2>/dev/null || true
+    }
+    plm_sch_files() {
+        find "${M}/eeschema/CMakeFiles/eeschema_kiface_objects.dir" -name '*.o'
+        ls "${M}/eeschema/navlib/libeeschema_navlib.a" 2>/dev/null || true
+    }
+    plm_cv_files() {
+        find "${M}/cvpcb/CMakeFiles/cvpcb_kiface_objects.dir" -name '*.o' 2>/dev/null || true
+    }
+
+    ${NM} --defined-only --extern-only --format=posix $(pl_files) 2>/dev/null \
+        | awk '$2 ~ /^[TDBR]$/ {print $1}' | sort -u > "${OUT}/pl_strong.txt"
+    ${NM} --defined-only --extern-only --format=posix $(pl_files) 2>/dev/null \
+        | awk '$2 ~ /^[WVwv]$/ {print $1}' | sort -u > "${OUT}/pl_weak.txt"
+    ${NM} --defined-only --extern-only --format=posix $(plm_pcb_files) 2>/dev/null \
+        | awk '$2 ~ /^[TDBR]$/ {print $1}' | sort -u > "${OUT}/plm_pcb_strong.txt"
+    ${NM} --defined-only --extern-only --format=posix $(plm_sch_files) 2>/dev/null \
+        | awk '$2 ~ /^[TDBR]$/ {print $1}' | sort -u > "${OUT}/plm_sch_strong.txt"
+    : > "${OUT}/plm_cv_strong.txt"
+    if [ -n "$(plm_cv_files)" ]; then
+        ${NM} --defined-only --extern-only --format=posix $(plm_cv_files) 2>/dev/null \
+            | awk '$2 ~ /^[TDBR]$/ {print $1}' | sort -u > "${OUT}/plm_cv_strong.txt"
+    fi
+    { ${NM} --defined-only --extern-only --format=posix $(plm_pcb_files) $(plm_sch_files) \
+          $(plm_cv_files) 2>/dev/null \
+          | awk '$2 ~ /^[WVwv]$/ {print $1}'; } | sort -u > "${OUT}/plm_engines_weak.txt"
+
+    # The shared libs of the merged tree: one definition linked once (safe dedup).
+    ${NM} --defined-only --extern-only --format=posix \
+        "${M}/common/libcommon.a" "${M}/common/libkicommon.a" \
+        "${M}/common/gal/libkigal.a" "${M}/libs/core/libcore.a" \
+        "${M}/libs/kimath/libkimath.a" "${M}/libs/kiplatform/libkiplatform.a" \
+        "${M}/scripting/libscripting.a" "${M}/api/libkiapi.a" \
+        "${M}/libs/sexpr/libsexpr.a" 2>/dev/null \
+        | awk '{print $1}' | sort -u > "${OUT}/pl_shared_merged.txt"
+
+    echo "== pl_editor vs pcbnew STRONG duplicates (merged tree, must be empty):"
+    comm -12 "${OUT}/pl_strong.txt" "${OUT}/plm_pcb_strong.txt" || true
+
+    echo "== pl_editor vs eeschema STRONG duplicates (merged tree, must be empty):"
+    comm -12 "${OUT}/pl_strong.txt" "${OUT}/plm_sch_strong.txt" || true
+
+    echo "== pl_editor vs cvpcb STRONG duplicates (merged tree, must be empty):"
+    comm -12 "${OUT}/pl_strong.txt" "${OUT}/plm_cv_strong.txt" || true
+
+    echo "== pl_editor WEAK duplicates not from shared libs, mentioning class tokens"
+    echo "   (review anything printed, the same criteria as the cvpcb weak audit):"
+    comm -12 "${OUT}/pl_weak.txt" "${OUT}/plm_engines_weak.txt" \
+        | comm -23 - "${OUT}/pl_shared_merged.txt" \
+        | grep -E '_Z(TV|TI|TS|N)[0-9]+[A-Z]' \
+        | grep -vE 'magic_enum|wxEventFunctorMethod|wxNavigationEnabled|wxSimplebook|wxDataView|wxMenuBar|wxVector|KIFACE|COLLECTOR|RC_JSON|PARAM_SCALED|EDA_|BOX2|WX_MENUBAR|COMMON_CONTROL|7ACTIONS' || true
+else
+    echo "== pl_editor audit SKIPPED (no merged kicad-kicad_editor tree with pl_editor_kiface_objects under ${BUILD_ROOT})" >&2
 fi
 
 echo "== audit done (details in ${OUT})"
