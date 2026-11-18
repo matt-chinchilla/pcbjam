@@ -1,0 +1,265 @@
+# Copyright (C) 2026 Circuit Center Inc
+# SPDX-License-Identifier: GPL-3.0-or-later
+#
+# Engine run 15: every kicad... name the merged image (kicad_editor) registers, read by
+# scripts/kicad/check-run15-exports.sh. Two kinds of line:
+#   new <name> <lane> <units>   a name run 15 adds (an export or a marker), the lane whose own
+#                               files register it, the manifest units that need it; written
+#                               from the wave 2 manifest (the exports and markers fields and
+#                               each engine lane's newExports), plus E0's kicadSettingsSections
+#   run14 <name>                a name the merged image registered at the run 15 base (pcbjam
+#                               9706f071, 138 names, the count run 14's probe read on Module)
+# A name changes here only through the integrator. Widened run 14 exports (kicadLibsAddEntry,
+# kicadUpdateBoardFromSchematic, kicadSettingsGet, kicadSettingsSet, kicadBoardEdit) keep their
+# run14 line: no new registration. occ_service's exports (occExport, occLoadModel) belong to its
+# own module and are not listed.
+
+new kicadContextMenuChoose e1 m1-e
+new kicadContextMenuHighlight e1 m1-e
+new kicadHeldMenus e1 st-hold-e
+new kicadHostContextMenu e1 m1-e
+new kicadHostPrompts e1 m1x-e1
+new kicadHotkeysGet e1 st-keys-e
+new kicadHotkeysSet e1 st-keys-e
+new kicadPromptAnswer e1 m1x-e1
+new kicadPromptCancel e1 m1x-e1
+new kicadPromptPick e1 m1x-e1
+new kicadRunAction e1 m1-e
+new kicadSelectionFilterGet e1 m6-e3
+new kicadSelectionFilterSet e1 m6-e3
+new kicadTableCsv e1 m12-e
+new kicadAutoplaceQuiet e2 st-ap-e
+new kicadMicrowaveArm e2 st-mw-e
+new kicadBoardItemRecords e3 m4-e
+new kicadBoardItemRecordsSet e3 m4-e
+new kicadBoardPlaceImage e3 m4-e
+new kicadBoardTuningGet e3 m4-e
+new kicadBoardTuningSet e3 m4-e
+new kicadHostBoardItems e3 m4-e
+new kicadHostFpEdit e3 fp-e1a
+new kicadFpEditEnumerate e4 fp-e3
+new kicadFpEditItemsAdd e4 fp-e-items
+new kicadFpEditItemsGet e4 fp-e-items
+new kicadFpEditItemsRemove e4 fp-e-items
+new kicadFpEditItemsSet e4 fp-e-items
+new kicadFpEditMarkSaved e4 fp-e2
+new kicadFpEditNew e4 fp-e2
+new kicadFpEditOpen e4 fp-e2
+new kicadFpEditPadDefaultsGet e4 fp-e3
+new kicadFpEditPadDefaultsSet e4 fp-e3
+new kicadFpEditSelect e4 fp-e2
+new kicadFpEditSelection e4 fp-e2
+new kicadFpEditState e4 fp-e2
+new kicadFpEditTake e4 fp-e2
+new kicadEmbeddedFileExtract e5 m13-e
+new kicadEmbeddedFilesGet e5 m13-e
+new kicadEmbeddedFilesSet e5 m13-e
+new kicadFootprintConvert e5 fp-e7
+new kicadFootprintForEditor e5 fp-e7
+new kicadFootprintPushToBoard e5 fp-e7
+new kicadFpEditCheck e5 fp-e6
+new kicadFpEditCleanup e5 fp-e6
+new kicadFpEditEmbed e5 fp-e5
+new kicadFpEditFootprintGet e5 fp-e5
+new kicadFpEditFootprintSet e5 fp-e5
+new kicadFpEditPlotSvg e5 fp-e6
+new kicadPlaceFromFile e5 st-placefile-e
+new kicadDsEditAppend e6 ds-e2
+new kicadDsEditArmImage e6 ds-e2
+new kicadDsEditDefaultsGet e6 ds-e2
+new kicadDsEditDefaultsSet e6 ds-e2
+new kicadDsEditItemsAdd e6 ds-e2
+new kicadDsEditItemsGet e6 ds-e2
+new kicadDsEditItemsRemove e6 ds-e2
+new kicadDsEditItemsSet e6 ds-e2
+new kicadDsEditMarkSaved e6 ds-e2
+new kicadDsEditOpen e6 ds-e2
+new kicadDsEditPreviewGet e6 ds-e2
+new kicadDsEditPreviewSet e6 ds-e2
+new kicadDsEditSelect e6 ds-e2
+new kicadDsEditSelection e6 ds-e2
+new kicadDsEditShow e6 ds-e2
+new kicadDsEditState e6 ds-e2
+new kicadDsEditTake e6 ds-e2
+new kicadHostDsEdit e6 ds-e2
+new kicadImportGraphics e6 fp-e8
+new kicadBoardUpdateGroups e7 e-block-layout
+new kicadDesignBlockApplyLayout e7 e-block-layout
+new kicadDesignBlockPlace e7 e-block-place
+new kicadDesignBlockSave e7 e-block-save
+new kicadDrawingSheetReload e7 e-sheetreload
+new kicadLibsRemoveEntry e7 e-librows
+new kicadPasteSpecial e7 st-paste-e
+new kicadPathVarsSet e7 e-librows
+new kicadBoardPadNets e8 lo-e4-e
+new kicadHostSchItems e8 m5-e
+new kicadSchIncrementAnnotations e8 st-incanno-e
+new kicadSchItemGet e8 m5-e
+new kicadSchItemSet e8 m5-e
+new kicadSchPlaceImage e8 m5-e
+new kicadSchRenameNets e8 lo-e4-e
+new kicadSheetPinsApply e8 m9-e
+new kicadSheetPinsGet e8 m9-e
+new kicadSheetPinsPlace e8 m9-e
+new kicadBusMigrationApply e9 m10-e
+new kicadBusMigrationGet e9 m10-e
+new kicadHostBusMigration e9 m10-e
+new kicadHostLegacy e9 st-open-kicad5-e
+new kicadImportLegacyProject e9 st-open-kicad5-e
+new kicadImportSession e9 st-ses-e
+new kicadSchRescue e9 st-rescue-e
+new kicadSchRescueApply e9 st-rescue-e
+new kicadBoardVerticesGet e10 m3-e3
+new kicadBoardVerticesSet e10 m3-e3
+new kicadCompareWithSource e10 st-compare-e
+new kicadFind e10 st-find-e-e
+new kicadNetReport e10 st-len-e-e
+new kicadSchReplace e10 st-find-e-e
+new kicadBoardEmbedModels e11 3d-e5
+new kicadBoardModels e11 3d-e5
+new kicadBoardSetModels e11 3d-e5
+new kicadSettingsRead e12 m8-e
+new kicadTuningSolve e12 m7-e
+new kicadMultichannel e13 st-mc-e
+new kicadMultichannelApply e13 st-mc-e
+new kicadSimUserSignals e13 m11-e
+new kicadSettingsSections e0 E0-R7
+
+run14 kicadAnnotate
+run14 kicadBoardEdit
+run14 kicadBoardFootprints
+run14 kicadBoardItemGet
+run14 kicadBoardItemSet
+run14 kicadCheckBoard
+run14 kicadCheckSheet
+run14 kicadChromeShown
+run14 kicadCollabApply
+run14 kicadCollabApplyItems
+run14 kicadCollabBusy
+run14 kicadCollabFitViewport
+run14 kicadCollabGetPos
+run14 kicadCollabGetSelection
+run14 kicadCollabGetSelectionFull
+run14 kicadCollabGetViewport
+run14 kicadCollabPresenceStart
+run14 kicadCollabReleaseSelection
+run14 kicadCollabSetPins
+run14 kicadCollabSetRemote
+run14 kicadCollabSetRemoteCursors
+run14 kicadCollabSetStyle
+run14 kicadCollabSetViewport
+run14 kicadCollabSnapshot
+run14 kicadCollabSnapshotItems
+run14 kicadCollabTestAddBoardText
+run14 kicadCollabTestAddJunction
+run14 kicadCollabTestAddLabel
+run14 kicadCollabTestAddNoConnect
+run14 kicadCollabTestAddSymbol
+run14 kicadCollabTestAddTrack
+run14 kicadCollabTestAddVia
+run14 kicadCollabTestAddWire
+run14 kicadCollabTestAddZone
+run14 kicadCollabTestApplyQueueState
+run14 kicadCollabTestClearSelection
+run14 kicadCollabTestDemoSet
+run14 kicadCollabTestDuplicateBoardItem
+run14 kicadCollabTestDuplicateSchItem
+run14 kicadCollabTestFlipBoardItem
+run14 kicadCollabTestGetCrossMapped
+run14 kicadCollabTestGetLocked
+run14 kicadCollabTestItemBlob
+run14 kicadCollabTestListItems
+run14 kicadCollabTestMirrorSchItem
+run14 kicadCollabTestMoveBoardItem
+run14 kicadCollabTestMoveEndpoint
+run14 kicadCollabTestMoveFirst
+run14 kicadCollabTestMoveSchItem
+run14 kicadCollabTestRemoveItem
+run14 kicadCollabTestRotateItem
+run14 kicadCollabTestSelectByUuid
+run14 kicadCollabTestSelectComponent
+run14 kicadCollabTestSelectFirst
+run14 kicadCollabTestSetBoardItemLocked
+run14 kicadCollabTestSetFieldText
+run14 kicadCollabTestSetFootprintField
+run14 kicadCollabTestSetPadSize
+run14 kicadCollabTestUndo
+run14 kicadCollabTestUndoDepth
+run14 kicadExplainViolation
+run14 kicadExportBoardOutput
+run14 kicadExportSchematicOutput
+run14 kicadFootprintSetModels
+run14 kicadFootprintsExchange
+run14 kicadHostActions
+run14 kicadHostBoardProperties
+run14 kicadHostProperties
+run14 kicadHostSymEdit
+run14 kicadImportSchematic
+run14 kicadLayersGetState
+run14 kicadLayersSetActive
+run14 kicadLayersSetVisible
+run14 kicadLibsAddEntry
+run14 kicadLibsFootprintUsage
+run14 kicadLibsInvalidate
+run14 kicadLibsReload
+run14 kicadLibsSymbolUsage
+run14 kicadLibsTestEditorFootprint
+run14 kicadLibsTestEditorLoad
+run14 kicadLibsTestLoadFootprint
+run14 kicadLibsTestPreload
+run14 kicadOpenFile
+run14 kicadOpenFileBusy
+run14 kicadOutputJobs
+run14 kicadPlaceImportedItem
+run14 kicadPlotBoard
+run14 kicadResolveRules
+run14 kicadSaveBoard
+run14 kicadSaveSchematic
+run14 kicadSchEdit
+run14 kicadSetChrome
+run14 kicadSetColorTheme
+run14 kicadSetDarkChrome
+run14 kicadSetReadOnly
+run14 kicadSettingsGet
+run14 kicadSettingsSet
+run14 kicadSheetsEnter
+run14 kicadSheetsGetTree
+run14 kicadShow3DViewer
+run14 kicadSimFileRead
+run14 kicadSimModelCatalog
+run14 kicadSimModelGet
+run14 kicadSimModelSet
+run14 kicadSimNetlist
+run14 kicadSimOpOnSheet
+run14 kicadSimRun
+run14 kicadSimStop
+run14 kicadSymbolForEditor
+run14 kicadSymbolGet
+run14 kicadSymbolLibConvert
+run14 kicadSymbolPushToSchematic
+run14 kicadSymbolSet
+run14 kicadSymbolsExchange
+run14 kicadSymbolsGet
+run14 kicadSymbolsSet
+run14 kicadSymEditCheck
+run14 kicadSymEditItemsAdd
+run14 kicadSymEditItemsGet
+run14 kicadSymEditItemsRemove
+run14 kicadSymEditItemsSet
+run14 kicadSymEditMarkSaved
+run14 kicadSymEditNew
+run14 kicadSymEditOpen
+run14 kicadSymEditPlotSvg
+run14 kicadSymEditSelect
+run14 kicadSymEditSelection
+run14 kicadSymEditShow
+run14 kicadSymEditState
+run14 kicadSymEditSymbolGet
+run14 kicadSymEditSymbolSet
+run14 kicadSymEditTake
+run14 kicadTestArmTimerPark
+run14 kicadTestFocusWindow
+run14 kicadTestSetOpenPark
+run14 kicadTestTimerParkState
+run14 kicadUpdateBoardFromSchematic
+run14 kicadUpdateFromLibrary
