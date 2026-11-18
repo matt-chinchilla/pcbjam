@@ -29,9 +29,58 @@ std::string footprintConvert( std::string aArgsJson )
 
     return "";
 }
+
+// m13-e: the document's embedded files, both frames (dispatched as kicadSettingsGet is): the
+// halves are defined in cc_e5_pcb.inc and cc_e5_sch.inc. The footprint and symbol editors
+// read false on both probes and answer "" or false (their own exports serve them).
+std::string embeddedFilesGetPcb();
+std::string embeddedFilesGetSch();
+bool        embeddedFilesSetPcb( std::string aArgsJson );
+bool        embeddedFilesSetSch( std::string aArgsJson );
+bool        embeddedFileExtractPcb( std::string aArgsJson );
+bool        embeddedFileExtractSch( std::string aArgsJson );
+
+/** kicadEmbeddedFilesGet (m13-e): the open document's embedded files. */
+std::string embeddedFilesGet()
+{
+    if( pcbEditorActive() )
+        return embeddedFilesGetPcb();
+
+    if( schEditorActive() )
+        return embeddedFilesGetSch();
+
+    return "";
+}
+
+/** kicadEmbeddedFilesSet (m13-e): add, remove or the fonts switch on the open document. */
+bool embeddedFilesSet( std::string aArgsJson )
+{
+    if( pcbEditorActive() )
+        return embeddedFilesSetPcb( aArgsJson );
+
+    if( schEditorActive() )
+        return embeddedFilesSetSch( aArgsJson );
+
+    return false;
+}
+
+/** kicadEmbeddedFileExtract (m13-e): one file's bytes into an extract run folder. */
+bool embeddedFileExtract( std::string aArgsJson )
+{
+    if( pcbEditorActive() )
+        return embeddedFileExtractPcb( aArgsJson );
+
+    if( schEditorActive() )
+        return embeddedFileExtractSch( aArgsJson );
+
+    return false;
+}
 } // namespace cc_e5
 
 EMSCRIPTEN_BINDINGS( cc_e5_dispatch )
 {
     function( "kicadFootprintConvert", &cc_e5::footprintConvert );
+    function( "kicadEmbeddedFilesGet", &cc_e5::embeddedFilesGet );
+    function( "kicadEmbeddedFilesSet", &cc_e5::embeddedFilesSet );
+    function( "kicadEmbeddedFileExtract", &cc_e5::embeddedFileExtract );
 }
