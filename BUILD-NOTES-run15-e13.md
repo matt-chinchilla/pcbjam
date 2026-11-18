@@ -146,35 +146,105 @@ and `errors` (so a host can tell a vanished plot from a refused expression).
   signals, or while a run is live: false, no folder written.
 - A second call with id 0 refused after a first accepted one: no `user0` remains.
 
-## st-mc-e: kicadMultichannel, kicadMultichannelApply (ledger PE37): NOT STARTED, plan for the relay
+## st-mc-e: kicadMultichannel, kicadMultichannelApply (ledger PE37)
 
-Read so far (kicad `pcbnew/tools/multichannel_tool.{h,cpp}` on `run15/main`); nobody in run 15
-owns `multichannel_tool.cpp`, so the unit is pcbjam only, in `cc_e13_pcb.inc`:
+Commit pcbjam `05f959c` (relay seat). No KiCad change (nobody in run 15 owns
+`pcbnew/tools/multichannel_tool.cpp`), no host ask, no marker. File: `wasm/bindings/cc_e13_pcb.inc`
+only. Both exports registered in `EMSCRIPTEN_BINDINGS( cc_e13_pcb )`, both MERGED IMAGE ONLY (the
+whole body, includes and registrations sit under `KICAD_MERGED_EMBIND`: occ_service links no
+multichannel tool). Includes added at the inc's top (merged only): `board_commit.h`, `footprint.h`,
+`pcb_group.h`, `zone.h`, `string_utils.h`, `connectivity/topo_match.h`,
+`geometry/convex_hull.h`, `geometry/shape_utils.h`, `tools/multichannel_tool.h` (all resolve
+with the existing include list: no include path asked of E0).
 
-- KiCad's own entry points show windows under the host: `AutogenerateRuleAreas` opens
-  `DIALOG_MULTICHANNEL_GENERATE_RULE_AREAS` whenever `Pgm().IsGUI()` (always true here);
-  `CheckRACompatibility` runs on the thread pool and opens a `WX_PROGRESS_REPORTER` after 1 s;
-  `RepeatLayout( event, ZONE* )` shows info bars. Never call those three.
-- Safe public pieces: `GetTool<MULTICHANNEL_TOOL>()`, `GeneratePotentialRuleAreas()` and
-  `FindExistingRuleAreas()` (both fill `GetData()->m_areas`, each clears it first: copy out the
-  existing list before generating), and `RepeatLayout( event, refArea, targetArea, options,
-  &externalCommit, &errorOut )`: silent with `aErrorOut`, resolves the topology itself, no dialog.
-- Plan: read `{op:"areas"}` = candidates (key `sheet:<path>`, `class:<name>`, `group:<name>`;
-  name as KiCad would name the zone `auto-placement-area-<source>`; exists when an existing
-  placement rule area holds the same component set, AutogenerateRuleAreas' own rule 1867 to 1911)
-  plus existing rule areas matching no candidate (with the zone uuid). `{op:"check", ref: zone
-  uuid}` = per other existing area the topology verdict through a COPY of
-  `resolveConnectionTopology` (1717 to 1808, public `TMATCH::CONNECTION_GRAPH::
-  BuildFromFootprintSet` and `FindIsomorphism`, `FormatComponentList` 66 to 118 copied), cited.
-- Apply `generate`: a copy of AutogenerateRuleAreas' write half (1915 to 2043, `buildRAOutline`
-  455 to 498 with `BuildConvexHull`, `KIGEOM::CollectBoxCorners`, `RectifyPolygon`), ONE
-  `BOARD_COMMIT` pushed "Auto-generate placement rule areas". Apply `repeat`: FindExistingRuleAreas,
-  ref and targets by zone uuid, one external `BOARD_COMMIT`, `RepeatLayout` per target with
-  `aErrorOut`; preview = `Revert()`, else `Push( "Repeat layout" )`; `groupItems` needs a copy of
-  `pruneExistingGroups` (1811 to 1842) and the grouping loop (959 to 978).
-- Record under `/tmp/cc-multichannel/<n>`: `multichannel.json` (spec 7.6 `MultichannelReport`)
-  then `.cc-multichannel.json` last (`ccIsRunDir`, `ccWriteJson`).
-- Fixture: kicad `qa/data/pcbnew/issue21739/` (read by path).
+KiCad's own entry points are not called where they show windows under the host:
+`AutogenerateRuleAreas` (its dialog whenever `Pgm().IsGUI()`), `CheckRACompatibility` (a
+`WX_PROGRESS_REPORTER` after 1 s), `RepeatLayout( event, ZONE* )` (info bar, `wxSafeYield`, its
+own push). Called as they are: `GetTool<MULTICHANNEL_TOOL>()`, `FindExistingRuleAreas()`,
+`GeneratePotentialRuleAreas()` (both refill the tool's `GetData()->m_areas`; the inc copies the
+vector out each time) and the public `RepeatLayout( event, refArea, targetArea, options,
+&externalCommit, &errorOut )` (silent with `errorOut`). Copied from `multichannel_tool.cpp` (private
+or static there, behavior unchanged, traces and timers dropped): `FormatComponentList` (66 to
+118), `resolveConnectionTopology` (1717 to 1808, public `TMATCH` API), `queryBoardItemsInGroup`
+(435), both `buildRAOutline` (455, 475), `pruneExistingGroups` (1811), and the write half of
+`AutogenerateRuleAreas` (1867 to 2043). One deliberate difference: KiCad's group loop would add a
+null zone for a group source with no board items (it skips making that zone and still groups it);
+the copy passes such an area.
+
+**Read `kicadMultichannel( argsJson ) -> string`** (synchronous, nothing changed; "" for another
+shape, no board, an open in flight):
+- `{"op":"areas"}` answers `{"areas": [{key, name, source, sheetPath, parts, exists, zone}],
+  "ruleAreas": [{zone, name, source, sourceName, parts}], "canGenerate": bool}`. `areas` are
+  GeneratePotentialRuleAreas' candidates: `key` `sheet:<path>`, `class:<name>` or
+  `group:<name>`; `name` the zone name AutogenerateRuleAreas gives (`auto-placement-area-<src>`);
+  `source` `sheet` | `componentClass` | `group`; `sheetPath` for a sheet, else ""; `exists` and
+  `zone` (uuid) when a placement rule area holds exactly the same parts (AutogenerateRuleAreas'
+  rule, the last such zone wins). `ruleAreas` are FindExistingRuleAreas' areas (zone uuid, zone
+  name, the zone's own source type and source text, its part count). `canGenerate` is false
+  where KiCad says "Cannot auto-generate any placement areas" (one or no candidate). This is
+  spec 7.6's `RuleAreaRow` plus `key` and `zone`, which the apply needs.
+- `{"op":"check","ref":"<zone uuid>"}` answers `{"checks": [{zone, name, parts, matched, ok,
+  message, reasons}], "error": ""}`: per other placement rule area, KiCad's verdict against the
+  reference (`message` is KiCad's `m_errorMsg`, "OK" or the first reason; `reasons` KiCad's own
+  mismatch lines, with the component lists when the counts differ). An unknown ref answers
+  `{"checks": [], "error": "not_found"}`.
+
+**Apply `kicadMultichannelApply( argsJson ) -> bool`** (true = queued on the apply coroutine;
+run folder root `/tmp/cc-multichannel/`):
+- `{run, dir, op: "generate", areas: [keys], replaceExisting: bool, groupItems?: bool}`: the
+  candidates named by key get a placement rule area each (copied write half, a 0.1 mm margin
+  hull rectified to 90 degree segments, all copper layers), an existing one removed first only
+  with `replaceExisting`; `groupItems` groups each new zone with its parts, pruning their old
+  groups (KiCad's dialog checkbox). ONE commit "Auto-generate placement rule areas"; nothing
+  pushed when no area was made. Errors: `too_few` (KiCad's info bar sentence as `message`),
+  `not_found` (an unknown key, `message` the key; nothing changed).
+- `{run, dir, op: "repeat", ref, targets: [zone uuids], options: {copyRouting?,
+  connectedRoutingOnly?, copyPlacement?, copyOtherItems?, includeLockedItems?, anchor?},
+  preview: bool}` (exactly these seven keys; options' booleans default to KiCad's
+  `REPEAT_LAYOUT_OPTIONS`; `anchor` a footprint uuid of the reference area or ""): per target
+  the copied verdict; a target that does not match is reported (`ok: false`, KiCad's reasons)
+  and skipped, as KiCad's Repeat Layout skips it; a matching one goes through RepeatLayout into
+  ONE external `BOARD_COMMIT`. A preview, or a run where nothing matched, is reverted; a failed
+  copy reverts the whole commit (`copy_failed`, KiCad's message), as KiCad's own path does;
+  otherwise pushed "Repeat layout". Errors: `not_found` (ref, a target or the anchor; nothing
+  changed). **`groupItems` is refused on repeat** (args false): the public per target
+  RepeatLayout keeps the items KiCad would group inside a local it never returns, and KiCad's
+  zone overload that groups shows an info bar and pushes its own commit (no preview). Reported to
+  E0 and to st-mc-i, st-mc-s: the Repeat page must not offer "group the items" this run.
+- Record: `<dir>/multichannel.json` = `{op, preview, areas, applied, depth, error, message}`
+  (generate rows `{key, name, parts, ok, reasons: [], skipped: "" | "exists" | "empty", zone?}`,
+  repeat rows `{zone, name, parts, ok, reasons}`; `depth` the board frame's undo count after the
+  run), then `<dir>/.cc-multichannel.json` last `{code: 0 | 1, error}`. `no_board` and `failed`
+  (an exception) are the other codes.
+
+**Header change:** none. Recompile reach: `pcbnew_embind.cpp` only.
+
+### What the build train must probe (st-mc-e)
+
+Fixture: kicad `qa/data/pcbnew/issue21739/topology_mismatch.kicad_pro` (read by path; KiCad's qa
+case `TopoMatchGlobalNetHierarchicalPins`: the sheet `i2c_thingy` placed twice, the board already
+holding the two placement rule areas sourced `/i2c_thingy_ch0/` and `/i2c_thingy_ch1/`, which
+KiCad's qa expects to MATCH with equal part counts). Open the board in the board frame.
+- `kicadMultichannel('{"op":"areas"}')`: `ruleAreas` holds both zones (source `sheet`,
+  sourceName the two paths, equal `parts`); `areas` holds the sheet candidates (keys
+  `sheet:/i2c_thingy_ch0/`, `sheet:/i2c_thingy_ch1/`, plus the root sheet's), the two channel
+  candidates `exists: true` with those zones' uuids; `canGenerate` true. Wrong: "" (the
+  MULTICHANNEL_TOOL not registered in the frame) or no `exists: true`.
+- `kicadMultichannel('{"op":"check","ref":"<ch0 zone>"}')`: one row, ch1, `ok: true`, `message`
+  "OK", `matched` equal to `parts`, `reasons` empty. Wrong: `ok: false` (the issue 21739 bug
+  back), a progress window, or a hang (the match runs on KiCad's thread pool and is joined on
+  the calling thread, as DRC is).
+- `kicadMultichannelApply('{"run":1,"dir":"/tmp/cc-multichannel/1","op":"repeat","ref":"<ch0>","targets":["<ch1>"],"options":{},"preview":true}')`:
+  true; `.cc-multichannel.json` `{"code":0,"error":""}`; one row `ok: true`, `applied` 1,
+  `depth` unchanged, board unchanged. The same with `"preview":false`: `depth` +1, ch1's parts
+  moved to ch0's placement, one Undo restores them. Wrong: depth +2 (a second commit), the info
+  bar "Copied to", or `copy_failed`.
+- `kicadMultichannelApply` `generate` with `areas` `["sheet:/i2c_thingy_ch0/",
+  "sheet:/i2c_thingy_ch1/"]`, `replaceExisting: true`: two rows `ok: true` with new zone uuids,
+  the old two zones gone, `depth` +1, no window; with `replaceExisting: false`: two rows
+  `skipped: "exists"`, `applied` 0, depth unchanged. An unknown key: `error` `not_found`.
+- `repeat` with `options: {"groupItems": true}` answers false (refused by design).
+- Bad shapes: `{"op":"areas","x":1}` answers ""; a repeat with `ref` in `targets` answers false.
 
 ## Checks (lo-e2-e and m11-e)
 
