@@ -26,6 +26,11 @@
  * (cc_eN_dispatch.inc) before the kicad_editor bindings block; the frame probes
  * ccActiveFrameType(), fpEditorActive(), symEditorActive() and dsEditorActive() a dispatcher
  * face uses to tell the footprint editor, symbol editor and drawing sheet editor frames apart.
+ *
+ * Modified by Circuit Center Inc on 2026-11-18: engine run 15, boot-e1. The chrome toggle is
+ * applyChrome( frame, show ), so the start-up hold of cc_boot_dispatch.inc hides KiCad's chrome
+ * on the frame being booted, before it is shown; kicadSetChrome paints the new layout before it
+ * returns (repaintChromeNow), as a mouse button's synchronous repaint does.
  */
 
 #ifdef __EMSCRIPTEN__
@@ -480,14 +485,10 @@ static std::string kicadOutputJobs()
     }
 }
 
-static bool kicadSetChrome( bool aShow )
+// Hides or shows KiCad's chrome on aFrame: the top frame for kicadSetChrome, the frame being
+// booted (not yet shown, not yet the top window) for the start-up hold of cc_boot_dispatch.inc.
+static void applyChrome( wxFrame* frame, bool aShow )
 {
-    wxFrame* frame =
-            wxTheApp ? dynamic_cast<wxFrame*>( wxTheApp->GetTopWindow() ) : nullptr;
-
-    if( !frame )
-        return false;
-
     wxMenuBar*    menuBar = frame->GetMenuBar();
     wxStatusBar*  statusBar = frame->GetStatusBar();
     wxAuiManager* mgr = wxAuiManager::GetManager( frame );
@@ -579,6 +580,35 @@ static bool kicadSetChrome( bool aShow )
 
     frame->SendSizeEvent();
     reportChrome( frame, mgr );
+}
+
+// Paints the frame's new layout before kicadSetChrome returns (engine run 15, boot-e1). Laid
+// out again but left to the engine's loop, the stage kept the old picture (the toolbars, the
+// panes, the status bar) for as long as the loop was held back after the call: the host's
+// open, or a second engine's boot on the same thread. The paint is the one a mouse button
+// runs synchronously (wx wasm wxApp::HandleMouseEvent: Paint, deferring a non-main GL window).
+// Not while a dispatch chain is parked or an open is in flight (the model may be half
+// changed; the pump paints when it resumes), and not on a frame not shown yet (its first
+// paint comes with its Show).
+static void repaintChromeNow( wxFrame* aFrame )
+{
+    if( !wxTheApp || !aFrame->IsShown() || wxWasmDispatchParked() || pcbjam_open::busy() )
+        return;
+
+    aFrame->Refresh();
+    wxTheApp->Paint( /*deferGLCanvasWindows=*/true );
+}
+
+static bool kicadSetChrome( bool aShow )
+{
+    wxFrame* frame =
+            wxTheApp ? dynamic_cast<wxFrame*>( wxTheApp->GetTopWindow() ) : nullptr;
+
+    if( !frame )
+        return false;
+
+    applyChrome( frame, aShow );
+    repaintChromeNow( frame );
     return true;
 }
 
@@ -966,6 +996,7 @@ static std::string settingsSections()
 #include "cc_e7_dispatch.inc"
 #include "cc_e10_dispatch.inc"
 #include "cc_e12_dispatch.inc"
+#include "cc_boot_dispatch.inc"
 
 EMSCRIPTEN_BINDINGS(kicad_editor) {
     // Apply-queue idle probe (drift-trio finding #10b): a scratch save taken

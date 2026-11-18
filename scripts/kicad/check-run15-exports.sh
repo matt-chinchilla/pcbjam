@@ -191,7 +191,7 @@ for r in regs:
 
 def owner_of(relpath):
     base = os.path.basename(relpath)
-    m = re.fullmatch(r'cc_(e\d+)_\w+\.inc', base)
+    m = re.fullmatch(r'cc_(e\d+|boot)_\w+\.inc', base)
     if m:
         return m.group(1)
     if base == "dsedit_embind.cpp":
@@ -222,7 +222,7 @@ for name, rs in sorted(by_name.items()):
 DECL = re.compile(r'^\s*(?:extern\s+)?(?:const\s+)?[\w:<>]+(?:\s*[\*&])?\s+[\*&]?(\w+)\s*\([^(){};=]*\)\s*;\s*$')
 NOT_TYPES = {"return", "else", "delete", "new", "throw", "case", "goto", "using", "typedef"}
 for fn in sorted(os.listdir(bind)):
-    m = re.fullmatch(r'cc_(e\d+)_dispatch\.inc', fn)
+    m = re.fullmatch(r'cc_(e\d+|boot)_dispatch\.inc', fn)
     if not m:
         continue
     lane = m.group(1)
