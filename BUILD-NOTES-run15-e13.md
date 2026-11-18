@@ -255,16 +255,41 @@ with lo-e2-e committed and m11-e in the tree:
     PASS eeschema       eeschema_embind.cpp subdir=eeschema -DKICAD_MERGED_EMBIND (12612 ms)
     syntax-check: 0 failed
 
-(Only the two warnings wx's own `log.h` always gives.) The `all` run of the hand over is owed:
-these two units touch only the eeschema TU, which no other unit of `all` compiles.
+## Checks at the hand over (all three units)
+
+After `git merge run15/main` in both worktrees (already up to date: pcbjam 48e664e, kicad
+caf17fbe), with lo-e2-e, m11-e and st-mc-e committed. While iterating st-mc-e:
+`gate.sh scripts/kicad/syntax-check-run15.sh --kicad /home/matthew/cc-engine-wt/e13/kicad pcbnew occ`
+gave PASS pcbnew (14003 ms), PASS occ (14052 ms), 0 failed. The hand over:
+`/home/matthew/cc-wave2/bin/gate.sh scripts/kicad/syntax-check-run15.sh --kicad /home/matthew/cc-engine-wt/e13/kicad all`
+(no `--kicad-file`: this lane changed no KiCad file)
+
+    PASS pcbnew         pcbnew_embind.cpp subdir=pcbnew -DKICAD_MERGED_EMBIND (13211 ms)
+    PASS eeschema       eeschema_embind.cpp subdir=eeschema -DKICAD_MERGED_EMBIND (12220 ms)
+    PASS symedit        symedit_embind.cpp subdir=eeschema  (7590 ms)
+    PASS fpedit         fpedit_embind.cpp subdir=pcbnew  (7236 ms)
+    PASS dsedit         dsedit_embind.cpp subdir=pagelayout_editor  (1137 ms)
+    PASS kicad_editor   kicad_editor_embind.cpp subdir=common  (4933 ms)
+    PASS occ            pcbnew_embind.cpp subdir=pcbnew (11680 ms)
+    syntax-check: 0 failed
+
+(Only the two warnings wx's own `log.h` always gives.)
 
 Export check: `scripts/kicad/check-run15-exports.sh --since run15/main --kicad
 /home/matthew/cc-engine-wt/e13/kicad --kicad-since run15/main`:
 
-    check-run15-exports: 155 names registered in the merged image (148 kicad names), 10 of 110 run 15 names, 0 failures
+    check-run15-exports: 157 names registered in the merged image (150 kicad names), 12 of 110 run 15 names, 0 failures
+
+## Reported to E0
+
+- lo-e2-e edits the simulator's helpers in `eeschema_embind.cpp`'s anonymous namespace just
+  above the leased section (simulator code only, see lo-e2-e "Lease").
+- st-mc-e: both exports merged image only; no include path, CMake line or build script line
+  needed. `groupItems` is refused on `repeat` (see st-mc-e): st-mc-i and st-mc-s should not
+  offer "group the items" on Repeat this run.
 
 ## Hand over state
 
-lo-e2-e and m11-e committed. st-mc-e not started (plan above). lo-e2-svc-e HELD: no diagnosis by
-lo-e2-i exists under `/home/matthew/cc-wave2/reports/` or `plan/`. No `e13.done`: the relay seat
-builds st-mc-e, then runs `all` and the export check and writes it.
+lo-e2-e, m11-e and st-mc-e committed, checks above clean, `e13.done` written. lo-e2-svc-e HELD:
+no diagnosis by lo-e2-i names it under `/home/matthew/cc-wave2/reports/` or `plan/` (checked at
+the hand over); it is built only when one says so (RULINGS 5).
