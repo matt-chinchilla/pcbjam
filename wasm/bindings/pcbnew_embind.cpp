@@ -3,8 +3,9 @@
  * Exposes core PCBnew objects to JavaScript
  *
  * Modified by Circuit Center Inc on 2026-11-18: engine run 15's seams, cc_fp_items.h (the
- * footprint item kinds, declarations) and one include per author lane's board face
- * (cc_eN_pcb.inc) after cc_rules_pcb.inc, each with its own namespace and bindings block.
+ * footprint item kinds, declarations, merged image only), the lease slots of lanes e7 and e11
+ * (cc_e7_lease.h, cc_e11_lease.h) and one include per author lane's board face (cc_eN_pcb.inc)
+ * after cc_rules_pcb.inc, each with its own namespace and bindings block.
  *
  * This provides a foundation for future Pyodide integration.
  *
@@ -110,7 +111,17 @@
 #include "pcbjam_theme.h"
 #include "pcbjam_libs_reload.h"
 #include "cc_output_common.h"
+#ifdef KICAD_MERGED_EMBIND
+// The footprint item kinds (R1) are defined in the fpedit translation unit, which only the
+// merged image links: occ_service compiles this file without them, so a board face that calls
+// cc_fpitems outside a KICAD_MERGED_EMBIND guard fails its compile, not its link.
 #include "cc_fp_items.h"
+#endif
+// The lease slots (engine run 15): a lane holding a leased body in this file declares there
+// what that body calls (its own includes, declarations, inline helpers); the definitions live in
+// its cc_eN_pcb.inc, included at the end of this file.
+#include "cc_e7_lease.h"
+#include "cc_e11_lease.h"
 #include <algorithm>
 #include <chrono>
 #include <cstdio>

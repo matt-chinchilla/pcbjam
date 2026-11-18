@@ -3,8 +3,18 @@
 //
 // Engine run 15 (R1): the footprint item kinds, frame neutral. DECLARATIONS ONLY: the single
 // definitions are lane e4's, in namespace cc_fpitems inside cc_e4_fpedit.inc (the fpedit
-// translation unit); pcbnew_embind.cpp includes this header too, so the board face (lane e3's
-// board item records) calls the same read and apply and links to them.
+// translation unit); pcbnew_embind.cpp includes this header too, under KICAD_MERGED_EMBIND
+// only, so the board face (lane e3's board item records) calls the same read and apply and
+// links to them in the merged image, and a board face call left outside a KICAD_MERGED_EMBIND
+// guard fails the occ_service compile (the syntax check's occ unit) in place of its link.
+//
+// The board face reaches every kind through this table (ccItemKind, ccFpItemJson,
+// ccFpItemApply), never by including a kind header: the kind headers (cc_item_pad.h,
+// cc_item_text.h, cc_item_shape.h) are included by their owner's fpedit inc alone, hold only
+// inline or static functions, and register nothing themselves; each kind is registered once,
+// from its owner's fpedit inc, with a namespace scope registrar in the fpedit translation unit.
+// The table itself is a function local static inside ccRegisterItemKind's translation unit, so
+// a registrar never runs before it exists.
 //
 // A kind is one row of a table: its name (exactly pad, field, text, textbox, shape,
 // dimension, zone, table, barcode, image, point), its read as JSON, its set as a patch inside
@@ -34,9 +44,13 @@ using json = nlohmann::json;
 struct CcItemKind
 {
     const char* name;
-    json ( *get )( BOARD_ITEM* aItem );
-    bool ( *set )( BOARD_ITEM* aItem, const json& aSet, BOARD_COMMIT& aCommit );
-    BOARD_ITEM* ( *add )( BOARD_ITEM_CONTAINER* aParent, const json& aItem );
+    // Every body takes the same frame facts as ccFpItemJson and ccFpItemApply: positions in its
+    // JSON are relative to aOrigin, and aBoardFrame says which frame the item lives in.
+    json ( *get )( BOARD_ITEM* aItem, const VECTOR2I& aOrigin, bool aBoardFrame );
+    bool ( *set )( BOARD_ITEM* aItem, const json& aSet, BOARD_COMMIT& aCommit,
+                   const VECTOR2I& aOrigin, bool aBoardFrame );
+    BOARD_ITEM* ( *add )( BOARD_ITEM_CONTAINER* aParent, const json& aItem,
+                          const VECTOR2I& aOrigin, bool aBoardFrame );
 };
 
 /** Adds a kind to the table (a kind registered twice keeps its first row). */

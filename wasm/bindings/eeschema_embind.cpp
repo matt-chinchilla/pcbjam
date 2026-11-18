@@ -16,9 +16,9 @@
 // Modified by Chirichella Inc. on 2026-11-16: kicadSymbolsGet, kicadSymbolsSet,
 // kicadSymbolsExchange, kicadSchEdit and the schematic half of kicadSettingsGet and
 // kicadSettingsSet (engine run 14, cc_rules_sch.inc).
-// Modified by Circuit Center Inc on 2026-11-18: engine run 15's seams, one include per author
-// lane's schematic face (cc_eN_sch.inc) after cc_rules_sch.inc, each with its own namespace
-// and bindings block.
+// Modified by Circuit Center Inc on 2026-11-18: engine run 15's seams, lane e13's lease slot
+// (cc_e13_lease.h) and one include per author lane's schematic face (cc_eN_sch.inc) after
+// cc_rules_sch.inc, each with its own namespace and bindings block.
 
 #ifdef __EMSCRIPTEN__
 #include <emscripten.h>
@@ -126,6 +126,10 @@
 #include <jobs/job_export_sch_plot.h>
 #include <wx/log.h>
 #include "cc_output_common.h"
+// The lease slot (engine run 15): lane e13 holds the simulator section of this file and declares
+// there what that section calls (its own includes, declarations, inline helpers); the
+// definitions live in its cc_e13_sch.inc, included after cc_rules_sch.inc.
+#include "cc_e13_lease.h"
 
 using namespace emscripten;
 using json = nlohmann::json;

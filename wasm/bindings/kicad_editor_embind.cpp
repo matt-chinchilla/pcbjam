@@ -23,7 +23,9 @@
  * Modified by Circuit Center Inc on 2026-11-18: engine run 15's seams, the export
  * kicadSettingsSections (the settings sections of both faces, from the section registries of
  * cc_rules_pcb.inc and cc_rules_sch.inc) and one include per author lane's dispatcher face
- * (cc_eN_dispatch.inc) before the kicad_editor bindings block.
+ * (cc_eN_dispatch.inc) before the kicad_editor bindings block; the frame probes
+ * ccActiveFrameType(), fpEditorActive(), symEditorActive() and dsEditorActive() a dispatcher
+ * face uses to tell the footprint editor, symbol editor and drawing sheet editor frames apart.
  */
 
 #ifdef __EMSCRIPTEN__
@@ -926,6 +928,32 @@ static std::string settingsSections()
 {
     return std::string( "{\"board\":" ) + pcbSettingsSections() + ",\"schematic\":"
            + schSettingsSections() + "}";
+}
+
+// Circuit Center (engine run 15): which editor this page's one frame is, for a dispatcher face.
+// pcbEditorActive() and schEditorActive() answer false in the footprint editor, symbol editor
+// and drawing sheet editor frames, so a dispatcher that serves those frames asks these first:
+// the top window's own KiCad frame type (FRAME_T_COUNT when no KiCad frame is up).
+[[maybe_unused]] static FRAME_T ccActiveFrameType()
+{
+    KIWAY_PLAYER* player =
+            wxTheApp ? dynamic_cast<KIWAY_PLAYER*>( wxTheApp->GetTopWindow() ) : nullptr;
+    return player ? player->GetFrameType() : FRAME_T_COUNT;
+}
+
+[[maybe_unused]] static bool fpEditorActive()
+{
+    return ccActiveFrameType() == FRAME_FOOTPRINT_EDITOR;
+}
+
+[[maybe_unused]] static bool symEditorActive()
+{
+    return ccActiveFrameType() == FRAME_SCH_SYMBOL_EDITOR;
+}
+
+[[maybe_unused]] static bool dsEditorActive()
+{
+    return ccActiveFrameType() == FRAME_PL_EDITOR;
 }
 
 // Circuit Center (engine run 15): each author lane's dispatcher face, in its own file,
