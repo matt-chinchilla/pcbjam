@@ -13,6 +13,10 @@
 
 #include <host_prompt.h>
 #include <tool/host_context_menu.h>
+#include <hotkeys_basic.h>
+#include <tool/action_manager.h>
+#include <tool/tool_action.h>
+#include <tool/tool_manager.h>
 #include <wx/dialog.h>
 #include <wx/toplevel.h>
 #include "collab_common.h"
@@ -164,6 +168,175 @@ std::string tableCsv( std::string aArgs )
 
     return "";
 }
+// ---- st-keys-e: kicadHotkeysGet, kicadHotkeysSet (the editor's keys, both editors) ----------
+
+// The live schematic or board editor's tool manager and its actions' prefix ("eeschema",
+// "pcbnew"); null in any other frame or with no frame.
+static TOOL_MANAGER* keysToolManager( std::string& aApp )
+{
+    if( fpEditorActive() || symEditorActive() || dsEditorActive() )
+        return nullptr;
+
+    if( pcbEditorActive() )
+        aApp = "pcbnew";
+    else if( schEditorActive() )
+        aApp = "eeschema";
+    else
+        return nullptr;
+
+    KIWAY_PLAYER* frame =
+            wxTheApp ? dynamic_cast<KIWAY_PLAYER*>( wxTheApp->GetTopWindow() ) : nullptr;
+    TOOL_MANAGER* toolMgr = frame ? frame->GetToolManager() : nullptr;
+
+    return toolMgr && toolMgr->GetActionManager() ? toolMgr : nullptr;
+}
+
+// An action of this editor's key list, as KiCad's hotkey list counts them (HOTKEY_STORE::Init):
+// this editor's own and the common ones, never an internal action (no friendly name).
+static bool keysListed( const TOOL_ACTION* aAction, const std::string& aApp )
+{
+    const std::string& name = aAction->GetName();
+
+    if( aAction->GetFriendlyName().IsEmpty() )
+        return false;
+
+    return name.rfind( aApp + ".", 0 ) == 0 || name.rfind( "common.", 0 ) == 0;
+}
+
+// KiCad's key grammar ("Ctrl+Shift+M"); "" for no key.
+static std::string keysName( int aKeycode )
+{
+    if( aKeycode <= 0 )
+        return std::string();
+
+    return KeyNameFromKeyCode( aKeycode ).ToStdString( wxConvUTF8 );
+}
+
+// Every action of the live editor's key list with its keys: {"editor":"sch"|"pcb","actions":
+// [{"name","label","key","default","alt"}]}, sorted by name; key the primary key now, default
+// KiCad's own, alt the secondary (the island's seeded chord). "" in any other frame. A read.
+std::string hotkeysGet()
+{
+    std::string   app;
+    TOOL_MANAGER* toolMgr = keysToolManager( app );
+
+    if( !toolMgr )
+        return "";
+
+    nlohmann::json actions = nlohmann::json::array();
+
+    for( const auto& [name, action] : toolMgr->GetActionManager()->GetActions() )
+    {
+        if( !action || !keysListed( action, app ) )
+            continue;
+
+        actions.push_back( { { "name", name },
+                             { "label", action->GetFriendlyName().ToStdString( wxConvUTF8 ) },
+                             { "key", keysName( action->GetHotKey() ) },
+                             { "default", keysName( action->GetDefaultHotKey() ) },
+                             { "alt", keysName( action->GetHotKeyAlt() ) } } );
+    }
+
+    nlohmann::json answer;
+    answer["editor"] = app == "pcbnew" ? "pcb" : "sch";
+    answer["actions"] = actions;
+
+    return answer.dump( -1, ' ', false, nlohmann::json::error_handler_t::replace );
+}
+
+// {"keys":{"<action>":"<key>"|""}} (at most 2,048): each named action's PRIMARY key, in KiCad's
+// grammar, "" for none; the secondary stays as it is (the island's seeded chord). Read whole
+// first: an action not in this editor's list, a key KiCad cannot read, any other shape, a
+// modal dialog, a parked prompt or an open in flight refuses the whole set (false, nothing
+// changes). Then the action manager's key map is rebuilt (ACTION_MANAGER::UpdateHotKeys,
+// from the actions, no file read). Not an edit: no undo step, no modified flag.
+bool hotkeysSet( std::string aArgs )
+{
+    std::string   app;
+    TOOL_MANAGER* toolMgr = keysToolManager( app );
+
+    if( !toolMgr || modalDialogUp() || CcHostPromptModalParked() || pcbjam_open::busy() )
+        return false;
+
+    const nlohmann::json args = nlohmann::json::parse( aArgs, nullptr, false );
+
+    if( args.is_discarded() || !args.is_object() || args.size() != 1 || !args.contains( "keys" )
+        || !args["keys"].is_object() || args["keys"].size() > 2048 )
+    {
+        return false;
+    }
+
+    ACTION_MANAGER*                          actionMgr = toolMgr->GetActionManager();
+    std::vector<std::pair<TOOL_ACTION*, int>> changes;
+
+    for( const auto& [name, key] : args["keys"].items() )
+    {
+        TOOL_ACTION* action = actionMgr->FindAction( name );
+
+        if( !action || !keysListed( action, app ) || !key.is_string() )
+            return false;
+
+        const std::string text = key.get<std::string>();
+        int               code = 0;
+
+        if( !text.empty() )
+        {
+            code = KeyCodeFromKeyName( wxString::FromUTF8( text ) );
+
+            if( code <= 0 )
+                return false;
+        }
+
+        changes.emplace_back( action, code );
+    }
+
+    for( const auto& [action, code] : changes )
+        action->SetHotKey( code, action->GetHotKeyAlt() );
+
+    actionMgr->UpdateHotKeys( false );
+    return true;
+}
+// ---- m6-e3: kicadSelectionFilterGet, kicadSelectionFilterSet (both editors) -------------------
+
+// The halves (cc_e1_pcb.inc, cc_e1_sch.inc, merged image only).
+std::string selectionFilterGetPcb();
+std::string selectionFilterGetSch();
+bool        selectionFilterSetPcb( std::string aArgs );
+bool        selectionFilterSetSch( std::string aArgs );
+
+// The live editor's selection filter (KiCad's Selection Filter pane): the board's twelve keys
+// or the schematic's ten, each a boolean. "" in any other frame.
+std::string selectionFilterGet()
+{
+    if( fpEditorActive() || symEditorActive() || dsEditorActive() )
+        return "";
+
+    if( pcbEditorActive() )
+        return selectionFilterGetPcb();
+
+    if( schEditorActive() )
+        return selectionFilterGetSch();
+
+    return "";
+}
+
+// Some of the live editor's keys with booleans: true taken, false refused (nothing changes).
+bool selectionFilterSet( std::string aArgs )
+{
+    if( fpEditorActive() || symEditorActive() || dsEditorActive() )
+        return false;
+
+    if( modalDialogUp() || CcHostPromptModalParked() )
+        return false;
+
+    if( pcbEditorActive() )
+        return selectionFilterSetPcb( aArgs );
+
+    if( schEditorActive() )
+        return selectionFilterSetSch( aArgs );
+
+    return false;
+}
 } // namespace cc_e1
 
 EMSCRIPTEN_BINDINGS( cc_e1_dispatch )
@@ -178,4 +351,8 @@ EMSCRIPTEN_BINDINGS( cc_e1_dispatch )
     emscripten::function( "kicadContextMenuHighlight", &cc_e1::contextMenuHighlight );
     emscripten::function( "kicadRunAction", &cc_e1::runAction );
     emscripten::function( "kicadTableCsv", &cc_e1::tableCsv );
+    emscripten::function( "kicadHotkeysGet", &cc_e1::hotkeysGet );
+    emscripten::function( "kicadHotkeysSet", &cc_e1::hotkeysSet );
+    emscripten::function( "kicadSelectionFilterGet", &cc_e1::selectionFilterGet );
+    emscripten::function( "kicadSelectionFilterSet", &cc_e1::selectionFilterSet );
 }
