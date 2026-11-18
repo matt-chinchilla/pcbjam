@@ -44,3 +44,43 @@ PASS kicad pcbnew/microwave/microwave_inductor.cpp (7044 ms)
 PASS kicad pcbnew/microwave/microwave_polygon.cpp (7005 ms)
 syntax-check: 0 failed
 ```
+
+## m6-e2: Create Array and Position Relative ask the host (modeless)
+
+No export (the prompt exports are e1's m1x-e1: `kicadPromptAnswer`, `kicadPromptCancel`, `kicadPromptPick`, marker `kicadHostPrompts`). Nothing in `cc_e2_pcb.inc`.
+
+**Host asks** (through `include/host_prompt.h`, e1's, merged into `run15/main` 79c5c7af):
+- `window.kicadHostPrompt.onAsk({token, ask: "array", modal: false, record})` from `DIALOG_CREATE_ARRAY::Show( true )` (`pcbnew/dialogs/dialog_create_array.cpp`, the `__EMSCRIPTEN__` block at the end; called by `ARRAY_TOOL::CreateArray`, `pcbnew/tools/array_tool.cpp` 104, unchanged). Record `{ shape: "grid" | "circular", arrangeSelection, uniqueReferences, padNumbering, grid: { nx, ny, dx, dy, offsetX, offsetY, centred, stagger, staggerRows, horizontalThenVertical, reverseNumberingAlternate, numberingStartSpecified, numbering2d, primary, secondary }, circular: { centreX, centreY, angle, angleOffset, clockwise, count, rotateItems, numberingStartSpecified, axis } }`, an axis `{ type: "numeric" | "hex" | "alphaShort" | "alphaFull", start: string, step }`; lengths mm (board coordinates for the centre), angles degrees; `padNumbering` is the dialog's `m_isFootprintEditor` (true in the footprint editor frame).
+- `onUpdate({token, record})` after each pick (`UpdatePickedItem`, `UpdatePickedPoint`).
+- `window.kicadHostPrompt.onAsk({token, ask: "positionRelative", modal: false, record})` from `DIALOG_POSITION_RELATIVE::Show( true )` (`pcbnew/dialogs/dialog_position_relative.cpp`; called by `POSITION_RELATIVE_TOOL::PositionRelative`, unchanged). Record `{ anchor: { kind: "item" | "point" | "gridOrigin" | "userOrigin", x, y, label }, x, y }` (label KiCad's `m_referenceInfo` text verbatim, x and y of the anchor and of the offset in mm). A later `Show( true )` while the prompt is parked (after a pick, or Shift+P again) sends `onUpdate` with the new record in place of a second ask.
+- `onEnd({token, reason: "gone"})` when a dialog with a parked prompt is destroyed (`CcHostPromptForget` in both destructors).
+
+**Answers:**
+- array: any subset of the record's keys (closed: an unknown key refuses with `field` = that key; a bad value inside `grid` or `circular` refuses with `field` `grid` or `circular`), read whole, then written into the dialog's own controls (`ChangeValue`, radio buttons, the notebook page by `shape`); a given circular `angle` clears KiCad's Full circle box so the angle governs; then KiCad's own `Validate()` and `TransferDataFromWindow()`. Accepted: the dialog closes itself and `ARRAY_TOOL::onDialogClosed` makes the array in ONE commit; the prompt ends (no `onEnd`, the answer's `{"accepted":true}` closes the card). Refused: the prompt stays parked; KiCad's error text (it called `wxMessageBox`) is captured as the refusal's `message` through `CcPromptCaptureMessage`; the zero spacing warning is `IsOK`, whose capture is m1x-e2's (`common/confirm.cpp`, e1).
+- array `prompt.pick`: `point` and `item` run `OnSelectCenterButton` as the two buttons do (KiCad's picker; the dialog disables itself while picking, as KiCad's does); the result arrives as `onUpdate`.
+- array cancel (`kicadPromptCancel`): `Close()` with no options, so ARRAY_TOOL destroys the dialog and makes nothing.
+- positionRelative: `{ x?, y? (mm), anchor?: "gridOrigin" | "userOrigin" }`, closed. `anchor` runs `OnUseGridOriginClick` or `OnUseUserOriginClick`; with no x and no y the card is sent the new record and the prompt stays parked. With x or y: a polar entry in the dialog is first turned to Cartesian (the box cleared), the given values written, then KiCad's own `OnOkClick` (one commit "Position Relative"), then the dialog hides as KiCad's OK hides it and the prompt ENDS. **Call, reported:** the addendum says the card stays open after Apply "as KiCad's dialog stays"; KiCad 10's OK hides the dialog (`OnOkClick` skips to the standard OK), and a second Apply against the same tool run would move again from the stale selection anchor (`POSITION_RELATIVE_TOOL::m_selectionAnchor` is only set by the tool's start), so the engine follows KiCad: after Apply, a new Shift+P asks anew. Picks keep the card open.
+- positionRelative `prompt.pick`: `item` runs `OnSelectItemClick`, `point` `OnSelectPointClick` (the dialog hides; the result returns through `UpdatePickedItem`/`UpdatePickedPoint`, whose `Show( true )` sends `onUpdate`).
+- positionRelative cancel: the dialog hidden (kept, as KiCad keeps it).
+
+**Files (kicad `seat/run15-e2`, commit e7872748):** `pcbnew/dialogs/dialog_create_array.h` and `.cpp`, `pcbnew/dialogs/dialog_position_relative.h` and `.cpp`. Everything under `#ifdef __EMSCRIPTEN__`. **Header change reach:** `dialog_create_array.h` is included by `dialog_create_array.cpp` and `pcbnew/tools/array_tool.cpp`; `dialog_position_relative.h` by `dialog_position_relative.cpp` and `pcbnew/tools/position_relative_tool.cpp` (and `qa/qa_utils/mocks.cpp`, not in the wasm build). Four TUs.
+
+**Probes (canvas-kinds fixture, Board, Edit mode, a `window.kicadHostPrompt` listener that records and returns true):**
+1. Select R1, Ctrl+T: one `onAsk` ask `array`, modal false, the record above, no KiCad window. `kicadPromptAnswer(token, {"shape":"grid","grid":{"nx":3,"ny":2,"dx":2.54,"dy":2.54},"uniqueReferences":true,"arrangeSelection":false})` answers `{"accepted":true}`; six items (R1 and five copies with new references); undo depth +1; one Undo removes them. Wrong if: the dialog shows, the answer is stale, or two undo steps.
+2. Again, `shape` circular: `kicadPromptPick(token, "point")` returns 0, a click on U1 pad 1, `onUpdate` with `circular.centreX/centreY` at that point; answer `{"shape":"circular","circular":{"count":6,"angle":60}}`: a ring of six.
+3. Refusal: `{"grid":{"nx":"3"}}` answers `{"accepted":false,"field":"grid","message":""}` and the prompt stays (a later good answer is accepted); `{"foo":1}` gives `field` `foo`; `{"shape":"grid","grid":{"nx":0}}` reaches KiCad (refused or accepted by KiCad's own rules, never a crash).
+4. Cancel: `kicadPromptCancel(token)` 0; nothing made; the next Ctrl+T asks again.
+5. Select R1, Shift+P: ask `positionRelative`; `kicadPromptPick(token, "item")`, click U1: `onUpdate` with anchor kind `item` at U1's position and KiCad's label; answer `{"x":5,"y":0}`: R1 sits 5 mm right of U1, one undo step "Position Relative"; the prompt has ended (`kicadPromptAnswer` on the same token answers `{"stale":true}`).
+6. Footprint editor frame: Ctrl+T on a pad: the record's `padNumbering` true.
+7. No listener: KiCad's own dialogs show as before (both).
+
+**Syntax check** (`--kicad /home/matthew/cc-engine-wt/e2/kicad pcbnew --kicad-file pcbnew/dialogs/dialog_create_array.cpp --kicad-file pcbnew/tools/array_tool.cpp --kicad-file pcbnew/dialogs/dialog_position_relative.cpp --kicad-file pcbnew/tools/position_relative_tool.cpp`):
+
+```
+PASS pcbnew         pcbnew_embind.cpp subdir=pcbnew -DKICAD_MERGED_EMBIND (41103 ms)
+PASS kicad pcbnew/dialogs/dialog_create_array.cpp (44573 ms)
+PASS kicad pcbnew/tools/array_tool.cpp (9340 ms)
+PASS kicad pcbnew/dialogs/dialog_position_relative.cpp (8181 ms)
+PASS kicad pcbnew/tools/position_relative_tool.cpp (9619 ms)
+syntax-check: 0 failed
+```
