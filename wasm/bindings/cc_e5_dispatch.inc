@@ -13,8 +13,21 @@
 
 namespace cc_e5
 {
+// The halves, defined in this lane's board face (cc_e5_pcb.inc) and footprint editor face
+// (cc_e5_fpedit.inc): external linkage, merged image only.
+std::string footprintConvertPcb( std::string aArgsJson );
+
+/** kicadFootprintConvert (fp-e7): the footprint editor's half first, then the board's. */
+std::string footprintConvert( std::string aArgsJson )
+{
+    if( pcbEditorActive() )
+        return footprintConvertPcb( aArgsJson );
+
+    return "";
+}
 } // namespace cc_e5
 
 EMSCRIPTEN_BINDINGS( cc_e5_dispatch )
 {
+    function( "kicadFootprintConvert", &cc_e5::footprintConvert );
 }
