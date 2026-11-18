@@ -2,6 +2,10 @@
  * Embind bindings for KiCad WASM
  * Exposes core PCBnew objects to JavaScript
  *
+ * Modified by Circuit Center Inc on 2026-11-18: engine run 15's seams, cc_fp_items.h (the
+ * footprint item kinds, declarations) and one include per author lane's board face
+ * (cc_eN_pcb.inc) after cc_rules_pcb.inc, each with its own namespace and bindings block.
+ *
  * This provides a foundation for future Pyodide integration.
  *
  * Note: GetBoard() is not available when KICAD_SCRIPTING=OFF.
@@ -106,6 +110,7 @@
 #include "pcbjam_theme.h"
 #include "pcbjam_libs_reload.h"
 #include "cc_output_common.h"
+#include "cc_fp_items.h"
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
@@ -6757,6 +6762,22 @@ std::string pcbResolveRules( std::string aArgsJson )
 // eleven global board edits, Change and Update Footprints, the settings sections), in their
 // own file.
 #include "cc_rules_pcb.inc"
+
+// Circuit Center (engine run 15): each author lane's board face, in its own file, namespace
+// (cc_eN) and bindings block (EMSCRIPTEN_BINDINGS( cc_eN_pcb )), outside any
+// KICAD_MERGED_EMBIND guard. Placed once by the seams commit; no lane edits these lines.
+#include "cc_e1_pcb.inc"
+#include "cc_e2_pcb.inc"
+#include "cc_e3_pcb.inc"
+#include "cc_e5_pcb.inc"
+#include "cc_e6_pcb.inc"
+#include "cc_e7_pcb.inc"
+#include "cc_e8_pcb.inc"
+#include "cc_e9_pcb.inc"
+#include "cc_e10_pcb.inc"
+#include "cc_e11_pcb.inc"
+#include "cc_e12_pcb.inc"
+#include "cc_e13_pcb.inc"
 
 EMSCRIPTEN_BINDINGS(pcbnew) {
     // Register vector types for iteration

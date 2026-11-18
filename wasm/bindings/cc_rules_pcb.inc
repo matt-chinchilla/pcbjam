@@ -13,6 +13,12 @@
 // cleanup dialogs, GLOBAL_EDIT_TOOL::SwapLayers, BOARD_EDITOR_CONTROL::RepairBoard), carried
 // here as free functions over our closed arguments, each preview reading only and each apply
 // ONE BOARD_COMMIT. No KiCad dialog, message box or progress window on any road.
+//
+// Modified by Circuit Center Inc on 2026-11-18: engine run 15's section registry (R7). A
+// settings section an author adds is registered from that author's own inc
+// (ccRegisterPcbSection), consulted after the built-in sections by the get, the set (before
+// Board Setup's OK steps, ccPcbSettingsChanged) and the list (ccPcbSections,
+// pcbSettingsSections for the export kicadSettingsSections).
 
 #include <board_stackup_manager/board_stackup.h>
 #include <cleanup_item.h>
@@ -32,6 +38,9 @@
 #include <tracks_cleaner.h>
 #include <font/font.h>
 #include <wx/tokenzr.h>
+
+#include <cctype>
+#include <functional>
 
 namespace
 {
@@ -2588,6 +2597,95 @@ json ccPcbPageJson( PCB_EDIT_FRAME* aFrame )
     return out;
 }
 
+// ───────────────── the section registry (engine run 15, R7) ─────────────────
+//
+// A section an author adds lives in that author's own inc (cc_eN_pcb.inc) and registers there
+// with a static registrar in its own namespace, never by editing the built-in list or the
+// set's chain:
+//
+//   namespace cc_e12
+//   {
+//   const bool kOrigins = ccRegisterPcbSection( { "origins", "pcb", &originsGet, &originsSet } );
+//   }
+//
+// The registry is consulted AFTER the built-in sections: a built-in name, a name registered
+// before, an empty get or set, a frame other than "pcb" or a name that is not
+// [A-Za-z][A-Za-z0-9]* of at most 64 characters is refused (false, one line on stderr).
+
+struct CC_PCB_SECTION
+{
+    std::string name;    // the wire name, as the page's cap settings:<name> spells it
+    std::string frame;   // "pcb": the board editor, the only frame this registry serves
+
+    // The read: an object, or null when the frame cannot answer (the export then answers "").
+    std::function<json( PCB_EDIT_FRAME* aFrame )> get;
+
+    // The set, on the apply coroutine: true when the value is taken (with aDryRun: would be,
+    // changing nothing). A refusal may name itself in aError and aMessage (left empty, a false
+    // answers bad_args). aRecord takes keys the record carries beside "value" (errors,
+    // wouldRemove, ...). No undo step and no save (KiCad's rule for settings).
+    std::function<bool( PCB_EDIT_FRAME* aFrame, const json& aValue, bool aDryRun,
+                        std::string& aError, std::string& aMessage, json& aRecord )>
+            set;
+
+    // true: a taken set (not a dry run) is followed by Board Setup's OK steps
+    // (ccPcbSettingsChanged, the tool reset among them). false only for a section that holds
+    // no board state (an editor preference), so the board is not marked modified.
+    bool setupOk = true;
+};
+
+/** Run 14's sections, answered by the chains of ccPcbSettingsGet and ccRunPcbSettingsSet. */
+const std::set<std::string>& ccPcbBuiltinSections()
+{
+    static const std::set<std::string> sections = { "netClasses",  "textVariables", "variants",
+                                                    "page",        "layers",        "stackup",
+                                                    "finish",      "textDefaults",  "constraints",
+                                                    "predefinedSizes", "teardrops", "checkSeverities",
+                                                    "customRules" };
+    return sections;
+}
+
+std::vector<CC_PCB_SECTION>& ccPcbSectionRegistry()
+{
+    static std::vector<CC_PCB_SECTION> registry;
+    return registry;
+}
+
+bool ccSectionNameOk( const std::string& aName )
+{
+    if( aName.empty() || aName.size() > 64 || !std::isalpha( (unsigned char) aName[0] ) )
+        return false;
+
+    return std::all_of( aName.begin(), aName.end(),
+                        []( char c ) { return std::isalnum( (unsigned char) c ) != 0; } );
+}
+
+const CC_PCB_SECTION* ccPcbRegisteredSection( const std::string& aName )
+{
+    for( const CC_PCB_SECTION& section : ccPcbSectionRegistry() )
+    {
+        if( section.name == aName )
+            return &section;
+    }
+
+    return nullptr;
+}
+
+bool ccRegisterPcbSection( CC_PCB_SECTION aSection )
+{
+    if( !ccSectionNameOk( aSection.name ) || aSection.frame != "pcb" || !aSection.get
+            || !aSection.set || ccPcbBuiltinSections().count( aSection.name )
+            || ccPcbRegisteredSection( aSection.name ) )
+    {
+        std::fprintf( stderr, "settings section %s refused by the board registry\n",
+                      aSection.name.c_str() );
+        return false;
+    }
+
+    ccPcbSectionRegistry().push_back( std::move( aSection ) );
+    return true;
+}
+
 json ccPcbSettingsGet( PCB_EDIT_FRAME* aFrame, const std::string& aSection )
 {
     BOARD*                 board = aFrame->GetBoard();
@@ -2727,6 +2825,9 @@ json ccPcbSettingsGet( PCB_EDIT_FRAME* aFrame, const std::string& aSection )
         out["text"] = text;
         return out;
     }
+
+    if( const CC_PCB_SECTION* registered = ccPcbRegisteredSection( aSection ) )
+        return registered->get( aFrame );
 
     return json();
 }
@@ -2873,13 +2974,14 @@ int ccItemsOnLayers( BOARD* aBoard, const LSEQ& aLayers )
     return count;
 }
 
-const std::set<std::string>& ccPcbSections()
+/** Every section the board frame takes: run 14's built-ins and every registered one. */
+std::set<std::string> ccPcbSections()
 {
-    static const std::set<std::string> sections = { "netClasses",  "textVariables", "variants",
-                                                    "page",        "layers",        "stackup",
-                                                    "finish",      "textDefaults",  "constraints",
-                                                    "predefinedSizes", "teardrops", "checkSeverities",
-                                                    "customRules" };
+    std::set<std::string> sections = ccPcbBuiltinSections();
+
+    for( const CC_PCB_SECTION& section : ccPcbSectionRegistry() )
+        sections.insert( section.name );
+
     return sections;
 }
 
@@ -2898,6 +3000,7 @@ void ccRunPcbSettingsSet( const CC_PCB_SETTINGS_ARGS& a )
     json               errors = json::array();
     json               value;
     std::optional<int> wouldRemove;
+    json               extra = json::object();   // a registered section's own record keys
 
     ccEnsureDir( a.dir );
 
@@ -3422,6 +3525,15 @@ void ccRunPcbSettingsSet( const CC_PCB_SETTINGS_ARGS& a )
                     }
                 }
             }
+            else if( const CC_PCB_SECTION* registered = ccPcbRegisteredSection( a.section ) )
+            {
+                // Engine run 15 (R7): a registered section, after every built-in one, before
+                // Board Setup's OK steps.
+                ok = registered->set( fr, a.value, a.dryRun, error, message, extra );
+
+                if( ok && !a.dryRun && registered->setupOk )
+                    ccPcbSettingsChanged( fr );
+            }
             else
             {
                 ok = false;
@@ -3455,6 +3567,12 @@ void ccRunPcbSettingsSet( const CC_PCB_SETTINGS_ARGS& a )
 
     if( wouldRemove )
         record["wouldRemove"] = *wouldRemove;
+
+    for( auto it = extra.begin(); it != extra.end(); ++it )
+    {
+        if( !record.contains( it.key() ) )
+            record[it.key()] = it.value();
+    }
 
     ccWriteJson( a.dir, "settings.json", record );
 
@@ -3713,6 +3831,20 @@ bool pcbFootprintsExchange( std::string aArgsJson )
     catch( ... )
     {
         return false;
+    }
+}
+
+// kicadSettingsSections' board half (engine run 15, R7): every section the board frame takes,
+// run 14's built-ins and every registered one, as a sorted JSON array of names.
+std::string pcbSettingsSections()
+{
+    try
+    {
+        return json( ccPcbSections() ).dump();
+    }
+    catch( ... )
+    {
+        return "[]";
     }
 }
 

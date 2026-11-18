@@ -27,6 +27,12 @@
 # upstream target and source subdir are both pcb_calculator (the OUTPUT_NAME
 # property in pcb_calculator/CMakeLists.txt emits calculator.{js,wasm}).
 # pl_editor is the standard case but its source subdir is pagelayout_editor.
+#
+# Modified by Circuit Center Inc on 2026-11-18: engine run 15's seams. The merged image
+# (kicad_editor) compiles and links two more embind TUs, fpedit_embind.cpp (include subdir
+# pcbnew) and dsedit_embind.cpp (include subdir pagelayout_editor), and compile_embind_tu adds
+# the include subdir's dialogs and tools folders at the END of its list (an include that
+# resolved before resolves the same way). The Pyodide comment of step 7.1 is reworded.
 
 set -e
 
@@ -397,9 +403,11 @@ log_info "KiCad WASM support verified"
 # definitions and shared-name registrations) plus the dispatcher TU that registers
 # the shared JS names once — see wasm/bindings/kicad_editor_embind.cpp.
 # The Symbol Editor's exports (symedit_embind.cpp, engine run 14) are their own TU beside
-# eeschema's, linked wherever eeschema's bindings are.
+# eeschema's, linked wherever eeschema's bindings are. The footprint editor's
+# (fpedit_embind.cpp) and the drawing sheet editor's (dsedit_embind.cpp), engine run 15, are
+# their own TUs too, linked into the merged image only.
 if [ "${APP_NAME}" = "kicad_editor" ]; then
-    EMBIND_OBJ="${STUBS_BUILD}/pcbnew_embind.o ${STUBS_BUILD}/eeschema_embind.o ${STUBS_BUILD}/symedit_embind.o ${STUBS_BUILD}/kicad_editor_embind.o"
+    EMBIND_OBJ="${STUBS_BUILD}/pcbnew_embind.o ${STUBS_BUILD}/eeschema_embind.o ${STUBS_BUILD}/symedit_embind.o ${STUBS_BUILD}/fpedit_embind.o ${STUBS_BUILD}/dsedit_embind.o ${STUBS_BUILD}/kicad_editor_embind.o"
 elif [ "${EMBIND_APP}" = "eeschema" ]; then
     EMBIND_OBJ="${STUBS_BUILD}/eeschema_embind.o ${STUBS_BUILD}/symedit_embind.o"
 else
@@ -595,7 +603,7 @@ emcmake cmake "${KICAD_DIR}" \
     -DHAVE_STRNCASECMP=1
 
 # Step 7.1: Compile Embind bindings (after CMake so config.h exists)
-# Exposes KiCad objects to JavaScript for future Pyodide integration.
+# Exposes KiCad objects to JavaScript: the exports the island's editor bridge calls.
 # When no app-specific source exists, build an empty object so the linker line
 # referencing ${APP_NAME}_embind.o doesn't break.
 
@@ -628,6 +636,9 @@ compile_embind_tu() {
     # libcontext.h lives one level deeper; tool/coroutine.h does #include <libcontext.h>
     _includes+=" -I${KICAD_DIR}/thirdparty/libcontext"
     _includes+=" -I${SYSROOT}/include"
+    # The app's dialogs and tools folders (engine run 15: the drawing sheet editor's frame and
+    # the host asks reach into them). Last, so an include that resolved before still does.
+    _includes+=" -I${KICAD_DIR}/${_subdir}/dialogs -I${KICAD_DIR}/${_subdir}/tools"
 
     # KiCad requires C++20 for concepts
     em++ -std=c++20 -c ${EXTRA_FLAGS} ${KICAD_TU_ABI_FLAGS} ${WX_CXXFLAGS} ${_defines} ${_includes} "${_src}" -o "${_obj}"
@@ -648,6 +659,11 @@ if [ "${APP_NAME}" = "kicad_editor" ]; then
                       "${STUBS_BUILD}/eeschema_embind.o" eeschema "-DKICAD_MERGED_EMBIND"
     compile_embind_tu "${PROJECT_ROOT}/wasm/bindings/symedit_embind.cpp" \
                       "${STUBS_BUILD}/symedit_embind.o" eeschema
+    # Engine run 15: the footprint editor's and the drawing sheet editor's own TUs.
+    compile_embind_tu "${PROJECT_ROOT}/wasm/bindings/fpedit_embind.cpp" \
+                      "${STUBS_BUILD}/fpedit_embind.o" pcbnew
+    compile_embind_tu "${PROJECT_ROOT}/wasm/bindings/dsedit_embind.cpp" \
+                      "${STUBS_BUILD}/dsedit_embind.o" pagelayout_editor
     compile_embind_tu "${PROJECT_ROOT}/wasm/bindings/kicad_editor_embind.cpp" \
                       "${STUBS_BUILD}/kicad_editor_embind.o" common
 elif [ -f "${EMBIND_SRC}" ]; then

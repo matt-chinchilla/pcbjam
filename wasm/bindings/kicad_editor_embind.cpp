@@ -19,6 +19,11 @@
  *
  * Deliberately header-light: no pcbnew/eeschema headers (avoids mixing both include
  * roots in one TU); only the generic KIWAY_PLAYER surface + the extern declarations.
+ *
+ * Modified by Circuit Center Inc on 2026-11-18: engine run 15's seams, the export
+ * kicadSettingsSections (the settings sections of both faces, from the section registries of
+ * cc_rules_pcb.inc and cc_rules_sch.inc) and one include per author lane's dispatcher face
+ * (cc_eN_dispatch.inc) before the kicad_editor bindings block.
  */
 
 #ifdef __EMSCRIPTEN__
@@ -65,6 +70,9 @@ std::string pcbSettingsGet( std::string aSection );
 bool        pcbSettingsSet( std::string aArgsJson );
 std::string schSettingsGet( std::string aSection );
 bool        schSettingsSet( std::string aArgsJson );
+// The section lists (engine run 15, R7): sorted JSON arrays of names.
+std::string pcbSettingsSections();
+std::string schSettingsSections();
 void        pcbCollabApply( std::string aJson );
 void        pcbCollabApplyItems( std::string aJson );
 std::string pcbPlaceImportedItem( std::string aSexpr );
@@ -910,6 +918,27 @@ static bool kicadCollabBusyProbe()
     return pcbjam_collab::applyBusy() || !pcbjam_collab::applyQueue().empty();
 }
 
+// kicadSettingsSections (engine run 15, R7; cap settings:<section> per name): the settings
+// sections this engine takes, by face, whichever frame is live: {"board": [names],
+// "schematic": [names]}, each sorted, run 14's built-ins and every section an author lane
+// registers from its own inc. A read, synchronous.
+static std::string settingsSections()
+{
+    return std::string( "{\"board\":" ) + pcbSettingsSections() + ",\"schematic\":"
+           + schSettingsSections() + "}";
+}
+
+// Circuit Center (engine run 15): each author lane's dispatcher face, in its own file,
+// namespace (cc_eN) and bindings block (EMSCRIPTEN_BINDINGS( cc_eN_dispatch )). Placed once
+// by the seams commit; no lane edits these lines.
+#include "cc_e1_dispatch.inc"
+#include "cc_e3_dispatch.inc"
+#include "cc_e5_dispatch.inc"
+#include "cc_e6_dispatch.inc"
+#include "cc_e7_dispatch.inc"
+#include "cc_e10_dispatch.inc"
+#include "cc_e12_dispatch.inc"
+
 EMSCRIPTEN_BINDINGS(kicad_editor) {
     // Apply-queue idle probe (drift-trio finding #10b): a scratch save taken
     // while a collab apply is in flight (queued, or suspended mid-commit)
@@ -1005,6 +1034,8 @@ EMSCRIPTEN_BINDINGS(kicad_editor) {
     // Settings sections of the live editor (engine run 14, island cc23).
     function("kicadSettingsGet", &settingsGet);
     function("kicadSettingsSet", &settingsSet);
+    // The settings sections of both faces (engine run 15, R7).
+    function("kicadSettingsSections", &settingsSections);
 }
 
 #endif // __EMSCRIPTEN__

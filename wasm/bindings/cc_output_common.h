@@ -19,6 +19,13 @@
  * include roots differ: this header reaches only common headers (common/jobs, reporter,
  * nlohmann, wx). Everything is inline in namespace cc_output, so the three translation
  * units share one definition.
+ *
+ * Modified by Circuit Center Inc on 2026-11-18: engine run 15's seams. The 3D export's fixes
+ * and the render job's are calls (ccFixPcbExport3d in cc_output_3d.h, ccFixPcbRender and
+ * ccPcbRenderListed in cc_output_render.h, both included at the end of this file); pcb_render
+ * is a board job, left out of kicadOutputJobs while ccPcbRenderListed() is false; the embed run
+ * folder rule (/tmp/cc-embed/<n>) shared by the footprint editor's embed and the board's
+ * model embed.
  */
 
 #pragma once
@@ -130,6 +137,19 @@ inline const std::string& OutputRoot()
     return root;
 }
 
+/** Where every embed run writes (engine run 15: kicadFpEditEmbed, kicadBoardEmbedModels): /tmp/cc-embed/<n>. */
+inline const std::string& EmbedRoot()
+{
+    static const std::string root = "/tmp/cc-embed/";
+    return root;
+}
+
+/** An embed run folder: the run folder rule under EmbedRoot(). */
+inline bool IsEmbedRunDir( const std::string& aDir )
+{
+    return IsRunDir( aDir, EmbedRoot() );
+}
+
 /** The record name every output run writes last. */
 inline const std::string& RecordName()
 {
@@ -146,7 +166,7 @@ inline const std::vector<std::string>& BoardJobs()
         "pcb_export_gerbers", "pcb_export_drill", "pcb_export_pos", "pcb_export_ipc2581",
         "pcb_export_odb", "pcb_export_ipcd356", "pcb_export_pdf", "pcb_export_svg",
         "pcb_export_dxf", "pcb_export_ps", "pcb_export_gencad", "pcb_export_stats",
-        "pcb_export_3d",
+        "pcb_export_3d", "pcb_render",
         "cc_footprint_report", "cc_idf", "cc_specctra_dsn", "cc_hyperlynx",
         "cc_footprint_associations", "cc_footprints"
     };
@@ -303,6 +323,12 @@ struct MERGE_RESULT
     std::string              refusal;    // not empty: the run makes nothing, code -1, this line
 };
 
+// Engine run 15: the per job fixes of the 3D export and the render job (their bodies in
+// cc_output_3d.h and cc_output_render.h, included at the end of this file).
+inline void ccFixPcbExport3d( json& aMerged, const json& aDefaults, MERGE_RESULT& aOut );
+inline void ccFixPcbRender( json& aMerged, const json& aDefaults, MERGE_RESULT& aOut );
+inline bool ccPcbRenderListed();
+
 /**
  * KiCad's own job settings onto aJob (a fresh instance), as KiCad's jobset runner would read
  * them, then the fixes the engine makes whatever was sent:
@@ -400,18 +426,11 @@ inline bool MergeSettings( JOB& aJob, const std::string& aName, const json& aSen
     // CC_OUTPUT_FIXES: the per job fixes (the outputs spec, section 4's Fixed column and 6.2).
     if( aName == "pcb_export_3d" )
     {
-        auto format = merged.find( "format" );
-
-        if( format == merged.end() || !format->is_string()
-                || format->get<std::string>() != "vrml" )
-        {
-            aOut.refusal = "Only VRML is made here.";
-        }
-
-        force( "overwrite", true );
-        force( "vrml_model_dir", "" );
-        force( "vrml_relative_paths", false );
-        force( "subst_models", false );
+        ccFixPcbExport3d( merged, defaults, aOut );
+    }
+    else if( aName == "pcb_render" )
+    {
+        ccFixPcbRender( merged, defaults, aOut );
     }
     else if( aName == "pcb_export_odb" )
     {
@@ -509,6 +528,9 @@ inline json JobsWithDefaults()
 
                     for( const std::string& name : aJobs )
                     {
+                        if( name == "pcb_render" && !ccPcbRenderListed() )
+                            continue;
+
                         if( IsOurs( name ) )
                         {
                             jobs[name] = OursDefaults( name );
@@ -546,5 +568,8 @@ inline json JobsWithDefaults()
 }
 
 } // namespace cc_output
+
+#include "cc_output_3d.h"
+#include "cc_output_render.h"
 
 #endif // __EMSCRIPTEN__

@@ -16,6 +16,9 @@
 // Modified by Chirichella Inc. on 2026-11-16: kicadSymbolsGet, kicadSymbolsSet,
 // kicadSymbolsExchange, kicadSchEdit and the schematic half of kicadSettingsGet and
 // kicadSettingsSet (engine run 14, cc_rules_sch.inc).
+// Modified by Circuit Center Inc on 2026-11-18: engine run 15's seams, one include per author
+// lane's schematic face (cc_eN_sch.inc) after cc_rules_sch.inc, each with its own namespace
+// and bindings block.
 
 #ifdef __EMSCRIPTEN__
 #include <emscripten.h>
@@ -6558,6 +6561,19 @@ static bool kicadSimOpOnSheet( std::string aArgsJson )
 // Circuit Center (engine run 14): properties, numbering and rules (the fields table, the
 // symbol exchange, the global text edit and the settings sections), in their own file.
 #include "cc_rules_sch.inc"
+
+// Circuit Center (engine run 15): each author lane's schematic face, in its own file,
+// namespace (cc_eN) and bindings block (EMSCRIPTEN_BINDINGS( cc_eN_sch )), outside any
+// KICAD_MERGED_EMBIND guard. Placed once by the seams commit; no lane edits these lines.
+#include "cc_e1_sch.inc"
+#include "cc_e5_sch.inc"
+#include "cc_e6_sch.inc"
+#include "cc_e7_sch.inc"
+#include "cc_e8_sch.inc"
+#include "cc_e9_sch.inc"
+#include "cc_e10_sch.inc"
+#include "cc_e12_sch.inc"
+#include "cc_e13_sch.inc"
 
 #ifdef KICAD_MERGED_EMBIND
 // Circuit Center (engine run 12): the eeschema half of the board engine's schematic

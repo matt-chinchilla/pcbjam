@@ -15,6 +15,12 @@
 // <dir>/.cc-<name>.json LAST, dir under /tmp/cc-<name>/; every READ is synchronous and
 // answers JSON or "". One commit and one undo step per apply; a preview pushes nothing; a
 // settings set pushes no undo step (KiCad's own rule). No KiCad dialog on any road.
+//
+// Modified by Circuit Center Inc on 2026-11-18: engine run 15's section registry (R7), the
+// board registry's twin. A settings section an author adds is registered from that author's own
+// inc (ccRegisterSchSection), consulted after the built-in sections by the get, the set
+// (before Schematic Setup's OK steps, ccSchSettingsChanged) and the list (ccSchSections,
+// schSettingsSections for the export kicadSettingsSections).
 
 #include <bus_alias.h>
 #include <font/font.h>
@@ -32,6 +38,9 @@
 #include <page_info.h>
 #include <settings/nested_settings.h>
 #include <settings/json_settings_internals.h>
+
+#include <cctype>
+#include <functional>
 
 namespace
 {
@@ -2103,6 +2112,96 @@ json ccSchVariantsJson( SCH_EDIT_FRAME* aFrame )
     return out;
 }
 
+// ───────────────── the section registry (engine run 15, R7) ─────────────────
+//
+// The board registry's twin (cc_rules_pcb.inc): a section an author adds registers from that
+// author's own inc (cc_eN_sch.inc) with a static registrar in its own namespace:
+//
+//   namespace cc_e12
+//   {
+//   const bool kSchEditing = ccRegisterSchSection( { "schEditing", "sch", &schEditingGet,
+//                                                    &schEditingSet, false } );
+//   }
+//
+// Consulted AFTER the built-in sections: a built-in name, a name registered before, an empty
+// get or set, a frame other than "sch" or a name that is not [A-Za-z][A-Za-z0-9]* of at most
+// 64 characters is refused (false, one line on stderr).
+
+struct CC_SCH_SECTION
+{
+    std::string name;    // the wire name, as the page's cap settings:<name> spells it
+    std::string frame;   // "sch": the schematic editor, the only frame this registry serves
+
+    // The read: an object, or null when the frame cannot answer (the export then answers "").
+    std::function<json( SCH_EDIT_FRAME* aFrame )> get;
+
+    // The set, on the apply coroutine: true when the value is taken (with aDryRun: would be,
+    // changing nothing). A refusal may name itself in aError and aMessage (left empty, a false
+    // answers bad_args). aRecord takes keys the record carries beside "value". No undo step
+    // and no save (KiCad's rule for settings).
+    std::function<bool( SCH_EDIT_FRAME* aFrame, const json& aValue, bool aDryRun,
+                        std::string& aError, std::string& aMessage, json& aRecord )>
+            set;
+
+    // true: a taken set (not a dry run) is followed by Schematic Setup's OK steps
+    // (ccSchSettingsChanged). false only for a section that holds no schematic state (an
+    // editor preference), so the schematic is not marked modified.
+    bool setupOk = true;
+
+    // With setupOk: the connectivity is rebuilt too (a net class change).
+    bool reconnect = false;
+};
+
+/** Run 14's sections, answered by the chains of ccSchSettingsGet and ccRunSchSettingsSet. */
+const std::set<std::string>& ccSchBuiltinSections()
+{
+    static const std::set<std::string> sections = { "netClasses",    "textVariables", "variants",
+                                                    "page",          "schFormatting", "fieldTemplates",
+                                                    "busAliases",    "ercSeverities", "pinMap" };
+    return sections;
+}
+
+std::vector<CC_SCH_SECTION>& ccSchSectionRegistry()
+{
+    static std::vector<CC_SCH_SECTION> registry;
+    return registry;
+}
+
+bool ccSectionNameOk( const std::string& aName )
+{
+    if( aName.empty() || aName.size() > 64 || !std::isalpha( (unsigned char) aName[0] ) )
+        return false;
+
+    return std::all_of( aName.begin(), aName.end(),
+                        []( char c ) { return std::isalnum( (unsigned char) c ) != 0; } );
+}
+
+const CC_SCH_SECTION* ccSchRegisteredSection( const std::string& aName )
+{
+    for( const CC_SCH_SECTION& section : ccSchSectionRegistry() )
+    {
+        if( section.name == aName )
+            return &section;
+    }
+
+    return nullptr;
+}
+
+bool ccRegisterSchSection( CC_SCH_SECTION aSection )
+{
+    if( !ccSectionNameOk( aSection.name ) || aSection.frame != "sch" || !aSection.get
+            || !aSection.set || ccSchBuiltinSections().count( aSection.name )
+            || ccSchRegisteredSection( aSection.name ) )
+    {
+        std::fprintf( stderr, "settings section %s refused by the schematic registry\n",
+                      aSection.name.c_str() );
+        return false;
+    }
+
+    ccSchSectionRegistry().push_back( std::move( aSection ) );
+    return true;
+}
+
 json ccSchSettingsGet( SCH_EDIT_FRAME* aFrame, const std::string& aSection )
 {
     SCHEMATIC& sch = aFrame->Schematic();
@@ -2174,6 +2273,9 @@ json ccSchSettingsGet( SCH_EDIT_FRAME* aFrame, const std::string& aSection )
         out["pageNumbers"] = std::move( numbers );
         return out;
     }
+
+    if( const CC_SCH_SECTION* registered = ccSchRegisteredSection( aSection ) )
+        return registered->get( aFrame );
 
     return json();
 }
@@ -2344,11 +2446,14 @@ struct CC_SETTINGS_ARGS
     bool        dryRun = false;
 };
 
-const std::set<std::string>& ccSchSections()
+/** Every section the schematic frame takes: run 14's built-ins and every registered one. */
+std::set<std::string> ccSchSections()
 {
-    static const std::set<std::string> sections = { "netClasses",    "textVariables", "variants",
-                                                    "page",          "schFormatting", "fieldTemplates",
-                                                    "busAliases",    "ercSeverities", "pinMap" };
+    std::set<std::string> sections = ccSchBuiltinSections();
+
+    for( const CC_SCH_SECTION& section : ccSchSectionRegistry() )
+        sections.insert( section.name );
+
     return sections;
 }
 
@@ -2359,6 +2464,7 @@ void ccRunSchSettingsSet( const CC_SETTINGS_ARGS& aArgs )
     std::string message;
     json        errors = json::array();
     json        value;
+    json        extra = json::object();   // a registered section's own record keys
 
     ensureRunDir( aArgs.dir );
 
@@ -2547,12 +2653,21 @@ void ccRunSchSettingsSet( const CC_SETTINGS_ARGS& aArgs )
                     fr->HardRedraw();
                 }
             }
+            else if( const CC_SCH_SECTION* registered = ccSchRegisteredSection( aArgs.section ) )
+            {
+                // Engine run 15 (R7): a registered section, after every built-in one, before
+                // Schematic Setup's OK steps.
+                ok = registered->set( fr, aArgs.value, aArgs.dryRun, error, message, extra );
+
+                if( ok && !aArgs.dryRun && registered->setupOk )
+                    ccSchSettingsChanged( fr, registered->reconnect );
+            }
             else
             {
                 ok = false;
             }
 
-            if( !ok )
+            if( !ok && error.empty() )
             {
                 error = "bad_args";
                 message = "the section did not take this value";
@@ -2577,6 +2692,12 @@ void ccRunSchSettingsSet( const CC_SETTINGS_ARGS& aArgs )
 
     if( !errors.empty() )
         record["errors"] = errors;
+
+    for( auto it = extra.begin(); it != extra.end(); ++it )
+    {
+        if( !record.contains( it.key() ) )
+            record[it.key()] = it.value();
+    }
 
     writeRunDone( aArgs.dir, "settings.json", record );
 
@@ -2996,6 +3117,20 @@ static bool kicadSchEdit( std::string aArgsJson )
     catch( ... )
     {
         return false;
+    }
+}
+
+// kicadSettingsSections' schematic half (engine run 15, R7): every section the schematic
+// frame takes, run 14's built-ins and every registered one, as a sorted JSON array of names.
+std::string schSettingsSections()
+{
+    try
+    {
+        return json( ccSchSections() ).dump();
+    }
+    catch( ... )
+    {
+        return "[]";
     }
 }
 
