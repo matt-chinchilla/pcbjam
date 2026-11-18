@@ -160,3 +160,43 @@ No export (e1's prompt exports answer). Nothing in `cc_e2_pcb.inc`.
 4. occ_service links with `kicadAutoplaceQuiet` registered.
 
 **Syntax check:** the run pasted under m6-e1 (`PASS pcbnew`, `PASS occ`, `PASS kicad pcbnew/autorouter/autoplace_tool.cpp`, `syntax-check: 0 failed`).
+
+## m3-e2: a new zone's settings ask the host (copper, non copper, rule area)
+
+No export. Merged image only (`#ifdef KICAD_MERGED_EMBIND` in `cc_e2_pcb.inc`: the nonCopper and ruleArea records go through `cc_fp_items.h`, which is merged only, and the hook variable lives in a pcbnew dialog file; occ_service registers nothing for this unit and its zone editors show KiCad's dialogs as before).
+
+**The hook (reported to E0, a shape call):** the ask must use records written in the board face (wave 1's `ccItemSheet`, `ccReadItemSet`, `ccApplyItemSet` in `pcbnew_embind.cpp`, and M4's zone kind through the item kinds table), which no KiCad file can reach. With no KiCad header in this lane for a setter (e7's `cc_host_design_block.h` pattern), the hook is a function pointer DEFINED in `pcbnew/dialogs/dialog_copper_zones.cpp` (`int ( *g_ccZoneSettingsHost )( const char* aKind, PCB_BASE_FRAME* aFrame, ZONE_SETTINGS* aSettings ) = nullptr;`, under `__EMSCRIPTEN__`) and declared `extern`, with the same line, in `dialog_non_copper_zones_properties.cpp`, `dialog_rule_area_properties.cpp` and `cc_e2_pcb.inc`; the inc sets it by a static initializer (`cc_e2::pcb::kZoneSettingsHost`). Null (nothing linked that sets it): KiCad's dialogs as before. If E0 prefers a header, the four declarations become one `include` of it; the behavior is unchanged.
+
+**Host ask** `window.kicadHostPrompt.onAsk({token, ask: "zoneSettings", modal: true, record: { kind, sheet }})` from `cc_e2::pcb::zoneSettingsAsk`, called first in:
+- `InvokeCopperZonesEditor` (`dialog_copper_zones.cpp`) only when `aZone` is null (a new zone): `kind` `copper`, board editor frame only (`ccApplyItemSet` is the board editor's; in the footprint editor KiCad's dialog shows). `sheet` is wave 1's zone sheet (`ccItemSheet`: `kind` `zone`, `locked`, `name`, `net`, `layers`, `priority`, `clearance`, `minWidth`, `padConnection`, `thermalGap`, `spokeWidth`, `netChoices`) with `uuid` `""`.
+- `InvokeNonCopperZonesEditor` (`dialog_non_copper_zones_properties.cpp`): `kind` `nonCopper`; `InvokeRuleAreaEditor` (`dialog_rule_area_properties.cpp`): `kind` `ruleArea`. `sheet` is `cc_fpitems::ccFpItemJson( zone, (0,0), boardFrame true )`, the zone kind's record (FP 7.2 plus M4's non copper keys), `uuid` `""`. While no `zone` kind is registered in the table (e5's fp-e4b and e3's m4-e not merged) the ask is not made and KiCad's dialog shows.
+Callers reached: `ZONE_CREATE_HELPER` (a zone drawn, `pcbnew/tools/zone_create_helper.cpp` 125 to 129), `CONVERT_TOOL::CreatePolys` to a zone (`convert_tool.cpp` 726 to 736), Duplicate Zone onto Layer (`board_editor_control.cpp` 1826 to 1830), `edit_zone_helpers.cpp` 51 to 62 and `footprint_editor_utils.cpp` 232 to 236 for the non copper and rule area kinds.
+
+How: the settings are exported into a `ZONE` of the board that is never added to it (`ZONE_SETTINGS::ExportSetting`), its record read; the answer is applied to that zone; on an accepted answer the settings are imported back (`ZONE_SETTINGS::operator<<`), and the Invoke function returns `wxID_OK` (0: `wxID_CANCEL`; -1: KiCad's dialog). The caller then makes the zone from the settings in its own commit, as after KiCad's OK.
+
+**Answer** `{ set }`, closed (any other key refuses with that key as `field`; `set` not an object refuses with `field` `set`):
+- copper: each key of `set` is read whole first by `ccReadItemSet` as a one key set (board.item.set's zone keys `name`, `net`, `priority`, `clearance`, `minWidth`, `padConnection`, `thermalGap`, `spokeWidth`, `locked`, wave 1's bounds) plus `layers` (a non empty array of copper layer names the board enables; the layers a new zone needs, for Duplicate onto a layer), a bad one refused with its key as `field`; then each applied by `ccApplyItemSet`.
+- nonCopper, ruleArea: `cc_fpitems::ccFpItemApply( zone, set, commit, (0,0), true )` inside a `BOARD_COMMIT` that is never pushed (the zone is not on the board; `COMMIT::~COMMIT` only frees its copies); refused: `field` `""`.
+
+**Call, reported:** when the zone comes from Convert, KiCad's zone dialogs also show the conversion options (`aConvertSettings`); the ask does not carry them, so the conversion runs with the tool's current settings (the last ones the convert ask or KiCad's dialog set).
+
+**Files:** kicad `seat/run15-e2` 552582c0 (`pcbnew/dialogs/dialog_copper_zones.cpp`, `dialog_non_copper_zones_properties.cpp`, `dialog_rule_area_properties.cpp`; everything under `__EMSCRIPTEN__`, no header changed); pcbjam 236665a (`cc_e2_pcb.inc`).
+
+**Probes (canvas-kinds fixture, Board, Edit mode, a listener that records and returns true):**
+1. Pencil case, Add a filled zone, draw a square: ask `zoneSettings`, `record.kind` `copper`, `record.sheet.uuid` `""`, `record.sheet.netChoices` the board's nets, no KiCad window. Answer `{"set":{"net":"GND","priority":1}}`: `{"accepted":true}`, the zone appears on the drawn layer with net GND and priority 1, one undo step; Undo removes it.
+2. Right-click the copper zone, Duplicate the zone onto a layer: ask `copper` again (the source zone's settings); answer `{"set":{"layers":["B.Cu"]}}`: a copy on B.Cu. `{"set":{"layers":["F.SilkS"]}}` refuses with `field` `layers`; `{"set":{"net":"NOPE"}}` with `field` `net`; `{"sets":{}}` with `field` `sets`.
+3. Convert the Edge.Cuts rectangle to a zone: ask `copper`; answer `{"set":{"net":"GND"}}`: a zone fills inside the rectangle; Undo removes it.
+4. Once a `zone` kind is registered (e5, e3 merged): Add a rule area: ask `zoneSettings` `kind` `ruleArea`, the sheet M4's zone record; answer with M4's keys (for example its keepout flags): the area appears with them. Add a non copper zone: `kind` `nonCopper` likewise. Before that merge: KiCad's dialogs show for these two (expected, not a fault).
+5. `kicadPromptCancel(token)`: no zone is made.
+6. No listener: KiCad's three dialogs as before. The footprint editor's new copper zone: KiCad's dialog (expected).
+
+**Syntax check** (`--kicad /home/matthew/cc-engine-wt/e2/kicad pcbnew occ --kicad-file pcbnew/dialogs/dialog_copper_zones.cpp --kicad-file pcbnew/dialogs/dialog_non_copper_zones_properties.cpp --kicad-file pcbnew/dialogs/dialog_rule_area_properties.cpp`):
+
+```
+PASS pcbnew         pcbnew_embind.cpp subdir=pcbnew -DKICAD_MERGED_EMBIND (12150 ms)
+PASS occ            pcbnew_embind.cpp subdir=pcbnew (12035 ms)
+PASS kicad pcbnew/dialogs/dialog_copper_zones.cpp (6938 ms)
+PASS kicad pcbnew/dialogs/dialog_non_copper_zones_properties.cpp (4811 ms)
+PASS kicad pcbnew/dialogs/dialog_rule_area_properties.cpp (5897 ms)
+syntax-check: 0 failed
+```
