@@ -146,3 +146,30 @@ What the build train must probe:
 2. Frame pcb, tracks with nets copied: `{"mode":"keep","clearNets":true}` pastes them with no net; `clearNets:false` keeps the nets.
 3. After it, a plain Ctrl+Shift+V (if a door reaches KiCad's own pasteSpecial) shows the dialog path again, never a stale choice (wrong if it pastes silently).
 4. False at once: `mode` `"other"`, a missing or extra key, a non boolean clearNets.
+
+## State at the end of this seat (2026-11-18 08:20)
+
+Done and committed: e-librows, e-block-save (both in build G), e-block-place, st-paste-e. e-block-layout: K-B2 and kicadDesignBlockApplyLayout done; the Update widening and the marker `kicadBoardUpdateGroups` HELD until E0 widens the lease to `CC_UPDATE_ARGS` and `ccRunBoardUpdate` (or rules otherwise), so no `e7.unit.e-block-layout` and no `e7.done` yet. e-sheetreload (in the lane's record, not in this seat's list) is not started. No fix notes for e7 were open.
+
+Checks after `git merge run15/main` in both worktrees (pcbjam and kicad up to date with run15/main):
+
+```
+/home/matthew/cc-wave2/bin/gate.sh scripts/kicad/syntax-check-run15.sh --kicad /home/matthew/cc-engine-wt/e7/kicad all --kicad-file pcbnew/tools/pcb_control.cpp --kicad-file eeschema/tools/sch_editor_control.cpp --kicad-file eeschema/sch_design_block_utils.cpp --kicad-file pcbnew/pcb_design_block_utils.cpp
+PASS pcbnew         pcbnew_embind.cpp subdir=pcbnew -DKICAD_MERGED_EMBIND (12032 ms)
+PASS eeschema       eeschema_embind.cpp subdir=eeschema -DKICAD_MERGED_EMBIND (11825 ms)
+PASS symedit        symedit_embind.cpp subdir=eeschema  (7030 ms)
+PASS fpedit         fpedit_embind.cpp subdir=pcbnew  (7037 ms)
+PASS dsedit         dsedit_embind.cpp subdir=pagelayout_editor  (1165 ms)
+PASS kicad_editor   kicad_editor_embind.cpp subdir=common  (5042 ms)
+PASS occ            pcbnew_embind.cpp subdir=pcbnew (11648 ms)
+PASS kicad pcbnew/tools/pcb_control.cpp (9657 ms)
+PASS kicad eeschema/tools/sch_editor_control.cpp (8945 ms)
+PASS kicad eeschema/sch_design_block_utils.cpp (5865 ms)
+PASS kicad pcbnew/pcb_design_block_utils.cpp (6375 ms)
+syntax-check: 0 failed
+
+scripts/kicad/check-run15-exports.sh --since run15/main --kicad /home/matthew/cc-engine-wt/e7/kicad --kicad-since run15/main
+check-run15-exports: 157 names registered in the merged image (150 kicad names), 12 of 110 run 15 names, 0 failures
+```
+
+Merged image only: kicadDesignBlockSave's and kicadDesignBlockPlace's board halves, kicadDesignBlockApplyLayout. New KiCad headers (no existing KiCad header changed): `include/cc_host_design_block.h`, `include/cc_host_block_layout.h`, `include/cc_paste_special.h`, `eeschema/cc_sch_design_block_write.h`, `pcbnew/cc_pcb_design_block_write.h`.
