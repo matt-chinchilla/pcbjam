@@ -86,10 +86,29 @@ bool pathVarsSet( std::string aArgsJson )
     return true;
 }
 
+// e-block-save (DB2, K-B3). kicadDesignBlockSave( {"run", "dir", "name", "scope", "sheetPath"?} )
+// on whichever editor is live: the board half (cc_e7_pcb.inc, merged image only) takes the scopes
+// board, selection and linkedGroup, the schematic half (cc_e7_sch.inc) sheet and selection. Each
+// half reads the arguments whole and answers false before anything is queued.
+bool blockSavePcb( std::string aArgsJson );
+bool blockSaveSch( std::string aArgsJson );
+
+bool designBlockSave( std::string aArgsJson )
+{
+    if( pcbEditorActive() )
+        return blockSavePcb( aArgsJson );
+
+    if( schEditorActive() )
+        return blockSaveSch( aArgsJson );
+
+    return false;
+}
+
 } // namespace cc_e7
 
 EMSCRIPTEN_BINDINGS( cc_e7_dispatch )
 {
+    emscripten::function( "kicadDesignBlockSave", &cc_e7::designBlockSave );
     emscripten::function( "kicadLibsRemoveEntry", &cc_e7::libsRemoveEntry );
     emscripten::function( "kicadPathVarsSet", &cc_e7::pathVarsSet );
 }
