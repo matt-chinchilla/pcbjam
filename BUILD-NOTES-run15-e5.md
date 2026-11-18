@@ -334,6 +334,102 @@ What the build train must probe (fp-i2a's e2e on fpedit-small, through e4's item
   the item (the clone probe broken), a picture whose read `bytes` is 0 (the PNG encode of a
   JPEG or a missing PNG handler in the engine), any KiCad window.
 
+## m13-e: the document's embedded files (BUILD-NOTES-run15-m13-e.md)
+
+Relay seat. Commit pcbjam `0ae7a6d` (`cc_e5_pcb.inc`, `cc_e5_sch.inc`, `cc_e5_dispatch.inc`),
+merged with run15/main at `2bc9ad0`. No KiCad file, no marker, no host ask.
+
+Exports, registered in `EMSCRIPTEN_BINDINGS( cc_e5_dispatch )` (`cc_e5_dispatch.inc`), each
+picking its half with `pcbEditorActive()` then `schEditorActive()` (the footprint and symbol
+editor frames read false on both and answer "" or false; fp-e5's `kicadFpEditEmbed` serves the
+footprint editor):
+
+- `kicadEmbeddedFilesGet()` -> `cc_e5::embeddedFilesGet`, halves `embeddedFilesGetPcb`
+  (`cc_e5_pcb.inc`) and `embeddedFilesGetSch` (`cc_e5_sch.inc`). Answers addendum 10.1's
+  `{owner, fontsEmbedded, files: [{name, type, bytes, heldBy}], fonts: [{name, embedded}]}`
+  (at most 1,024 files; `bytes` the decompressed size, read from a COPY of a file that holds
+  only its compressed text; `heldBy` the nested sets, `RunOnNestedEmbeddedFiles`: the
+  footprints or the screens' library symbols, that hold a file of that name). A read.
+- `kicadEmbeddedFilesSet( json )` -> `cc_e5::embeddedFilesSet`, halves `embeddedFilesSetPcb`,
+  `embeddedFilesSetSch`. Closed shapes, read whole before anything is queued: `{run, dir, op:
+  "add", path, name, type}` (dir an embed run folder `/tmp/cc-embed/<n>`, `cc_output::
+  IsRunDir`; path a regular file of at most 25 MB directly inside dir; name 1 to 255
+  characters, no separator or control character, not `.` or `..`; type font, model,
+  worksheet, datasheet, other), `{op: "remove", name, alsoHeld}`, `{op: "fonts", embed}`; the
+  last two may also carry `run` and `dir` (both or neither) for the record. A removal of a name
+  the document does not hold answers false. On the apply coroutine: PANEL_EMBEDDED_FILES' own
+  steps (common/dialogs/panel_embedded_files.cpp): an add by `EMBEDDED_FILES::AddFile(
+  wxFileName, true )` into a staging set (KiCad's read, ZSTD and hash), moved in under the
+  page's name and type (a file of that name replaced: the panel's Overwrite); a removal with
+  `alsoHeld` removes the nested copies first (TransferDataFromWindow 222 to 236, its "Delete
+  from footprints (symbols) as well?"); fonts drops the FONT files (onFontEmbedClick 278 to
+  288), with `embed` calls the document's own `EmbedFonts()` (BOARD::EmbedFonts board.cpp
+  3178, SCHEMATIC::EmbedFonts), then `SetAreFontsEmbedded`. NO undo step; the frame's
+  `OnModify()`; then `<dir>/embedded.json` `{files, error: "" | "not_applied"}` written last
+  when a dir was given.
+- `kicadEmbeddedFileExtract( json )` -> `cc_e5::embeddedFileExtract`, halves
+  `embeddedFileExtractPcb`, `embeddedFileExtractSch`. Exactly `{dir: "/tmp/cc-embed-out/<n>",
+  name}`: the file decompressed from a copy (`EMBEDDED_FILES::DecompressAndDecode`) and written
+  to `<dir>/<name>`, then `<dir>/.cc-embed-out.json` `{name, bytes, error: "" |
+  "extract_failed"}`. Synchronous (the document is not changed).
+
+The shared rules are one block per face, `cc_e5::pcb::embfiles` and `cc_e5::sch::embfiles`
+(one copy each: the two faces are separate translation units). The halves are external
+linkage at `cc_e5` scope and are called only from the dispatcher, so the exports are merged
+image only; the pcb face's halves compile in occ_service's unit too (the `occ` check passes)
+and are simply unused there.
+
+Font names without FreeType: `font/outline_font.h` includes `<freetype/freetype.h>`, which the
+embind compile cannot find (the first syntax check of this unit FAILED pcbnew, eeschema and
+occ on `'freetype/freetype.h' file not found`). The code does not include it: the font list
+walks the document's texts as its own `GetFonts()` walks them (the board's drawings; every
+sheet's items), keeps a font only when `GetFonts()` (KiCad's embedding permission filter)
+holds it, comparing the two pointers as addresses (OUTLINE_FONT's one public base is FONT),
+and reads the file name through a pointer to FONT's protected `m_fontFileName` formed in a
+derived class (`FONT_FILE_NAME`, never made). REPORTED to E0 as information: a future unit
+that needs `OUTLINE_FONT` in an embind TU needs `${SYSROOT}/include/freetype2` on
+`compile_embind_tu`'s include list; this unit does not.
+
+Syntax check, after `git merge run15/main` (88b68c5, e4's fp-e-items and the item kind
+table's definitions on it), the lane's whole tree at `2bc9ad0`:
+
+```
+/home/matthew/cc-wave2/bin/gate.sh scripts/kicad/syntax-check-run15.sh --kicad /home/matthew/cc-engine-wt/e0-kicad all
+PASS pcbnew         pcbnew_embind.cpp subdir=pcbnew -DKICAD_MERGED_EMBIND (14594 ms)
+PASS eeschema       eeschema_embind.cpp subdir=eeschema -DKICAD_MERGED_EMBIND (15238 ms)
+PASS symedit        symedit_embind.cpp subdir=eeschema  (8222 ms)
+PASS fpedit         fpedit_embind.cpp subdir=pcbnew  (10420 ms)
+PASS dsedit         dsedit_embind.cpp subdir=pagelayout_editor  (1501 ms)
+PASS kicad_editor   kicad_editor_embind.cpp subdir=common  (5911 ms)
+PASS occ            pcbnew_embind.cpp subdir=pcbnew (13764 ms)
+syntax-check: 0 failed
+scripts/kicad/check-run15-exports.sh --since run15/main
+check-run15-exports: 225 names registered in the merged image (218 kicad names), 80 of 110 run 15 names, 0 failures
+```
+
+What the build train must probe (the unit's recipe):
+
+- open kicad-source-mirror's `qa/data/pcbnew/issue22102.kicad_pcb` in /viewer, Edit mode,
+  Board tab: `kicadEmbeddedFilesGet()` answers `owner` "board" and lists
+  `SchematicTemplate.kicad_wks` with `type` "worksheet" and `bytes` above 0 (0 or -1 means the
+  copy's decompress failed).
+- `kicadEmbeddedFileExtract('{"dir":"/tmp/cc-embed-out/1","name":"SchematicTemplate.kicad_wks"}')`
+  is true; `/tmp/cc-embed-out/1/SchematicTemplate.kicad_wks` starts with `(kicad_wks` and its
+  size equals the get's `bytes`; `.cc-embed-out.json` has `error` "".
+- `kicadEmbeddedFilesSet('{"run":1,"dir":"/tmp/cc-embed/1","op":"remove","name":
+  "SchematicTemplate.kicad_wks","alsoHeld":false}')` is true; after the apply queue empties
+  `/tmp/cc-embed/1/embedded.json` lists no file, a get lists none, the undo depth did not move,
+  the board is modified. A second identical call answers false (the name is gone).
+- add: stage a PDF at `/tmp/cc-embed/2/sheet.pdf`, `{run:2, dir:"/tmp/cc-embed/2", op:"add",
+  path:"/tmp/cc-embed/2/sheet.pdf", name:"datasheet.pdf", type:"datasheet"}`: a get lists
+  `datasheet.pdf` of type datasheet and the PDF's size. A path outside the dir answers false.
+- fonts, on the embedded-fonts fixture: the get answers `fontsEmbedded` true and Noto Sans
+  `embedded` true; `{op:"fonts", embed:false}` removes the font file and the switch; `{op:
+  "fonts", embed:true}` brings both back. A save after it carries the font.
+- the same three calls in the schematic frame answer `owner` "schematic".
+- the failure that means it is wrong: an undo step after a set, the board not modified, a
+  file in `heldBy` 0 that a footprint visibly carries, any KiCad window.
+
 ## Hand over state (this seat, 2026-11-18)
 
 Done: fp-e7 (earlier seat), fp-e5, fp-e6. Not started, for the relay on this same branch, in
