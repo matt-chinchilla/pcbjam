@@ -87,3 +87,63 @@ What the build train must probe:
 - A listener returning true for `cc.Control.setLanguage`: Preferences > Set Language > Deutsch leaves the menus English; no listener: the language changes as before.
 - A right click still shows KiCad's context menu; choosing an item the listener holds (`pcbnew.InteractiveEdit.properties`) logs it and runs nothing; another item runs.
 - A cycling toolbar group (the units toggle): held, the units stay; not held, they cycle as before.
+
+## m1-e: K-MENU, our context menu (canvas addendum 3.1)
+
+Exports (pcbjam `cc_e1_dispatch.inc`, block `cc_e1_dispatch`, commit b52f7f7; not merged only, no pcbnew or eeschema header):
+
+- `kicadHostContextMenu() -> bool` marker, true.
+- `kicadContextMenuChoose( int token, int id ) -> int`: 0 done (`-1` cancels), 1 stale, 2 no item with that id, 3 disabled, 4 a submenu or separator.
+- `kicadContextMenuHighlight( int token, int id ) -> int`: the same codes; 0 posts a `wxEVT_MENU_HIGHLIGHT` for the item to its containing `ACTION_MENU` through the frame's `CallAfter` (delivered by the tick while the menu is parked, as a wx event is; dropped if the menu closed first).
+- `kicadRunAction( string name ) -> int`: 0 dispatched (on its own coroutine through `pcbjam_collab::runOnCoroutine`, so an action that opens a window may suspend), 1 `ACTION_MANAGER::FindAction` null (nothing run), 3 busy (a parked host menu, a parked modal prompt, KiCad's own popup `IsContextMenuActive`, a modal `wxDialog`, the Kiway blocking dialog, an open in flight), 4 no frame or tool manager. Never asks `hostHoldsAction`.
+
+Host ask (kicad commit 87580fb2): `window.kicadHostMenu.onMenu( text )`, text the JSON `{ token, clarify, tool, title, at: { x, y }, kinds, items, cut? }`; each item `{ id, kind (normal, check, radio, submenu, separator), label, enabled, checked, action, key, items? }`. Bounds 400 items, depth 3, label 128 characters, `cut: true` past them.
+
+- `include/tool/host_context_menu.h` (new, header only): `CcHostTakesMenu( TOOL_MANAGER&, ACTION_MENU&, wxWindow* frame, const TOOL_BASE* tool, bool clarify, const VECTOR2D& cursor )` (two parameters more than the spec's line: the frame and the owning tool, which `DispatchContextMenu` holds), the parked menu `CcParkedMenu()`, `CcHostMenuParked`, `CcHostMenuCancelParked`, `CcHostMenuChoose`, `CcHostMenuHighlight`, the kinds table `CcMenuKindOf` (a board rule area told from a zone by `GetFriendlyName() == _( "Rule Area" )`; a schematic graphic line reads `shape`; drawing sheet `line`, `rect`, `text`, `image`). With no `window.kicadHostMenu.onMenu` the hook returns before touching anything (plain popup path unchanged). Taken: `SetInvokingWindow`, `UpdateUI()`, `wxEVT_MENU_OPEN` to the menu and every `ACTION_MENU` submenu through `OnMenuEvent`, the model, `wxWasmBeginWait( "menu" )` before the ask, `CcHostWait` (host_prompt.h), then the replay of `DoPopupMenu` (FindItem, Toggle a checkable, `containing->SendEvent`).
+- `common/tool/tool_manager.cpp` `TOOL_MANAGER::DispatchContextMenu`: at the top, a right click while a host menu is parked cancels it and opens nothing (the tick keeps dispatching during the wait; this keeps the tool state of the parked menu whole); `clarify` read before `CMENU_NOW` is cleared; `frame->PopupMenu` only when `CcHostTakesMenu` returns false.
+- `include/tool/action_menu.h`: `const TOOL_ACTION* ActionFor( int aId ) const` inline under `__EMSCRIPTEN__` (this menu's own map; the serializer asks each submenu for its own items). Header change: recompile reach is every file including `action_menu.h` (most tools: about the same reach as a tool header; the train takes it with the others). `action_menu.cpp` (st-hold-e's) is not touched by this unit.
+
+Syntax check: `/home/matthew/cc-wave2/bin/gate.sh scripts/kicad/syntax-check-run15.sh --kicad /home/matthew/cc-engine-wt/e1/kicad kicad_editor --kicad-file common/tool/tool_manager.cpp --kicad-file common/kidialog.cpp --kicad-file common/confirm.cpp --kicad-file common/dialogs/dialog_assign_netclass.cpp`
+
+```
+PASS kicad_editor   kicad_editor_embind.cpp subdir=common  (5923 ms)
+PASS kicad common/tool/tool_manager.cpp (5654 ms)
+PASS kicad common/kidialog.cpp (3243 ms)
+PASS kicad common/confirm.cpp (2059 ms)
+PASS kicad common/dialogs/dialog_assign_netclass.cpp (4054 ms)
+syntax-check: 0 failed
+```
+
+What the build train must probe (canvas-kinds fixture, island frame console):
+
+- `Module.kicadHostContextMenu()` true.
+- Schematic, `window.kicadHostMenu = { onMenu: t => (window.__m = JSON.parse(t), true) }`, right click R4: `__m.clarify === false`, `__m.tool` `eeschema.InteractiveSelection`, `__m.kinds` `["symbol"]`, an item with `action` `eeschema.InteractiveEdit.rotateCCW`, `enabled` true, `key` `R`; NO KiCad popup (`.wx-menu-popup` absent). `kicadContextMenuChoose(__m.token, <that id>)` 0: R4 turns, undo depth +1; Undo turns it back. Again: 1 (stale). Wrong: the DOM popup shows anyway, a hang after the choice (the wait never resolved), the choice running nothing (the replay missed `SendEvent`).
+- Right click, `kicadContextMenuChoose(token, -1)`: 0, nothing changes, the next right click opens a new model. A right click while a model is parked: no new model, the first is canceled (a choose on it: 1).
+- A separator id: 4; a disabled item: 3; `id` 999999: 2.
+- `Module.kicadRunAction('eeschema.InteractiveEdit.mirrorV')` with R4 selected: 0, R4 mirrors; `kicadRunAction('no.Such.action')`: 1, nothing changes; while a model is parked: 3.
+- Board, two stacked tracks at a crossing: a model with `clarify` true, `title` KiCad's ("Clarify Selection"), one `normal` item per candidate with `action` ""; `kicadContextMenuHighlight(token, id2)` 0 and the second track brightens on the next frame; choosing it selects it (one selected item).
+- No listener (`delete window.kicadHostMenu`): KiCad's DOM popup shows exactly as on run 14.
+
+## m1x-e2: messages, confirmations and Assign Netclass ask the host (canvas addendum 4.2)
+
+No export (rides `kicadHostPrompts`, `kicadPromptAnswer`, `kicadPromptCancel` of m1x-e1). kicad commit 9140d111:
+
+| ask | where | record | answer |
+|---|---|---|---|
+| `message` | `KIDIALOG::ShowModal` (`common/kidialog.cpp`, after KiCad's own do-not-show-again check), `DisplayError`, `DisplayErrorMessage`, `DisplayInfoMessage`, `IsOK`, `OKOrCancelDialog` (`common/confirm.cpp`) | `{ title, text, extra, icon (info, warning, error, question from GetEffectiveIcon), buttons: [{ id, label }], dontAsk }`; buttons yes, no or ok, then cancel, labels KiCad's with `&` stripped | `{ button, dontAsk }`; a button not offered refuses with field `button`, a non boolean `dontAsk` with field `dontAsk` |
+| `assignNetclass` | `DIALOG_ASSIGN_NETCLASS::ShowModal` (`common/dialogs/dialog_assign_netclass.cpp`, declared in `include/dialogs/dialog_assign_netclass.h`) | `{ pattern, netclass, netclasses }` from its own `TransferDataToWindow` | `{ pattern, netclass }` (either may be left out: the dialog's value stays); a netclass not in the list refuses with field `netclass`; accepted runs its own `TransferDataFromWindow` (the pattern assignment) |
+
+- The one body is `int CcHostMessage( const wxMessageDialogBase&, bool offerDontAsk, bool* dontAsk )` defined in `kidialog.cpp` (kicommon) and declared locally in `confirm.cpp` (no header change). It returns the pressed button's wx id, the dismissal id (Cancel, else No, else OK) on the host's cancel, or -1 (KiCad's dialog).
+- While a prompt answer is applied (`CcPromptCapturing`), a message box is never asked: its text (plus the extended text) becomes that answer's refusal `message` and it returns the dismissal id.
+- `dontAsk` is offered only by a KIDIALOG with KiCad's "Do not show again" box (`DoNotShowCheckbox`); a true answer checks the box so KiCad stores the choice as before. `OKOrCancelDialog`'s "Apply to all" keeps KiCad's own default (checked).
+- Not hooked (file flows, as the spec says): `UnsavedChangesDialog`, `AskOverrideLock`, `ConfirmRevertDialog`, `SelectSingleOption`, `HandleUnsavedChanges`.
+- Header change: `dialog_assign_netclass.h` gains `ShowModal() override` (reach: its own .cpp and the two tools that build it, `sch_editor_control.cpp`, `board_editor_control.cpp`). `kidialog.h` is NOT changed.
+
+Syntax check: the same run as m1-e above (kidialog.cpp, confirm.cpp, dialog_assign_netclass.cpp PASS).
+
+What the build train must probe:
+
+- Board, a locked track selected, D (drag), with `window.kicadHostPrompt = { onAsk: t => (window.__a = JSON.parse(t), true) }`: `__a.ask === "message"`, `__a.record.icon` `warning` or `question`, buttons in KiCad's order with its labels (for example `Drag Anyway`); `kicadPromptAnswer(__a.token, '{"button":"ok"}')` `{"accepted":true}` and the drag starts; `kicadPromptCancel` leaves the track. `{"button":"maybe"}`: `{"accepted":false,"field":"button","message":""}`, still parked.
+- A message raised while an entry answer is applied (an entry the dialog refuses with a message box): the entry's refusal carries that sentence and no `message` ask arrives.
+- Schematic, right click a wire, Assign a net class: `ask` `assignNetclass`, `record.pattern` the wire's net, `record.netclasses[0]` `Default`; `{"pattern":"<net>","netclass":"Default"}` accepted, Schematic Setup's net class assignments list the pattern; `{"netclass":"Nope"}` refuses with field `netclass`. Wrong: the netclass list doubled after a not taken ask (no listener: KiCad's dialog must list each class once).
+- No listener: every message box and the netclass dialog show as before.
