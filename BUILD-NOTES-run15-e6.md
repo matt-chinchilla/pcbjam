@@ -80,3 +80,10 @@ What the build train must probe (fixtures: island `tests/fixtures/drawings/outli
 4. Schematic frame: `outline.dxf` `"place":"at","origin":[50,50]` lands near (50 mm, 50 mm); one Ctrl+Z removes it. Symbol editor frame (symedit-small): the same lands in the open symbol on the current unit, one undo step, `symedit.take` holds it.
 5. `"place":"pointer"` in the board frame: the drawing follows the pointer, R rotates it, a click places it (one undo step "Import Graphics"); a second run then Esc leaves nothing and no undo step. The same in the schematic frame. Wrong: items left on the board after Esc, or a step on the undo stack after Esc.
 6. Refusals answer `""`: an unknown key, a relative path, a path with `..`, a missing file, a `.txt` file, `"layer":"Nope"`, a layer the board does not enable, the drawing sheet editor frame. No KiCad window or message box on any road (the dialog is never constructed).
+
+## Lane state at the relay (seat 2, 2026-11-18)
+
+- The seat before was cut off by the machine fault; both worktrees were clean, nothing to stash. ds-e1 (gate and unit files) stands as written.
+- fp-e8: committed above, waiting only on E0's `dxflib_qcad` include line; once `run15/main` carries it: `git merge run15/main`, the syntax check `all`, paste the lines here, then `e6.unit.fp-e8`.
+- ds-e2: not started; it is cut after build G answers gate 0 items 1 to 4 (build G's gitlink bump `48e664e` is on `run15/main`, its result not yet in E0's notes).
+- sy2-e: held (RULINGS 5): no diagnosis names an engine file (nothing under `cc-wave2/reports/` or `plan/` but the manifest's own lines).
