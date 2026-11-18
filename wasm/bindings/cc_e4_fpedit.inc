@@ -13,7 +13,8 @@
 // code of build G), then kicadFpEditNew, kicadFpEditMarkSaved, kicadFpEditSelection and
 // kicadFpEditSelect. fp-e-items (FP spec 7.2): the item kind table and the four item exports.
 // fp-e3: the pad kind (cc_item_pad.h), kicadFpEditPadDefaultsGet, kicadFpEditPadDefaultsSet
-// and kicadFpEditEnumerate.
+// and kicadFpEditEnumerate. fp-e4a: the text kinds field, text, textbox, table and barcode
+// (cc_item_text.h), no export of their own (the four item exports serve them).
 
 #include <map>
 #include <set>
@@ -41,6 +42,7 @@
 #include <netinfo.h>
 
 #include "cc_item_pad.h"
+#include "cc_item_text.h"
 
 namespace cc_e4
 {
@@ -1122,6 +1124,21 @@ bool kicadFpEditItemsRemove( std::string aArgsJson )
 const bool kPadKindRegistered =
         ( cc_fpitems::ccRegisterItemKind( { "pad", &padkind::kindGet, &padkind::kindSet,
                                              &padkind::kindAdd } ),
+          true );
+
+// ── fp-e4a: the text kinds (no export: the item exports dispatch to them) ─────────────
+
+const bool kTextKindsRegistered =
+        ( cc_fpitems::ccRegisterItemKind( { "field", &textkind::kindGet, &textkind::kindSet,
+                                             &textkind::addField } ),
+          cc_fpitems::ccRegisterItemKind( { "text", &textkind::kindGet, &textkind::kindSet,
+                                             &textkind::addText } ),
+          cc_fpitems::ccRegisterItemKind( { "textbox", &textkind::kindGet, &textkind::kindSet,
+                                             &textkind::addTextbox } ),
+          cc_fpitems::ccRegisterItemKind( { "table", &textkind::kindGet, &textkind::kindSet,
+                                             &textkind::addTable } ),
+          cc_fpitems::ccRegisterItemKind( { "barcode", &textkind::kindGet, &textkind::kindSet,
+                                             &textkind::addBarcode } ),
           true );
 
 // fpedit.padDefaults.get: the master pad KiCad gives every new pad (BOARD_DESIGN_SETTINGS::
