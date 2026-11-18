@@ -11,6 +11,10 @@
 // never in a shared block. The rules: BUILD-NOTES-run15.md.
 
 #include <settings/common_settings.h>
+#include <project/component_class_settings.h>
+#include <project/project_file.h>
+#include <schematic_settings.h>
+#include <settings/bom_settings.h>
 
 namespace cc_e12
 {
@@ -186,11 +190,198 @@ bool mouseSet( SCH_EDIT_FRAME* aFrame, const json& aValue, bool aDryRun, std::st
 {
     return prefsSet( aFrame, Pgm().GetCommonSettings(), mouseKeys(), aValue, aDryRun );
 }
+
+// ── m7-e (M7): Schematic Setup's Annotation and BOM Presets panels, and the board's component
+// classes read from the schematic frame (the project file holds them; Schematic Setup has no
+// such panel, so the set is the board's). Each section reads a given project (the m8-e reader
+// reads another design with the same function) and sets the live one; a set is a closed patch
+// read whole before anything changes, Schematic Setup's OK steps after.
+
+SCHEMATIC_SETTINGS* schSettingsOf( PROJECT* aProject )
+{
+    return aProject ? aProject->GetProjectFile().m_SchematicSettings : nullptr;
+}
+
+// annotation: PANEL_EESCHEMA_ANNOTATION_OPTIONS. Wire keys are KiCad's JSON paths with a dot:
+// "annotation.sort_order" (0 across then down, by X; 1 down then across, by Y),
+// "annotation.method" (0 first free, 1 sheet number times 100, 2 times 1000),
+// "annotate_start_num" (also schFormatting's: either set writes the one key),
+// "reuse_designators".
+
+const std::vector<std::pair<std::string, std::string>>& annotationKeys()
+{
+    static const std::vector<std::pair<std::string, std::string>> keys = {
+        { "annotation.sort_order", "/annotation/sort_order" },
+        { "annotation.method", "/annotation/method" },
+        { "annotate_start_num", "/annotate_start_num" },
+        { "reuse_designators", "/reuse_designators" }
+    };
+    return keys;
+}
+
+json annotationRead( PROJECT* aProject )
+{
+    SCHEMATIC_SETTINGS* settings = schSettingsOf( aProject );
+
+    if( !settings )
+        return json();
+
+    return ccJsonSectionGet( CC_JSON_SECTION{ settings, annotationKeys() } );
+}
+
+json annotationGet( SCH_EDIT_FRAME* aFrame )
+{
+    return annotationRead( &aFrame->Prj() );
+}
+
+bool annotationSet( SCH_EDIT_FRAME* aFrame, const json& aValue, bool aDryRun, std::string& aError,
+                    std::string& aMessage, json& aRecord )
+{
+    if( !aValue.is_object() || aValue.empty() )
+        return false;
+
+    for( const auto& [key, v] : aValue.items() )
+    {
+        if( std::none_of( annotationKeys().begin(), annotationKeys().end(),
+                          [&]( const auto& aKey ) { return aKey.first == key; } ) )
+        {
+            return false;
+        }
+
+        if( key == "reuse_designators" ? !v.is_boolean() : !v.is_number_integer() )
+            return false;
+
+        if( key == "annotation.sort_order" && v != 0 && v != 1 )
+            return false;
+
+        if( key == "annotation.method" && v != 0 && v != 1 && v != 2 )
+            return false;
+
+        if( key == "annotate_start_num" && ( v.get<long long>() < 0 || v.get<long long>() > 999999 ) )
+            return false;
+    }
+
+    if( aDryRun )
+        return true;
+
+    CC_JSON_SECTION section{ &aFrame->Schematic().Settings(), annotationKeys() };
+
+    return ccJsonSectionSet( section, aValue );
+}
+
+// bomPresets: PANEL_BOM_PRESETS. KiCad's JSON: bom_presets and bom_fmt_presets (the user's
+// presets; KiCad's built in ones are not stored), bom_settings and bom_fmt_settings (the
+// current choice). Each value is read by KiCad's own from_json first (a value KiCad would not
+// load is refused), then replaces its key whole.
+
+const std::vector<std::pair<std::string, std::string>>& bomKeys()
+{
+    static const std::vector<std::pair<std::string, std::string>> keys = {
+        { "bom_presets", "/bom_presets" },
+        { "bom_fmt_presets", "/bom_fmt_presets" },
+        { "bom_settings", "/bom_settings" },
+        { "bom_fmt_settings", "/bom_fmt_settings" }
+    };
+    return keys;
+}
+
+json bomPresetsRead( PROJECT* aProject )
+{
+    SCHEMATIC_SETTINGS* settings = schSettingsOf( aProject );
+
+    if( !settings )
+        return json();
+
+    return ccJsonSectionGet( CC_JSON_SECTION{ settings, bomKeys() } );
+}
+
+json bomPresetsGet( SCH_EDIT_FRAME* aFrame )
+{
+    return bomPresetsRead( &aFrame->Prj() );
+}
+
+bool bomPresetsSet( SCH_EDIT_FRAME* aFrame, const json& aValue, bool aDryRun, std::string& aError,
+                    std::string& aMessage, json& aRecord )
+{
+    if( !aValue.is_object() || aValue.empty() )
+        return false;
+
+    try
+    {
+        for( const auto& [key, v] : aValue.items() )
+        {
+            if( key == "bom_presets" && v.is_array() && v.size() <= 1024 )
+                (void) v.get<std::vector<BOM_PRESET>>();
+            else if( key == "bom_fmt_presets" && v.is_array() && v.size() <= 1024 )
+                (void) v.get<std::vector<BOM_FMT_PRESET>>();
+            else if( key == "bom_settings" && v.is_object() )
+                (void) v.get<BOM_PRESET>();
+            else if( key == "bom_fmt_settings" && v.is_object() )
+                (void) v.get<BOM_FMT_PRESET>();
+            else
+                return false;
+        }
+    }
+    catch( ... )
+    {
+        return false;
+    }
+
+    if( aDryRun )
+        return true;
+
+    SCHEMATIC_SETTINGS& settings = aFrame->Schematic().Settings();
+    settings.Store();
+    nlohmann::json& doc = *settings.Internals();
+
+    for( const auto& [key, v] : aValue.items() )
+        doc[json::json_pointer( "/" + key )] = v;   // replaced whole, never merged
+
+    settings.Load();
+    return true;
+}
+
+// componentClasses, read from the schematic frame: the same project file section the board
+// face registers (see cc_e12_pcb.inc); its set is the board's (Board Setup's panel and
+// SynchronizeComponentClasses), so here a set is refused.
+
+json componentClassesRead( PROJECT* aProject )
+{
+    if( !aProject )
+        return json();
+
+    std::shared_ptr<COMPONENT_CLASS_SETTINGS>& settings = aProject->GetProjectFile().ComponentClassSettings();
+
+    if( !settings )
+        return json();
+
+    return ccJsonSectionGet( CC_JSON_SECTION{ settings.get(),
+                                              { { "sheet_component_classes.enabled",
+                                                  "/sheet_component_classes/enabled" },
+                                                { "assignments", "/assignments" } } } );
+}
+
+json componentClassesGet( SCH_EDIT_FRAME* aFrame )
+{
+    return componentClassesRead( &aFrame->Prj() );
+}
+
+bool componentClassesSet( SCH_EDIT_FRAME* aFrame, const json& aValue, bool aDryRun, std::string& aError,
+                          std::string& aMessage, json& aRecord )
+{
+    aError = "bad_args";
+    aMessage = "component classes are set in the board editor";
+    return false;
+}
 } // namespace sch
 
 const bool kSchEditing = ccRegisterSchSection( { "schEditing", "sch", &sch::schEditingGet, &sch::schEditingSet,
                                                  false } );
 const bool kSchMouse = ccRegisterSchSection( { "mouse", "sch", &sch::mouseGet, &sch::mouseSet, false } );
+const bool kAnnotation = ccRegisterSchSection( { "annotation", "sch", &sch::annotationGet, &sch::annotationSet } );
+const bool kBomPresets = ccRegisterSchSection( { "bomPresets", "sch", &sch::bomPresetsGet, &sch::bomPresetsSet } );
+const bool kSchComponentClasses = ccRegisterSchSection( { "componentClasses", "sch", &sch::componentClassesGet,
+                                                          &sch::componentClassesSet } );
 } // namespace cc_e12
 
 EMSCRIPTEN_BINDINGS( cc_e12_sch )

@@ -14,6 +14,20 @@
 #include <pcbnew_settings.h>
 #include <router/pns_routing_settings.h>
 #include <settings/common_settings.h>
+#include <pcb_painter.h>
+#include <pcb_plot_params.h>
+#include <pcb_view.h>
+#include <project/component_class_settings.h>
+#include <project/project_file.h>
+#include <project/tuning_profiles.h>
+
+#ifdef KICAD_MERGED_EMBIND
+// K-TSOLVE (kicad pcbnew/dialogs/panel_setup_tuning_profile_info.cpp, WebAssembly build only):
+// the tuning profile panel's solve as a free function. Declared here, defined in KiCad's file.
+bool ccTuningSolve( BOARD* aBoard, const EDA_IU_SCALE& aIuScale, bool aDifferential, double aImpedance,
+                    PCB_LAYER_ID aSignal, PCB_LAYER_ID aTopRef, PCB_LAYER_ID aBottomRef, int aSolveFor,
+                    int& aWidth, int& aGap, int& aDelay, wxString& aProblem );
+#endif
 
 namespace cc_e12
 {
@@ -750,6 +764,597 @@ bool stackupLayersSet( PCB_EDIT_FRAME* aFrame, const json& aValue, bool aDryRun,
 
     return true;
 }
+
+// ── m7-e (M7, PE31): the Board Setup panels the page did not have yet. Each section reads a
+// given board and project (the m8-e reader reads another design with the same function) and
+// sets the live one; a set is a closed patch, read whole before anything changes, Board
+// Setup's OK steps after (setupOk). Wire keys are KiCad's own JSON names (zoneDefaults,
+// tuningPatterns, componentClasses, tuningProfiles) or this lane's (zoneHatchOffsets,
+// boardFormatting); componentClasses names KiCad's nested key with a dot.
+
+/** One value of the kind aKind: 'n' a finite number, 'p' a number >= 0, 'i' an integer, 'b' a
+ *  bool, 's' a string, 'o' an object, 'a' an array. */
+bool kindOk( const json& aValue, char aKind )
+{
+    switch( aKind )
+    {
+    case 'n': return aValue.is_number() && std::isfinite( aValue.get<double>() );
+    case 'p': return aValue.is_number() && std::isfinite( aValue.get<double>() ) && aValue.get<double>() >= 0.0;
+    case 'i': return aValue.is_number_integer();
+    case 'b': return aValue.is_boolean();
+    case 's': return aValue.is_string();
+    case 'o': return aValue.is_object();
+    case 'a': return aValue.is_array();
+    default:  return false;
+    }
+}
+
+/** An object whose every key is one of aKinds, of that key's kind; with aAll every key present. */
+bool objectOk( const json& aValue, std::initializer_list<std::pair<const char*, char>> aKinds, bool aAll )
+{
+    if( !aValue.is_object() || ( aAll && aValue.size() != aKinds.size() ) )
+        return false;
+
+    for( const auto& [key, v] : aValue.items() )
+    {
+        auto kind = std::find_if( aKinds.begin(), aKinds.end(),
+                                  [&]( const auto& aPair ) { return key == aPair.first; } );
+
+        if( kind == aKinds.end() || !kindOk( v, kind->second ) )
+            return false;
+    }
+
+    return true;
+}
+
+/** ccPcbJsonSet's refusals without its change: wire keys only, no null, each key's kind kept. */
+bool jsonPatchOk( const CC_PCB_JSON_SECTION& aSection, const json& aPatch )
+{
+    if( !aSection.settings || !aPatch.is_object() || aPatch.empty() || ccPcbHasNull( aPatch ) )
+        return false;
+
+    aSection.settings->Store();
+    const nlohmann::json& doc = *aSection.settings->Internals();
+
+    for( const auto& [key, value] : aPatch.items() )
+    {
+        auto it = std::find_if( aSection.keys.begin(), aSection.keys.end(),
+                                [&]( const auto& aPair ) { return aPair.first == key; } );
+
+        if( it == aSection.keys.end() )
+            return false;
+
+        const json::json_pointer ptr( it->second );
+
+        if( doc.contains( ptr ) )
+        {
+            const json& target = doc.at( ptr );
+
+            if( !( target.is_number() && value.is_number() ) && target.type() != value.type() )
+                return false;
+        }
+    }
+
+    return true;
+}
+
+bool jsonSectionSet( const CC_PCB_JSON_SECTION& aSection, const json& aPatch, bool aDryRun )
+{
+    if( !jsonPatchOk( aSection, aPatch ) )
+        return false;
+
+    return aDryRun || ccPcbJsonSet( aSection, aPatch );
+}
+
+// zoneDefaults: PANEL_SETUP_ZONES, BOARD_DESIGN_SETTINGS' defaults.zones params (mm, degrees and
+// KiCad's enumeration numbers as the project file holds them). Load() sets the default zone
+// settings through the params.
+
+const std::vector<std::string>& zoneDefaultKeys()
+{
+    static const std::vector<std::string> keys = {
+        "min_clearance",       "min_thickness",        "fill_mode",
+        "hatch_thickness",     "hatch_gap",            "hatch_orientation",
+        "hatch_smoothing_level", "hatch_smoothing_value", "border_display_style",
+        "border_hatch_pitch",  "thermal_relief_gap",   "thermal_relief_spoke_width",
+        "pad_connection",      "corner_smoothing",     "corner_radius",
+        "remove_islands",      "min_island_area"
+    };
+    return keys;
+}
+
+CC_PCB_JSON_SECTION zoneDefaultsSection( BOARD* aBoard )
+{
+    CC_PCB_JSON_SECTION section;
+    section.settings = &aBoard->GetDesignSettings();
+
+    for( const std::string& key : zoneDefaultKeys() )
+        section.keys.emplace_back( key, "/defaults/zones/" + key );
+
+    return section;
+}
+
+json zoneDefaultsRead( BOARD* aBoard, PROJECT* aProject )
+{
+    return ccPcbJsonGet( zoneDefaultsSection( aBoard ) );
+}
+
+json zoneDefaultsGet( PCB_EDIT_FRAME* aFrame )
+{
+    return zoneDefaultsRead( aFrame->GetBoard(), &aFrame->Prj() );
+}
+
+bool zoneDefaultsSet( PCB_EDIT_FRAME* aFrame, const json& aValue, bool aDryRun, std::string& aError,
+                      std::string& aMessage, json& aRecord )
+{
+    if( !aValue.is_object() )
+        return false;
+
+    for( const auto& [key, v] : aValue.items() )
+    {
+        // Every zone default is a number (a length, an angle or an enumeration).
+        if( !kindOk( v, 'n' ) || ( v.get<double>() < 0.0 && key != "hatch_orientation" ) )
+            return false;
+    }
+
+    return jsonSectionSet( zoneDefaultsSection( aFrame->GetBoard() ), aValue, aDryRun );
+}
+
+// zoneHatchOffsets: PANEL_SETUP_ZONE_HATCH_OFFSETS, the board file's m_ZoneLayerProperties.
+// {layers: [{layer, offset: [x, y] mm | null}]}, one row per copper layer the board enables, in
+// KiCad's order; null is "Board default". A set replaces the list: every enabled copper layer
+// it does not name goes back to the board default, as the panel writes every row.
+
+json zoneHatchOffsetsRead( BOARD* aBoard, PROJECT* aProject )
+{
+    BOARD_DESIGN_SETTINGS& bds = aBoard->GetDesignSettings();
+    json                   layers = json::array();
+
+    for( PCB_LAYER_ID layer : LSET::AllCuMask().UIOrder() )
+    {
+        if( !bds.IsLayerEnabled( layer ) )
+            continue;
+
+        json entry = json::object();
+        entry["layer"] = ccLayer( layer );
+
+        auto it = bds.m_ZoneLayerProperties.find( layer );
+
+        if( it != bds.m_ZoneLayerProperties.end() && it->second.hatching_offset )
+            entry["offset"] = json::array( { ccMm( it->second.hatching_offset->x ),
+                                             ccMm( it->second.hatching_offset->y ) } );
+        else
+            entry["offset"] = nullptr;
+
+        layers.push_back( std::move( entry ) );
+    }
+
+    json out = json::object();
+    out["layers"] = std::move( layers );
+    return out;
+}
+
+json zoneHatchOffsetsGet( PCB_EDIT_FRAME* aFrame )
+{
+    return zoneHatchOffsetsRead( aFrame->GetBoard(), &aFrame->Prj() );
+}
+
+bool zoneHatchOffsetsSet( PCB_EDIT_FRAME* aFrame, const json& aValue, bool aDryRun, std::string& aError,
+                          std::string& aMessage, json& aRecord )
+{
+    BOARD*                 board = aFrame->GetBoard();
+    BOARD_DESIGN_SETTINGS& bds = board->GetDesignSettings();
+
+    if( !aValue.is_object() || aValue.size() != 1 || !aValue.contains( "layers" ) || !aValue["layers"].is_array()
+            || aValue["layers"].size() > PCB_LAYER_ID_COUNT )
+    {
+        return false;
+    }
+
+    std::map<PCB_LAYER_ID, std::optional<VECTOR2I>> given;
+
+    for( const json& entry : aValue["layers"] )
+    {
+        if( !entry.is_object() || entry.size() != 2 || !entry.contains( "layer" ) || !entry.contains( "offset" )
+                || !entry["layer"].is_string() )
+        {
+            return false;
+        }
+
+        const PCB_LAYER_ID layer = ccLayerByName( board, entry["layer"].get<std::string>() );
+
+        if( layer == UNDEFINED_LAYER || !IsCopperLayer( layer ) || !bds.IsLayerEnabled( layer )
+                || given.count( layer ) )
+        {
+            return false;
+        }
+
+        const json& offset = entry["offset"];
+
+        if( offset.is_null() )
+        {
+            given[layer] = std::nullopt;
+            continue;
+        }
+
+        if( !offset.is_array() || offset.size() != 2 || !kindOk( offset[0], 'n' ) || !kindOk( offset[1], 'n' )
+                || std::abs( offset[0].get<double>() ) > 1000.0 || std::abs( offset[1].get<double>() ) > 1000.0 )
+        {
+            return false;
+        }
+
+        given[layer] = VECTOR2I( pcbIUScale.mmToIU( offset[0].get<double>() ),
+                                 pcbIUScale.mmToIU( offset[1].get<double>() ) );
+    }
+
+    if( aDryRun )
+        return true;
+
+    for( PCB_LAYER_ID layer : LSET::AllCuMask().UIOrder() )
+    {
+        if( !bds.IsLayerEnabled( layer ) )
+            continue;
+
+        auto it = given.find( layer );
+        bds.m_ZoneLayerProperties[layer].hatching_offset = it != given.end() ? it->second : std::nullopt;
+    }
+
+    return true;
+}
+
+// boardFormatting: PANEL_SETUP_FORMATTING. {applyToFields, applyToText, applyToShapes,
+// applyToDimensions, applyToBarcodes} are the design settings' m_StyleFP* (the project file's
+// defaults.apply_defaults_to_fp_*), {dashRatio, gapRatio} the board's plot options; a set runs
+// the panel's own steps (SetPlotOptions, the painter's dash and gap ratios, a repaint of the
+// shapes).
+
+json boardFormattingRead( BOARD* aBoard, PROJECT* aProject )
+{
+    BOARD_DESIGN_SETTINGS& bds = aBoard->GetDesignSettings();
+    const PCB_PLOT_PARAMS& plot = aBoard->GetPlotOptions();
+    json                   out = json::object();
+
+    out["applyToFields"] = bds.m_StyleFPFields;
+    out["applyToText"] = bds.m_StyleFPText;
+    out["applyToShapes"] = bds.m_StyleFPShapes;
+    out["applyToDimensions"] = bds.m_StyleFPDimensions;
+    out["applyToBarcodes"] = bds.m_StyleFPBarcodes;
+    out["dashRatio"] = plot.GetDashedLineDashRatio();
+    out["gapRatio"] = plot.GetDashedLineGapRatio();
+    return out;
+}
+
+json boardFormattingGet( PCB_EDIT_FRAME* aFrame )
+{
+    return boardFormattingRead( aFrame->GetBoard(), &aFrame->Prj() );
+}
+
+bool boardFormattingSet( PCB_EDIT_FRAME* aFrame, const json& aValue, bool aDryRun, std::string& aError,
+                         std::string& aMessage, json& aRecord )
+{
+    if( aValue.empty()
+            || !objectOk( aValue, { { "applyToFields", 'b' }, { "applyToText", 'b' }, { "applyToShapes", 'b' },
+                                    { "applyToDimensions", 'b' }, { "applyToBarcodes", 'b' },
+                                    { "dashRatio", 'p' }, { "gapRatio", 'p' } },
+                          false ) )
+    {
+        return false;
+    }
+
+    for( const char* ratio : { "dashRatio", "gapRatio" } )
+    {
+        if( aValue.contains( ratio ) && ( aValue[ratio].get<double>() <= 0.0 || aValue[ratio].get<double>() > 1000.0 ) )
+            return false;
+    }
+
+    if( aDryRun )
+        return true;
+
+    BOARD*                 board = aFrame->GetBoard();
+    BOARD_DESIGN_SETTINGS& bds = board->GetDesignSettings();
+    PCB_PLOT_PARAMS        settings = board->GetPlotOptions();
+
+    if( aValue.contains( "dashRatio" ) )
+        settings.SetDashedLineDashRatio( aValue["dashRatio"].get<double>() );
+
+    if( aValue.contains( "gapRatio" ) )
+        settings.SetDashedLineGapRatio( aValue["gapRatio"].get<double>() );
+
+    board->SetPlotOptions( settings );
+
+    if( aValue.contains( "applyToFields" ) )
+        bds.m_StyleFPFields = aValue["applyToFields"].get<bool>();
+
+    if( aValue.contains( "applyToText" ) )
+        bds.m_StyleFPText = aValue["applyToText"].get<bool>();
+
+    if( aValue.contains( "applyToShapes" ) )
+        bds.m_StyleFPShapes = aValue["applyToShapes"].get<bool>();
+
+    if( aValue.contains( "applyToDimensions" ) )
+        bds.m_StyleFPDimensions = aValue["applyToDimensions"].get<bool>();
+
+    if( aValue.contains( "applyToBarcodes" ) )
+        bds.m_StyleFPBarcodes = aValue["applyToBarcodes"].get<bool>();
+
+    KIGFX::PCB_VIEW* view = aFrame->GetCanvas()->GetView();
+
+    view->GetPainter()->GetSettings()->SetDashLengthRatio( settings.GetDashedLineDashRatio() );
+    view->GetPainter()->GetSettings()->SetGapLengthRatio( settings.GetDashedLineGapRatio() );
+
+    view->UpdateAllItemsConditionally( KIGFX::REPAINT,
+            []( KIGFX::VIEW_ITEM* aItem ) -> bool
+            {
+                const EDA_ITEM* item = dynamic_cast<const EDA_ITEM*>( aItem );
+                return item && item->Type() == PCB_SHAPE_T;
+            } );
+
+    aFrame->GetCanvas()->Refresh();
+    return true;
+}
+
+// tuningPatterns: PANEL_SETUP_TUNING_PATTERNS, the design settings' tuning_pattern_settings.
+// Three objects (single_track_defaults, diff_pair_defaults, diff_pair_skew_defaults), each
+// min_amplitude, max_amplitude, spacing (mm), corner_style (0 chamfer, 1 round),
+// corner_radius_percentage, single_sided; a set merges into each named object.
+
+CC_PCB_JSON_SECTION tuningPatternsSection( BOARD* aBoard )
+{
+    CC_PCB_JSON_SECTION section;
+    section.settings = &aBoard->GetDesignSettings();
+    section.keys = { { "single_track_defaults", "/tuning_pattern_settings/single_track_defaults" },
+                     { "diff_pair_defaults", "/tuning_pattern_settings/diff_pair_defaults" },
+                     { "diff_pair_skew_defaults", "/tuning_pattern_settings/diff_pair_skew_defaults" } };
+    return section;
+}
+
+json tuningPatternsRead( BOARD* aBoard, PROJECT* aProject )
+{
+    return ccPcbJsonGet( tuningPatternsSection( aBoard ) );
+}
+
+json tuningPatternsGet( PCB_EDIT_FRAME* aFrame )
+{
+    return tuningPatternsRead( aFrame->GetBoard(), &aFrame->Prj() );
+}
+
+bool tuningPatternsSet( PCB_EDIT_FRAME* aFrame, const json& aValue, bool aDryRun, std::string& aError,
+                        std::string& aMessage, json& aRecord )
+{
+    if( !aValue.is_object() )
+        return false;
+
+    for( const auto& [key, v] : aValue.items() )
+    {
+        if( v.empty()
+                || !objectOk( v, { { "min_amplitude", 'p' }, { "max_amplitude", 'p' }, { "spacing", 'p' },
+                                   { "corner_style", 'i' }, { "corner_radius_percentage", 'i' },
+                                   { "single_sided", 'b' } },
+                              false ) )
+        {
+            return false;
+        }
+
+        for( const char* length : { "min_amplitude", "max_amplitude", "spacing" } )
+        {
+            if( v.contains( length ) && v[length].get<double>() > 1000.0 )
+                return false;
+        }
+
+        if( v.contains( "corner_style" ) && v["corner_style"] != 0 && v["corner_style"] != 1 )
+            return false;
+
+        if( v.contains( "corner_radius_percentage" )
+                && ( v["corner_radius_percentage"].get<long long>() < 0
+                     || v["corner_radius_percentage"].get<long long>() > 100 ) )
+        {
+            return false;
+        }
+    }
+
+    return jsonSectionSet( tuningPatternsSection( aFrame->GetBoard() ), aValue, aDryRun );
+}
+
+// componentClasses: PANEL_ASSIGN_COMPONENT_CLASSES, the project file's
+// component_class_settings. {"sheet_component_classes.enabled": bool, "assignments": [{
+// component_class, conditions_operator ("ALL" | "ANY"), conditions: {TYPE[-n]: {primary?,
+// secondary?}}}]}, TYPE one of KiCad's seven condition names. assignments replaces the list.
+// Board Setup's OK steps run SynchronizeComponentClasses.
+
+bool componentClassAssignmentsOk( const json& aValue )
+{
+    static const std::set<std::string> types = { "REFERENCE", "FOOTPRINT",       "SIDE",      "ROTATION",
+                                                  "FOOTPRINT_FIELD", "CUSTOM", "SHEET_NAME" };
+
+    if( !aValue.is_array() || aValue.size() > 4096 )
+        return false;
+
+    for( const json& assignment : aValue )
+    {
+        if( !objectOk( assignment, { { "component_class", 's' }, { "conditions_operator", 's' },
+                                     { "conditions", 'o' } },
+                       true ) )
+        {
+            return false;
+        }
+
+        const std::string op = assignment["conditions_operator"].get<std::string>();
+
+        if( assignment["component_class"].get<std::string>().empty() || ( op != "ALL" && op != "ANY" ) )
+            return false;
+
+        for( const auto& [name, condition] : assignment["conditions"].items() )
+        {
+            if( !types.count( name.substr( 0, name.find( '-' ) ) )
+                    || !objectOk( condition, { { "primary", 's' }, { "secondary", 's' } }, false ) )
+            {
+                return false;
+            }
+        }
+    }
+
+    return true;
+}
+
+std::optional<CC_PCB_JSON_SECTION> componentClassesSection( PROJECT* aProject )
+{
+    if( !aProject )
+        return std::nullopt;
+
+    std::shared_ptr<COMPONENT_CLASS_SETTINGS>& settings = aProject->GetProjectFile().ComponentClassSettings();
+
+    if( !settings )
+        return std::nullopt;
+
+    CC_PCB_JSON_SECTION section;
+    section.settings = settings.get();
+    section.keys = { { "sheet_component_classes.enabled", "/sheet_component_classes/enabled" },
+                     { "assignments", "/assignments" } };
+    return section;
+}
+
+json componentClassesRead( BOARD* aBoard, PROJECT* aProject )
+{
+    std::optional<CC_PCB_JSON_SECTION> section = componentClassesSection( aProject );
+    return section ? ccPcbJsonGet( *section ) : json();
+}
+
+json componentClassesGet( PCB_EDIT_FRAME* aFrame )
+{
+    return componentClassesRead( aFrame->GetBoard(), &aFrame->Prj() );
+}
+
+bool componentClassesSet( PCB_EDIT_FRAME* aFrame, const json& aValue, bool aDryRun, std::string& aError,
+                          std::string& aMessage, json& aRecord )
+{
+    std::optional<CC_PCB_JSON_SECTION> section = componentClassesSection( &aFrame->Prj() );
+
+    if( !section || aValue.empty()
+            || !objectOk( aValue, { { "sheet_component_classes.enabled", 'b' }, { "assignments", 'a' } }, false )
+            || ( aValue.contains( "assignments" ) && !componentClassAssignmentsOk( aValue["assignments"] ) ) )
+    {
+        return false;
+    }
+
+    return jsonSectionSet( *section, aValue, aDryRun );
+}
+
+// tuningProfiles: PANEL_SETUP_TUNING_PROFILES, the project file's tuning_profiles.
+// {tuning_profiles_impedance_geometric: [{profile_name, type (0 single, 1 differential),
+// target_impedance, enable_time_domain_tuning, via_prop_delay, layer_entries: [{signal_layer,
+// top_reference_layer, bottom_reference_layer, width, diff_pair_gap, delay}], via_overrides:
+// [{signal_layer_from, signal_layer_to, via_layer_from, via_layer_to, delay}]}]}: KiCad's own
+// JSON (lengths and delays in KiCad's internal units, as the project file holds them), the
+// list replaced whole. A profile's name is unique and not empty, a layer once per profile
+// (the panel's ValidateProfile). Board Setup's OK steps run SynchronizeTuningProfileProperties.
+
+bool tuningProfileListOk( const json& aValue )
+{
+    auto layerOk = []( const json& aName ) -> bool
+    {
+        if( !aName.is_string() )
+            return false;
+
+        wxString name = wxString::FromUTF8( aName.get<std::string>() );
+        return LSET::NameToLayer( name ) >= 0;
+    };
+
+    if( !aValue.is_array() || aValue.size() > 256 )
+        return false;
+
+    std::set<std::string> names;
+
+    for( const json& profile : aValue )
+    {
+        if( !objectOk( profile, { { "profile_name", 's' }, { "type", 'i' }, { "target_impedance", 'p' },
+                                  { "enable_time_domain_tuning", 'b' }, { "via_prop_delay", 'i' },
+                                  { "layer_entries", 'a' }, { "via_overrides", 'a' } },
+                       true ) )
+        {
+            return false;
+        }
+
+        const std::string name = profile["profile_name"].get<std::string>();
+
+        if( name.empty() || !names.insert( name ).second || ( profile["type"] != 0 && profile["type"] != 1 )
+                || profile["layer_entries"].size() > PCB_LAYER_ID_COUNT || profile["via_overrides"].size() > 4096 )
+        {
+            return false;
+        }
+
+        std::set<std::string> signals;
+
+        for( const json& entry : profile["layer_entries"] )
+        {
+            if( !objectOk( entry, { { "signal_layer", 's' }, { "top_reference_layer", 's' },
+                                    { "bottom_reference_layer", 's' }, { "width", 'i' },
+                                    { "diff_pair_gap", 'i' }, { "delay", 'i' } },
+                           true )
+                    || !layerOk( entry["signal_layer"] ) || !layerOk( entry["top_reference_layer"] )
+                    || !layerOk( entry["bottom_reference_layer"] )
+                    || !signals.insert( entry["signal_layer"].get<std::string>() ).second )
+            {
+                return false;
+            }
+        }
+
+        for( const json& entry : profile["via_overrides"] )
+        {
+            if( !objectOk( entry, { { "signal_layer_from", 's' }, { "signal_layer_to", 's' },
+                                    { "via_layer_from", 's' }, { "via_layer_to", 's' }, { "delay", 'i' } },
+                           true )
+                    || !layerOk( entry["signal_layer_from"] ) || !layerOk( entry["signal_layer_to"] )
+                    || !layerOk( entry["via_layer_from"] ) || !layerOk( entry["via_layer_to"] ) )
+            {
+                return false;
+            }
+        }
+    }
+
+    return true;
+}
+
+std::optional<CC_PCB_JSON_SECTION> tuningProfilesSection( PROJECT* aProject )
+{
+    if( !aProject )
+        return std::nullopt;
+
+    std::shared_ptr<TUNING_PROFILES>& settings = aProject->GetProjectFile().TuningProfileParameters();
+
+    if( !settings )
+        return std::nullopt;
+
+    CC_PCB_JSON_SECTION section;
+    section.settings = settings.get();
+    section.keys = { { "tuning_profiles_impedance_geometric", "/tuning_profiles_impedance_geometric" } };
+    return section;
+}
+
+json tuningProfilesRead( BOARD* aBoard, PROJECT* aProject )
+{
+    std::optional<CC_PCB_JSON_SECTION> section = tuningProfilesSection( aProject );
+    return section ? ccPcbJsonGet( *section ) : json();
+}
+
+json tuningProfilesGet( PCB_EDIT_FRAME* aFrame )
+{
+    return tuningProfilesRead( aFrame->GetBoard(), &aFrame->Prj() );
+}
+
+bool tuningProfilesSet( PCB_EDIT_FRAME* aFrame, const json& aValue, bool aDryRun, std::string& aError,
+                        std::string& aMessage, json& aRecord )
+{
+    std::optional<CC_PCB_JSON_SECTION> section = tuningProfilesSection( &aFrame->Prj() );
+
+    if( !section || !aValue.is_object() || aValue.size() != 1
+            || !aValue.contains( "tuning_profiles_impedance_geometric" )
+            || !tuningProfileListOk( aValue["tuning_profiles_impedance_geometric"] ) )
+    {
+        return false;
+    }
+
+    return jsonSectionSet( *section, aValue, aDryRun );
+}
 } // namespace pcb
 
 const bool kRouter = ccRegisterPcbSection( { "router", "pcb", &pcb::routerGet, &pcb::routerSet } );
@@ -760,8 +1365,130 @@ const bool kPcbEditing = ccRegisterPcbSection( { "pcbEditing", "pcb", &pcb::pcbE
 const bool kMouse = ccRegisterPcbSection( { "mouse", "pcb", &pcb::mouseGet, &pcb::mouseSet, false } );
 const bool kStackupLayers = ccRegisterPcbSection( { "stackupLayers", "pcb", &pcb::stackupLayersGet,
                                                     &pcb::stackupLayersSet } );
+const bool kZoneDefaults = ccRegisterPcbSection( { "zoneDefaults", "pcb", &pcb::zoneDefaultsGet,
+                                                   &pcb::zoneDefaultsSet } );
+const bool kZoneHatchOffsets = ccRegisterPcbSection( { "zoneHatchOffsets", "pcb", &pcb::zoneHatchOffsetsGet,
+                                                       &pcb::zoneHatchOffsetsSet } );
+const bool kBoardFormatting = ccRegisterPcbSection( { "boardFormatting", "pcb", &pcb::boardFormattingGet,
+                                                      &pcb::boardFormattingSet } );
+const bool kTuningPatterns = ccRegisterPcbSection( { "tuningPatterns", "pcb", &pcb::tuningPatternsGet,
+                                                     &pcb::tuningPatternsSet } );
+const bool kComponentClasses = ccRegisterPcbSection( { "componentClasses", "pcb", &pcb::componentClassesGet,
+                                                       &pcb::componentClassesSet } );
+const bool kTuningProfiles = ccRegisterPcbSection( { "tuningProfiles", "pcb", &pcb::tuningProfilesGet,
+                                                     &pcb::tuningProfilesSet } );
+
+#ifdef KICAD_MERGED_EMBIND
+// ── kicadTuningSolve (m7-e, 5.3; merged image only): KiCad's Tuning Profiles panel's "work out"
+// for one row, through ccTuningSolve (kicad pcbnew/dialogs/panel_setup_tuning_profile_info.cpp,
+// K-TSOLVE, the panel calling the same function). {type: "single" | "differential", impedance
+// (ohms, a pair's differential impedance), signalLayer, topRef?, bottomRef? (canonical layer
+// names the board enables; a microstrip on F.Cu reads bottomRef, on B.Cu topRef, a stripline
+// both), solveFor: "width" | "gap" | "delay", width?: mm, gap?: mm} answers {width: mm | null,
+// gap: mm | null, delay: ps/cm | null, problem: "" | KiCad's own message}. A gap is a pair's
+// answer only. A read: nothing changes, no record. "" for any other shape, no frame or an open
+// in flight.
+
+std::string tuningSolve( std::string aArgsJson )
+{
+    PCB_EDIT_FRAME* fr = pcbFrame();
+
+    if( !fr || !fr->GetBoard() || pcbjam_open::busy() )
+        return "";
+
+    try
+    {
+        json args = json::parse( aArgsJson, nullptr, /*allow_exceptions*/ false );
+
+        if( args.is_discarded()
+                || !pcb::objectOk( args, { { "type", 's' }, { "impedance", 'p' }, { "signalLayer", 's' },
+                                           { "topRef", 's' }, { "bottomRef", 's' }, { "solveFor", 's' },
+                                           { "width", 'p' }, { "gap", 'p' } },
+                                   false )
+                || !args.contains( "type" ) || !args.contains( "impedance" ) || !args.contains( "signalLayer" )
+                || !args.contains( "solveFor" ) )
+        {
+            return "";
+        }
+
+        const std::string type = args["type"].get<std::string>();
+        const std::string solve = args["solveFor"].get<std::string>();
+        const int         solveFor = solve == "width" ? 0 : solve == "gap" ? 1 : solve == "delay" ? 2 : -1;
+        const bool        differential = type == "differential";
+
+        if( ( type != "single" && !differential ) || solveFor < 0 || ( solveFor == 1 && !differential )
+                || args["impedance"].get<double>() > 1e6 )
+        {
+            return "";
+        }
+
+        BOARD* board = fr->GetBoard();
+
+        auto layerArg = [&]( const char* aKey ) -> std::optional<PCB_LAYER_ID>
+        {
+            if( !args.contains( aKey ) )
+                return UNDEFINED_LAYER;
+
+            const PCB_LAYER_ID layer = ccLayerByName( board, args[aKey].get<std::string>() );
+
+            if( layer == UNDEFINED_LAYER || !IsCopperLayer( layer ) )
+                return std::nullopt;
+
+            return layer;
+        };
+
+        std::optional<PCB_LAYER_ID> signal = layerArg( "signalLayer" );
+        std::optional<PCB_LAYER_ID> topRef = layerArg( "topRef" );
+        std::optional<PCB_LAYER_ID> bottomRef = layerArg( "bottomRef" );
+
+        if( !signal || *signal == UNDEFINED_LAYER || !topRef || !bottomRef )
+            return "";
+
+        auto lengthArg = [&]( const char* aKey ) -> int
+        {
+            if( !args.contains( aKey ) )
+                return 0;
+
+            return pcbIUScale.mmToIU( std::min( args[aKey].get<double>(), 1000.0 ) );
+        };
+
+        int      width = lengthArg( "width" );
+        int      gap = differential ? lengthArg( "gap" ) : 0;
+        int      delay = 0;
+        wxString problem;
+        json     out = json::object();
+
+        if( ccTuningSolve( board, pcbIUScale, differential, args["impedance"].get<double>(), *signal, *topRef,
+                           *bottomRef, solveFor, width, gap, delay, problem ) )
+        {
+            out["width"] = width > 0 ? json( ccMm( width ) ) : json();
+            out["gap"] = differential && gap > 0 ? json( ccMm( gap ) ) : json();
+            out["delay"] = std::round( EDA_UNIT_UTILS::UI::ToUserUnit( pcbIUScale, EDA_UNITS::PS_PER_CM, delay )
+                                       * 10000.0 )
+                           / 10000.0;
+            out["problem"] = "";
+        }
+        else
+        {
+            out["width"] = nullptr;
+            out["gap"] = nullptr;
+            out["delay"] = nullptr;
+            out["problem"] = problem.IsEmpty() ? std::string( "No answer for these values." ) : toUtf8( problem );
+        }
+
+        return out.dump( -1, ' ', false, json::error_handler_t::replace );
+    }
+    catch( ... )
+    {
+        return "";
+    }
+}
+#endif
 } // namespace cc_e12
 
 EMSCRIPTEN_BINDINGS( cc_e12_pcb )
 {
+#ifdef KICAD_MERGED_EMBIND
+    function( "kicadTuningSolve", &cc_e12::tuningSolve );
+#endif
 }
