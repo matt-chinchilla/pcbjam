@@ -122,10 +122,49 @@ bool designBlockPlace( std::string aArgsJson )
     return false;
 }
 
+// st-paste-e (K-PASTE). kicadPasteSpecial( {"mode": "unique" | "keep" | "remove",
+// "clearNets": bool} ), read whole (exactly those two keys) before anything is queued; clearNets
+// counts on the board only. The halves (cc_e7_pcb.inc, cc_e7_sch.inc) arm the choices and start
+// KiCad's Paste Special on the apply coroutine.
+bool pastePcb( int aMode, bool aClearNets );
+bool pasteSch( int aMode, bool aClearNets );
+
+bool pasteSpecial( std::string aArgsJson )
+{
+    nlohmann::json args = nlohmann::json::parse( aArgsJson, nullptr, false );
+
+    if( args.is_discarded() || !args.is_object() || args.size() != 2 )
+        return false;
+
+    auto mode = args.find( "mode" );
+    auto clearNets = args.find( "clearNets" );
+
+    if( mode == args.end() || !mode->is_string() || clearNets == args.end()
+            || !clearNets->is_boolean() )
+    {
+        return false;
+    }
+
+    const std::string m = mode->get<std::string>();
+    const int         code = m == "unique" ? 0 : m == "keep" ? 1 : m == "remove" ? 2 : -1;
+
+    if( code < 0 )
+        return false;
+
+    if( pcbEditorActive() )
+        return pastePcb( code, clearNets->get<bool>() );
+
+    if( schEditorActive() )
+        return pasteSch( code, clearNets->get<bool>() );
+
+    return false;
+}
+
 } // namespace cc_e7
 
 EMSCRIPTEN_BINDINGS( cc_e7_dispatch )
 {
+    emscripten::function( "kicadPasteSpecial", &cc_e7::pasteSpecial );
     emscripten::function( "kicadDesignBlockPlace", &cc_e7::designBlockPlace );
     emscripten::function( "kicadDesignBlockSave", &cc_e7::designBlockSave );
     emscripten::function( "kicadLibsRemoveEntry", &cc_e7::libsRemoveEntry );

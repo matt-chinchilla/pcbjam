@@ -10,7 +10,10 @@
 // translation unit holds every lane's face) and every name registers in the block below,
 // never in a shared block. The rules: BUILD-NOTES-run15.md.
 
+#include <cc_paste_special.h>
+
 #ifdef KICAD_MERGED_EMBIND
+#include <cc_host_block_layout.h>
 #include <cc_host_design_block.h>
 #include <cc_pcb_design_block_write.h>
 #include <design_block_io.h>
@@ -19,6 +22,32 @@
 
 namespace cc_e7
 {
+
+// st-paste-e (K-PASTE), the board half of kicadPasteSpecial: the choices armed for ONE Paste
+// Special (cc_paste_special.h) and KiCad's paste started on the apply coroutine: the clipboard's
+// items hang off the pointer with the chosen annotation and Clear Nets (a board clip only) and the reader's press commits them
+// as one undo step, with no DIALOG_PASTE_SPECIAL. The slot is emptied after the action, so a
+// paste that never reached the dialog's place leaves nothing armed for a later one.
+bool pastePcb( int aMode, bool aClearNets )
+{
+    PCB_EDIT_FRAME* fr = pcbFrame();
+
+    if( !fr || pcbjam_open::busy() )
+        return false;
+
+    pcbjam_collab::runOnCoroutine( fr, [aMode, aClearNets]() {
+        PCB_EDIT_FRAME* f = pcbFrame();
+
+        if( !f )
+            return;
+
+        ccPasteSpecialSlot() = CC_PASTE_SPECIAL{ aMode, aClearNets };
+        f->GetToolManager()->RunAction( ACTIONS::pasteSpecial );
+        ccPasteSpecialSlot().reset();
+    } );
+
+    return true;
+}
 
 #ifdef KICAD_MERGED_EMBIND
 
@@ -255,10 +284,128 @@ bool blockPlacePcb( std::string aArgsJson )
     return true;
 }
 
+// e-block-layout (DB3, K-B2). kicadDesignBlockApplyLayout( {"run", "dir", "uuids"} ), the board
+// frame only (merged image only): exactly run (an integer >= 0), dir (a run folder under
+// /tmp/cc-blocklayout/) and uuids (1 to 256 lower case uuids, each a group of the board, no
+// repeats); false for anything else, no board or an open in flight. On the apply coroutine those
+// groups are selected (as KiCad's Update PCB selects the groups it lays out) and KiCad's Apply
+// Design Block Layout runs with the host reporter set: ONE commit over every group it lays out,
+// no message box, no progress window, no info bar. Then the selection is cleared and
+// <dir>/.cc-block-layout.json is written last: {"applied": n, "failures": [{"uuid", "reason"}],
+// "lines": [KiCad's info bar lines]}. A selected group with no design block link counts in
+// neither (the tool skips it; the host offers the press only on a linked group).
+bool blockApplyLayout( std::string aArgsJson )
+{
+    PCB_EDIT_FRAME* fr = pcbFrame();
+
+    if( !fr || !fr->GetBoard() || pcbjam_open::busy() )
+        return false;
+
+    json args = json::parse( aArgsJson, nullptr, /*allow_exceptions*/ false );
+
+    if( args.is_discarded() || !args.is_object() || args.size() != 3 )
+        return false;
+
+    auto run = args.find( "run" );
+    auto dir = args.find( "dir" );
+    auto uuids = args.find( "uuids" );
+
+    if( run == args.end() || !run->is_number_integer() || run->get<long long>() < 0
+            || dir == args.end() || !dir->is_string() || uuids == args.end()
+            || !uuids->is_array() || uuids->empty() || uuids->size() > 256 )
+    {
+        return false;
+    }
+
+    const std::string d = dir->get<std::string>();
+
+    if( !cc_output::IsRunDir( d, "/tmp/cc-blocklayout/" ) )
+        return false;
+
+    std::vector<KIID>     wanted;
+    std::set<std::string> seen;
+
+    for( const json& u : *uuids )
+    {
+        if( !u.is_string() || !ccIsLowerUuid( u.get<std::string>() )
+                || !seen.insert( u.get<std::string>() ).second )
+        {
+            return false;
+        }
+
+        const KIID id( u.get<std::string>() );
+        bool       found = false;
+
+        for( PCB_GROUP* g : fr->GetBoard()->Groups() )
+            found = found || g->m_Uuid == id;
+
+        if( !found )
+            return false;
+
+        wanted.push_back( id );
+    }
+
+    cc_output::EnsureDir( d );
+
+    pcbjam_collab::runOnCoroutine( fr, [d, wanted]() {
+        CC_HOST_BLOCK_LAYOUT_REPORT report;
+        PCB_EDIT_FRAME*             f = pcbFrame();
+
+        if( f && f->GetBoard() )
+        {
+            TOOL_MANAGER*       toolMgr = f->GetToolManager();
+            PCB_SELECTION_TOOL* selTool = toolMgr->GetTool<PCB_SELECTION_TOOL>();
+
+            toolMgr->RunAction( ACTIONS::selectionClear );
+
+            for( PCB_GROUP* g : f->GetBoard()->Groups() )
+            {
+                if( std::find( wanted.begin(), wanted.end(), g->m_Uuid ) != wanted.end() )
+                    selTool->select( g );
+            }
+
+            {
+                CC_HOST_BLOCK_LAYOUT_SCOPE scope( &report );
+                toolMgr->RunAction( PCB_ACTIONS::applyDesignBlockLayout );
+            }
+
+            toolMgr->RunAction( ACTIONS::selectionClear );
+        }
+        else
+        {
+            report.lines.push_back( wxS( "The board editor is gone." ) );
+        }
+
+        json failures = json::array();
+
+        for( const CC_HOST_BLOCK_LAYOUT_FAILURE& failure : report.failures )
+        {
+            failures.push_back( { { "uuid", std::string( failure.uuid.AsString().utf8_str() ) },
+                                  { "reason", std::string( failure.reason.utf8_str() ) } } );
+        }
+
+        json lines = json::array();
+
+        for( const wxString& line : report.lines )
+            lines.push_back( std::string( line.utf8_str() ) );
+
+        json record = json::object();
+        record["applied"] = report.applied;
+        record["failures"] = failures;
+        record["lines"] = lines;
+        cc_output::WriteRecord( d, ".cc-block-layout.json", record );
+    } );
+
+    return true;
+}
+
 #endif // KICAD_MERGED_EMBIND
 
 } // namespace cc_e7
 
 EMSCRIPTEN_BINDINGS( cc_e7_pcb )
 {
+#ifdef KICAD_MERGED_EMBIND
+    emscripten::function( "kicadDesignBlockApplyLayout", &cc_e7::blockApplyLayout );
+#endif
 }

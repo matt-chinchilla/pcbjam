@@ -11,6 +11,7 @@
 // never in a shared block. The rules: BUILD-NOTES-run15.md.
 
 #include <cc_host_design_block.h>
+#include <cc_paste_special.h>
 #include <cc_sch_design_block_write.h>
 #include <design_block_io.h>
 #include <tools/sch_actions.h>
@@ -261,6 +262,33 @@ bool blockPlaceSch( std::string aArgsJson )
 
         // The tool took the block at its start; a tool that did not start leaves none behind.
         ccSetHostDesignBlock( nullptr );
+    } );
+
+    return true;
+}
+
+
+// st-paste-e (K-PASTE), the schematic half of kicadPasteSpecial: the choices armed for ONE Paste
+// Special (cc_paste_special.h) and KiCad's paste started on the apply coroutine: the clipboard's
+// items hang off the pointer with the chosen annotation and the reader's press commits them
+// as one undo step, with no DIALOG_PASTE_SPECIAL. The slot is emptied after the action, so a
+// paste that never reached the dialog's place leaves nothing armed for a later one.
+bool pasteSch( int aMode, bool aClearNets )
+{
+    SCH_EDIT_FRAME* fr = schFrame();
+
+    if( !fr || pcbjam_open::busy() )
+        return false;
+
+    pcbjam_collab::runOnCoroutine( fr, [aMode, aClearNets]() {
+        SCH_EDIT_FRAME* f = schFrame();
+
+        if( !f )
+            return;
+
+        ccPasteSpecialSlot() = CC_PASTE_SPECIAL{ aMode, aClearNets };
+        f->GetToolManager()->RunAction( ACTIONS::pasteSpecial );
+        ccPasteSpecialSlot().reset();
     } );
 
     return true;
