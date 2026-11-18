@@ -13,8 +13,26 @@
 
 namespace cc_e12
 {
+// kicadSettingsRead (m8-e): the halves are defined in cc_e12_pcb.inc and cc_e12_sch.inc.
+bool settingsReadPcb( std::string aArgsJson );
+bool settingsReadSch( std::string aArgsJson );
+
+// {run, dir: "/tmp/cc-settings-read/<n>", project, board?, sections} from whichever editor is
+// live, as kicadSettingsGet is dispatched; false in any other frame (the footprint, symbol and
+// drawing sheet editors read false on both probes).
+bool settingsRead( std::string aArgsJson )
+{
+    if( pcbEditorActive() )
+        return settingsReadPcb( aArgsJson );
+
+    if( schEditorActive() )
+        return settingsReadSch( aArgsJson );
+
+    return false;
+}
 } // namespace cc_e12
 
 EMSCRIPTEN_BINDINGS( cc_e12_dispatch )
 {
+    function( "kicadSettingsRead", &cc_e12::settingsRead );
 }
