@@ -160,3 +160,15 @@ syntax-check: 0 failed
 - ds-e2: committed and green, `e6.unit.ds-e2` written. K-DS2 only if build G's gate 0 item 4 refuses the `(uuid ...)` tokens.
 - sy2-e: held (RULINGS 5): no diagnosis under `cc-wave2/reports` or `cc-wave2/plan` names an engine file (sy2-i's diagnosis not written).
 - Handover (`e6.done`) waits on fp-e8's include line: then merge `run15/main` in both worktrees, `all`, the export check, `e6.done`.
+- Syntax check `all` re-run 2026-11-18 after build G ended (run15/main 48e664e merged, `gate.sh scripts/kicad/syntax-check-run15.sh --kicad /home/matthew/cc-engine-wt/e6/kicad all`):
+
+```
+PASS pcbnew         pcbnew_embind.cpp subdir=pcbnew -DKICAD_MERGED_EMBIND (11207 ms)
+FAIL eeschema       eeschema_embind.cpp subdir=eeschema -DKICAD_MERGED_EMBIND   (dxf_import_plugin.h:32 'dl_creationadapter.h' file not found)
+PASS symedit        symedit_embind.cpp subdir=eeschema  (6945 ms)
+FAIL fpedit         fpedit_embind.cpp subdir=pcbnew   (the same)
+PASS dsedit         dsedit_embind.cpp subdir=pagelayout_editor  (4993 ms)
+PASS kicad_editor   kicad_editor_embind.cpp subdir=common  (4621 ms)
+PASS occ            pcbnew_embind.cpp subdir=pcbnew (11118 ms)
+syntax-check: 2 failed
+```
