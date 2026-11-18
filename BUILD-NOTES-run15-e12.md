@@ -241,6 +241,101 @@ Export check: `scripts/kicad/check-run15-exports.sh --since run15/main --kicad
 /home/matthew/cc-engine-wt/e12/kicad --kicad-since run15/main`: `214 names registered in the
 merged image (207 kicad names), 69 of 110 run 15 names, 0 failures`.
 
+## m8-e: kicadSettingsRead
+
+Commits: pcbjam 72e6293 (`cc_rules_pcb.inc`, `cc_rules_sch.inc`, `cc_e12_pcb.inc`,
+`cc_e12_sch.inc`, `cc_e12_dispatch.inc`) and 5138ecf (the two rules incs' dated lines); no kicad
+file. Then `git merge run15/main` (pcbjam b6d7eb7; kicad already at run15/main).
+
+**Registry widened (guide section 2):** `CC_PCB_SECTION` gains, at its END, `std::function<json(
+BOARD* aBoard, PROJECT* aProject )> read = nullptr`; `CC_SCH_SECTION` gains, at its END,
+`std::function<json( PROJECT* aProject )> read = nullptr`. Every registration written before keeps
+its meaning; a section with no reader never travels (it is listed in `missing`). This lane's m7
+sections pass their readers (`zoneDefaults`, `zoneHatchOffsets`, `boardFormatting`,
+`tuningPatterns`, `componentClasses`, `tuningProfiles`; `annotation`, `bomPresets`,
+`componentClasses` in the schematic). ST's preference and origin sections have none (they never
+travel, 6.1).
+
+**Readers refactor, behavior of kicadSettingsGet unchanged:** `ccPcbJsonSection( BOARD*, PROJECT*,
+name )` and `ccPcbSettingsRead( BOARD*, PROJECT*, rulesPath, name )` hold the built-in bodies
+(project sections, textVariables, layers, stackup, finish, customRules), the frame's
+`ccPcbSettingsGet` keeps variants and page and calls the reader for every other built-in, a
+registered section's `get` as before. With no board only the project's sections answer
+(netClasses, textVariables, and a registered reader given a null board: componentClasses,
+tuningProfiles). The schematic twin: `ccSchJsonSection( PROJECT*, name )`, `ccSchSettingsRead(
+PROJECT*, name )` (project sections, textVariables, busAliases from the project file's aliases as
+KiCad's Import Settings reads them); the frame's get keeps variants, busAliases (the live
+schematic's) and page.
+
+**Export** `kicadSettingsRead( std::string ) -> bool`, registered in `cc_e12_dispatch.inc`, block
+`cc_e12_dispatch` (merged image; the dispatcher picks `cc_e12::settingsReadPcb` in
+`cc_e12_pcb.inc` on `pcbEditorActive()`, `cc_e12::settingsReadSch` in `cc_e12_sch.inc` on
+`schEditorActive()`, false in any other frame). Args closed: `{run, dir: "/tmp/cc-settings-read/<n>",
+project: "<name>.kicad_pro", board?: "<name>.kicad_pcb", sections: [1 to 64 unique names]}`, plain
+file names that exist in `dir`; false for any other shape, no frame or an open in flight. Queued
+on the apply coroutine:
+- board frame: `SETTINGS_MANAGER::LoadProject( path, false )` (KiCad's own), the board by
+  `PCB_IO_MGR::FindPlugin( KICAD_SEXP )->LoadBoard`, `SetProject` as `onAuxiliaryAction` does;
+  each name read by `ccPcbSettingsRead` (customRules from `<board>.kicad_dru` beside the board,
+  `missing` when that file is not there); `ClearProject`, the board deleted, the project
+  unloaded without a save.
+- schematic frame: the project loaded the same way; its `ERC_SETTINGS` and `SCHEMATIC_SETTINGS`
+  made and `LoadFromFile()`d exactly as `SCHEMATIC::SetProject` makes them, read by
+  `ccSchSettingsRead`, then deleted (only what this read made), the project unloaded. KiCad's own
+  `onAuxiliaryAction` builds a whole `SCHEMATIC` here; its destructor clears the static
+  `SCHEMATIC::m_IsSchematicExists` and unregisters every `SCH_FIELD` listener, the open
+  schematic's too, so the engine does not build one.
+- A name the frame does not list, a section with no reader, or a board section with no board is
+  `missing`. Record `settings-read.json` `{sections: {name: value}, missing: [names]}`, then
+  `.cc-settings-read.json` `{error, message}` last: error "" on a read, `unreadable` when KiCad
+  could not load the project or the board (message: KiCad's first line with the run folder taken
+  out, at most 512 characters; sections empty), `island_error` with no frame. Nothing of the open
+  design changes; no undo step.
+
+**What the build train must probe** (fixtures `settings-to/` open, `settings-from/` staged; m8-i):
+1. Board frame: stage settings-from's `.kicad_pro`, `.kicad_pcb`, `.kicad_dru` under
+   `/tmp/cc-settings-read/1/`; `kicadSettingsRead` with every board section of 6.1 (`layers`,
+   `stackup`, `finish`, `zoneHatchOffsets`, `textDefaults`, `zoneDefaults`, `boardFormatting`,
+   `constraints`, `predefinedSizes`, `teardrops`, `tuningPatterns`, `netClasses`,
+   `componentClasses`, `tuningProfiles`, `customRules`, `checkSeverities`) answers true; the
+   record lists netClasses with HV, layers with copperCount 6, customRules with the fixture's
+   rule text; `missing` empty; `.cc-settings-read.json` error "". Then `kicadSettingsGet(
+   "netClasses")` of the open design still lacks HV, its undo depth unchanged, the board not
+   modified. Failure: the open design changed (the reader read the frame's board), or the
+   record never lands (a throw on the coroutine).
+2. The same with no `.kicad_dru` staged: `customRules` is in `missing`.
+3. No board in the args: `netClasses`, `componentClasses`, `tuningProfiles`, `textVariables`
+   answer; `layers` and the other board sections are in `missing`.
+4. A `.kicad_pcb` that is not a board (any text): error `unreadable`, message without
+   `/tmp/cc-settings-read/`; then a second good read still works (the other project was
+   unloaded: `SETTINGS_MANAGER` holds one project again).
+5. Schematic frame: the same staging with `["schFormatting", "annotation", "fieldTemplates",
+   "bomPresets", "ercSeverities", "pinMap", "netClasses", "busAliases", "textVariables",
+   "layers"]`: every name answers but `layers` (missing); `annotation` carries the fixture's
+   values. After it, deleting a wire and a field edit through the properties panel still work
+   (the open schematic's flags and listeners untouched).
+6. A name with a path (`"project": "../x.kicad_pro"`) or a dir outside `/tmp/cc-settings-read/`:
+   false. In the footprint editor frame: false.
+
+Syntax check after the merge (b6d7eb7):
+`/home/matthew/cc-wave2/bin/gate.sh scripts/kicad/syntax-check-run15.sh --kicad /home/matthew/cc-engine-wt/e12/kicad all --kicad-file pcbnew/dialogs/panel_setup_tuning_profile_info.cpp`:
+`PASS pcbnew (16727 ms)`, `PASS eeschema (17184 ms)`, `PASS symedit (8042 ms)`, `PASS fpedit
+(8256 ms)`, `PASS dsedit (1193 ms)`, `PASS kicad_editor (6510 ms)`, `PASS occ (14913 ms)`, `PASS
+kicad pcbnew/dialogs/panel_setup_tuning_profile_info.cpp (8322 ms)`, `syntax-check: 0 failed`.
+Export check (after 5138ecf, which changed comments only):
+`scripts/kicad/check-run15-exports.sh --since run15/main --kicad /home/matthew/cc-engine-wt/e12/kicad --kicad-since run15/main`:
+`215 names registered in the merged image (208 kicad names), 70 of 110 run 15 names, 0 failures`.
+
+## Handover
+
+Every unit of the lane is done: lo-e3s-e, st-routing-e, st-origins-e, st-editprefs-e, m7-e,
+m8-e (each has its status file). Merge-only and merged image facts: `kicadTuningSolve` is merged
+image only (`KICAD_MERGED_EMBIND`); `kicadSettingsRead` is registered in the dispatcher face
+(merged image), its halves compile in every configuration and call nothing of another TU. The one
+KiCad file of the lane, `pcbnew/dialogs/panel_setup_tuning_profile_info.cpp`, has no header
+change (one object recompiles). Nothing to report to E0: no include path, CMake or build script
+line, no new export name.
+
 ## State for the relay (after st-editprefs-e)
 
 Done and committed: lo-e3s-e (3558c9e), st-routing-e (fe4e114), st-origins-e (134c8f1),
