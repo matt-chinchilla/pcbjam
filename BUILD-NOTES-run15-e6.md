@@ -153,10 +153,10 @@ syntax-check: 0 failed
 
 (The two warnings printed are wx's own `log.h` memset and memcpy, in every TU.) Export check (`scripts/kicad/check-run15-exports.sh --since run15/main --kicad /home/matthew/cc-engine-wt/e6/kicad --kicad-since run15/main`): `173 names registered in the merged image (166 kicad names), 28 of 110 run 15 names, 0 failures`.
 
-## Lane state (relay seat 3, 2026-11-18 07:50)
+## Lane state (relay seat 3, 2026-11-18, after the workflow restart)
 
 - ds-e1: done (gate and unit files).
-- fp-e8: committed (pcbjam 9c1570e), still waiting ONLY on E0's `-I${KICAD_DIR}/thirdparty/dxflib_qcad` line in `compile_embind_tu` (not on `run15/main` at 48e664e). Once it lands: `git merge run15/main`, the syntax check `all`, paste the lines in the fp-e8 section, then `e6.unit.fp-e8`.
-- ds-e2: committed and green (above), status `e6.unit.ds-e2` written. K-DS2 only if build G's gate 0 item 4 refuses the `(uuid ...)` tokens. Build G had not run at this writing (no result in E0's notes).
-- sy2-e: held (RULINGS 5): no diagnosis names an engine file.
+- fp-e8: committed (pcbjam 9c1570e), still waiting ONLY on E0's `-I${KICAD_DIR}/thirdparty/dxflib_qcad` line in `compile_embind_tu` (not on `run15/main` at 48e664e, the tip when this seat started). This request lived in these notes only before the restart; it is repeated in this seat's return to E0. Once it lands: `git merge run15/main`, the syntax check `all`, paste the lines in the fp-e8 section, then `e6.unit.fp-e8`, then the handover.
+- ds-e2: committed and green, `e6.unit.ds-e2` written. K-DS2 only if build G's gate 0 item 4 refuses the `(uuid ...)` tokens.
+- sy2-e: held (RULINGS 5): no diagnosis under `cc-wave2/reports` or `cc-wave2/plan` names an engine file (sy2-i's diagnosis not written).
 - Handover (`e6.done`) waits on fp-e8's include line: then merge `run15/main` in both worktrees, `all`, the export check, `e6.done`.
