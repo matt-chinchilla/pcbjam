@@ -54,8 +54,11 @@ WX="$(cd "$WX" && pwd)"
 [ -f "$WX/include/wx/wx.h" ] || die "$WX is not a wxWidgets tree"
 [ ${#TUS[@]} -gt 0 ] || [ ${#KFILES[@]} -gt 0 ] || die "name the TUs (or all) and/or --kicad-file paths"
 
-# Never while a build runs: the recipe's container is up, or the build's pid is alive.
-if [ -n "$(docker ps -q --filter label=com.docker.compose.project=kicad-wasm-cc-engine)" ]; then
+# Never while a build runs: the recipe's container is up, or the build's pid is alive. The
+# recipe's containers are compose's, named kicad-wasm-cc-engine-<service>-...; a syntax check's
+# own docker run of the builder image carries the image's compose label too, under a random
+# name, so the name decides (another author's check is no build).
+if [ -n "$(docker ps -q --filter label=com.docker.compose.project=kicad-wasm-cc-engine --filter name=^kicad-wasm-cc-engine-)" ]; then
   die "an engine build is running (the kicad-wasm-cc-engine container is up); wait for it"
 fi
 for pidfile in "$ENGINE_ROOT"/out/*/build.pid; do
