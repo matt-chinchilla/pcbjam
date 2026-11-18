@@ -15,7 +15,15 @@ Kept by the integrator (E0) on pcbjam `run15/main`. Thirteen author lanes (e1 to
 
 `cc/main` of both engine repositories stays where it is until run 15 is accepted, so the run 14 island (cc23, cc24) still ships from its own commits. The pcbjam gitlink of `kicad` on `run15/main` is 1b214bab (= kicad `run15/main`) until the merge bumps it once.
 
-Seat branches `seat/run15-e1` to `seat/run15-e13` in both repositories and their worktrees under `/home/matthew/cc-engine-wt/` are cut from `run15/main` after the seams are reviewed (not yet).
+Seat branches (cut 2026-11-18 from `run15/main`, pcbjam 2c5a086, kicad 1b214bab): `seat/run15-e1` to `seat/run15-e13` in pcbjam, worktrees `/home/matthew/cc-engine-wt/eN/pcbjam`; `seat/run15-eN` in kicad-source-mirror for the eleven lanes with KiCad files (e1, e2, e3, e6 to e13), worktrees `/home/matthew/cc-engine-wt/eN/kicad`. e4 and e5 have none: they read `/home/matthew/cc-engine/kicad-source-mirror` and syntax check against E0's `/home/matthew/cc-engine-wt/e0-kicad` (kicad `run15/main`). Disk: 51 GB free before, 39 GB after (the eleven kicad worktrees about 1.1 GB each, the pcbjam ones 36 MB).
+
+## The seam repairs after review (commits b8eeea4, 2c5a086)
+
+- `cc_fp_items.h` is included by `pcbnew_embind.cpp` under `KICAD_MERGED_EMBIND` only: a board face call to `cc_fpitems` left outside a merged guard now fails the syntax check's `occ` unit (planted `cc_fpitems::ccItemKind( "pad" )` in `cc_e3_pcb.inc`: `PASS pcbnew`, `FAIL occ` with `use of undeclared identifier 'cc_fpitems'`). Every kind body (`get`, `set`, `add`) takes `aOrigin` and `aBoardFrame` as the two wrappers do; the kind headers hold inline or static functions only, register nothing, and are included by their owner's fpedit inc alone (the board face reaches the kinds through the table).
+- Lease slots: `cc_e7_lease.h` and `cc_e11_lease.h` near the top of `pcbnew_embind.cpp`, `cc_e13_lease.h` near the top of `eeschema_embind.cpp`, above the leased bodies (which sit above the lane incs): a leased body's includes, declarations and inline helpers go there.
+- The dispatcher's frame probes in `kicad_editor_embind.cpp`: `ccActiveFrameType()` (the top `KIWAY_PLAYER`'s `GetFrameType()`, `FRAME_T_COUNT` when none), `fpEditorActive()`, `symEditorActive()`, `dsEditorActive()` (`pcbEditorActive()` and `schEditorActive()` read false in those three frames).
+- `check-run15-exports.sh`: a changed file whose first ten lines carry our notice needs no Modified line; a non-kicad name in a lane file, a registration whose name is not a string literal, an em or en dash added, and a dispatcher face's declared half no file of the lane defines now fail; `#if 0` and `#if 1` are decided. Mutation run (planted, then reverted): a correct `kicadMicrowaveArm` in `cc_e2_pcb.inc` with a duplicate under `#if 0` passes with no Modified line; `ccSneaky`, `function( std::string( "kicadBoardTuningSet" ).c_str(), ...)`, an em dash in a comment and an undefined `comparePcb` declared in `cc_e10_dispatch.inc` each give their FAIL line; defining `comparePcb` in `cc_e10_pcb.inc` clears it.
+- After: `syntax-check-run15.sh --kicad /home/matthew/cc-engine-wt/e0-kicad all` PASS on all seven units, `syntax-check: 0 failed`; `check-run15-exports.sh` `146 names registered in the merged image (139 kicad names), 1 of 110 run 15 names, 0 failures`.
 
 ## The seams (commit 4ed5328)
 
@@ -40,9 +48,41 @@ Measured on `run15/main` (741cf62): `syntax-check-run15.sh --kicad <run15 kicad>
 
 ## How a build is launched, and from where
 
-- One build at a time machine wide (`/home/matthew/cc-engine/out/.build.lock`), launched only by E0, detached, from an island worktree on `w2/base` (it carries `occ_service`): `bash scripts/engine/build.sh cc8`, tree `/home/matthew/cc-engine/tree-cc8`, outputs `/home/matthew/cc-engine/out/cc8/`. Before launching: `check-run15-exports.sh` (with `--join` for the last build), the kicad gitlink on `run15/main` equal to kicad `run15/main`, no syntax check running.
-- **The build script builds `cc/main`, not `run15/main`:** `cc-editor-island/scripts/engine/build.sh` line 60 on `w2/base` (56 on `phase4-selection`), `cc8)      ROOT_REF=cc/main;     KICAD_REF=cc/main;    WX_REF=cc/main; BUILD_DEPS=$FORCE_DEPS ;;`. That is the one line that would need to change for run 15 (its two refs to `run15/main`, wx staying on `cc/main`). Not changed, and `cc/main` not moved: the controller decides. Recommended instead of editing the `cc8` line: a `run15)` case with the same refs, so the tree is `tree-run15` and the outputs `out/run15/` and `out/cc8/` (run 14's served engine) is not deleted by the new run (`build.sh` drops the old outputs of the name it builds).
-- The recipe now runs `kicad_editor,ngspice_service,occ_service`. `occ_service` has never been built in this tree: its first build configures and compiles its own KiCad tree (`build-wasm/kicad-occ_service`, the pcbnew kiface), time not measured. It links `pcbnew_embind.o` compiled WITHOUT `KICAD_MERGED_EMBIND` (the recipe's `EMBIND_APP=pcbnew`): a lane's board face that reaches a definition only the merged image holds must sit under `#ifdef KICAD_MERGED_EMBIND` (the syntax check's `occ` unit compiles that configuration; only the link proves it).
+- **The tree.** Island `w2/base` 98bdfda adds the name `run15` to `scripts/engine/build.sh`: pcbjam `run15/main`, kicad `run15/main`, wx `cc/main`, built in `/home/matthew/cc-engine/tree-cc8` (its clean worktrees moved to those commits, pcbjam on branch `build/run15`; the same container paths, so ccache serves it, and no third source tree on a full disk), outputs in `/home/matthew/cc-engine/out/run15/` (`kicad_editor.js`, `.wasm`, `wx.js`, `wx-dom.js`, `images.tar.gz`, `ngspice_service.{js,wasm}`, `occ_service.{js,wasm}`, `meta.json`, `build.log`, `memory.log`). `out/cc8/` (run 14's served engine) is never touched by it; `cc/main` never moves. A later `build.sh cc8` moves tree-cc8 back to `cc/main`. The script is run from E0's island worktree `/home/matthew/cc-w2/island/e0-occ` (on `w2/base`), never from the main island checkout (`phase4-selection` has no `run15` case and no occ_service).
+- **The launch** (E0 only, detached, holding TWO of the machine's three gate slots so at most one other heavy command runs beside a build). Measured: a plain `gate.sh gate.sh ...` holds NO slot by the time the build runs, because each stage reopens fd 9 (the inner gate.sh's `exec 9>>`, then `build.sh`'s own `exec 9>` for the build lock) and closing the descriptor drops the flock; moving the slot to another descriptor before each stage holds two (a probe of the three slot files from inside: `slot 1 held`, `slot 2 held`, `slot 3 free`). So:
+
+  ```bash
+  cd /home/matthew/cc-w2/island/e0-occ
+  setsid nohup /home/matthew/cc-wave2/bin/gate.sh bash -c \
+    'exec 8>&9 9>&-; exec /home/matthew/cc-wave2/bin/gate.sh bash -c "exec 7>&9 9>&-; exec bash scripts/engine/build.sh run15"' \
+    > /home/matthew/cc-engine/out/run15-launcher.log 2>&1 < /dev/null &
+  ```
+
+  `build.sh` then takes `/home/matthew/cc-engine/out/.build.lock` itself (one engine build machine wide). Watch `out/run15/build.log`; the end line is `engine build run15 done in <s>s (peak used <n> GB)` or the recipe's failure tail.
+- **Before every launch** (in `/home/matthew/cc-engine-wt/e0-pcbjam` on `run15/main`): the kicad gitlink equals kicad `run15/main`; `scripts/kicad/check-run15-exports.sh --kicad /home/matthew/cc-engine-wt/e0-kicad` (with `--join` for the last train build) prints `0 failures`; `gate.sh scripts/kicad/syntax-check-run15.sh --kicad /home/matthew/cc-engine-wt/e0-kicad all --kicad-file <every KiCad .cpp the merges changed>` prints `syntax-check: 0 failed`; no syntax check running (an author's check refuses while the build runs; the build rewrites the cache volume).
+- **How long** (run 14's logs, `engine-run15.md` section 4): a build whose change is only in the pcbjam bindings 445 to 692 s; a KiCad `.cpp` change 1,448 to 1,600 s; a widely included KiCad header 1,653 s or more. Run 15 adds `occ_service`, never built here: its first build configures and compiles its own KiCad tree (`build-wasm/kicad-occ_service`), not measured (est. 20 to 40 min more on build G only; ccache then). Build G est. 45 to 70 min; a train build with the header lanes est. 30 min; a bindings only repair est. 10 to 12 min. Peak memory 19 to 23 GB.
+- `occ_service` links `pcbnew_embind.o` compiled WITHOUT `KICAD_MERGED_EMBIND` (the recipe's `EMBIND_APP=pcbnew`): a board face that reaches a merged-only definition must sit under `#ifdef KICAD_MERGED_EMBIND` (the `occ` unit catches `cc_fpitems`; an extern half of another TU is proved only by this link).
+
+## How a seat branch is merged
+
+In E0's worktrees only (`/home/matthew/cc-engine-wt/e0-pcbjam` and `/home/matthew/cc-engine-wt/e0-kicad`, both on `run15/main`):
+
+1. The lane's handover: its `BUILD-NOTES-run15-eN.md`, its syntax check `all` and export check pasted, both run after `git merge run15/main`.
+2. kicad: `git -C /home/matthew/cc-engine-wt/e0-kicad merge --no-ff seat/run15-eN` (lanes with KiCad files). pcbjam: `git -C /home/matthew/cc-engine-wt/e0-pcbjam merge --no-ff seat/run15-eN`. The lanes' files are disjoint (one author per KiCad file, per-lane incs, leases on separate bodies), so a conflict is a rule broken: it goes back to the lane, never resolved by E0 inside a lane's code.
+3. Once per build, after the last merge of that build: the gitlink, `git -C /home/matthew/cc-engine-wt/e0-pcbjam update-index --cacheinfo 160000,$(git -C /home/matthew/cc-engine-wt/e0-kicad rev-parse HEAD),kicad` and one commit `kicad: run15/main at <sha> (<lanes>)`.
+4. The two checks above on the merged tip, then the launch.
+5. An early header commit (ENGINE-AUTHORS.md section 7) is merged the same way, as that one commit (`git merge --no-ff <sha>`), as soon as its lane says it landed; no gitlink bump until the next build.
+
+## The order
+
+1. **Build G** = the seams + E0-OCC + the gate units at their GATE commits: fp-e2 (e4: `fpedit_common.h`, then `kicadFpEditOpen`, `kicadFpEditTake`, `kicadFpEditState`), 3d-e1 and 3d-e4 (e11: occ_service as built, `pcbnew_jobs_handler.cpp`'s render), ds-e1 (e6: `single_top.cpp`, `pagelayout_editor/CMakeLists.txt`), st-open-kicad5-e (e9: K-REMAP, `kicadImportLegacyProject`, `kicadHostLegacy`), e-librows and e-block-save (e7). Each of these lanes names its gate commit in its running notes; E0 merges exactly that commit of the seat branch (`git merge --no-ff <gate sha>`, both repositories), never the branch tip. A gate unit not landed at the cut rides the first train build (RULINGS 4, `buildGNotes`). The stop conditions are read before anything else merges.
+2. **The train** (I1 and the repairs): lanes merge as they hand over, at each free lock, the rest of each build G lane merging on top of its gate commit. The four header lanes (e1 `action_menu.h`, `kidialog.h`, the entry dialog headers; e3 `pad_tool.h`; e9 `specctra.h`; e10 `lib_symbol.h`, `footprint.h`) are held until all four have handed over and ride ONE build, so the about 27 min header rebuild is paid once. Lanes leasing existing bodies (e7, e11, e13) merge after the lanes whose incs they call, if any.
+3. Probe and repair: every fix found in one probe pass rides ONE repair build. `--join` on the last build.
+4. Before a build replaces `out/run15/`, a probed build that must stay readable is copied to `out/run15-<label>-keep` (the script deletes the old outputs of the name it builds).
+
+## How each author's exports are probed
+
+From a scratch island worktree of `w2/base` (never the main island checkout): `npm run fetch-engine -- --local /home/matthew/cc-engine/out/run15`, served on that worktree's own port pair, in the GPU window (CDP 9222), one tab at a time closed in a `finally`, no timing read while a build runs. First the seams list below, then, for each merged lane, the probes its `BUILD-NOTES-run15-eN.md` lists (the call, the fixture, the expected record and undo depth, the failure that would mean it is wrong), each result written under "Builds" here. Island e2e seats run their own specs on their own ports after.
 
 ## What every build must probe
 
