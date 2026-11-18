@@ -107,3 +107,42 @@ PASS kicad pcbnew/tools/pcb_control.cpp (10240 ms)
 syntax-check: 0 failed
 ```
 (the handover runs `all`.)
+
+## e-block-layout (DB3, K-B2): PART DONE, the Update widening held
+
+Commits: kicad 8397a505 (with st-paste-e's hunks: one file); pcbjam 9183722.
+
+Kicad:
+- `include/cc_host_block_layout.h` (new): `CC_HOST_BLOCK_LAYOUT_REPORT { applied, linked, skippedNoLink, failures[{ uuid, reason }], lines }`, the slot `ccHostBlockLayoutReport()`, the RAII `CC_HOST_BLOCK_LAYOUT_SCOPE`, and `ccHostBlockLayoutLine( line )` (true when a reporter took an info bar line).
+- `pcbnew/tools/pcb_control.cpp` `PCB_CONTROL::ApplyDesignBlockLayout` (about 1510 to 1830): under `__EMSCRIPTEN__` with a reporter set, its three info bar lines become reporter lines, no `WX_PROGRESS_REPORTER` is made (so no cancel path), and its summary `HTML_MESSAGE_BOX` is replaced by filling the record (KiCad's own failure reasons, per group uuid). The work itself (RepeatLayout into ONE `sharedCommit`, "Apply design block layout to %d group(s)") is KiCad's, unchanged. With no reporter KiCad's path runs word for word (the progress condition is an `#ifdef`/`#else` pair). Recompile reach: that .cpp.
+
+PCBJam:
+- `kicadDesignBlockApplyLayout( argsJson )` registered in `cc_e7_pcb` under `KICAD_MERGED_EMBIND` (merged image only), `cc_e7::blockApplyLayout`: exactly `run` (>= 0), `dir` (run folder under `/tmp/cc-blocklayout/`), `uuids` (1 to 256 distinct lower case uuids, each a group on the board, checked synchronously); false otherwise, with no board or an open in flight. On the apply coroutine: selection cleared, those groups selected (`PCB_SELECTION_TOOL::select`, as KiCad's Update PCB dialog does), `PCB_ACTIONS::applyDesignBlockLayout` under the reporter scope, selection cleared, then `<dir>/.cc-block-layout.json` last: `{"applied", "failures": [{"uuid", "reason"}], "lines"}`.
+- The block of each group is found as KiCad finds it: the group's design block link through the Design Blocks pane's libraries (`GetDesignBlock( group->GetDesignBlockLibId() )`), so the group's library row must be loaded (kicadLibsAddEntry design_block). A group placed by kicadDesignBlockPlace carries no link (see e-block-place).
+
+HELD, reported to E0: the widening of `kicadUpdateBoardFromSchematic` (`transferGroups`, `applyDesignBlockLayouts`, the layouts' records) and its marker `kicadBoardUpdateGroups`. The lease is only the body of `pcbUpdateBoardFromSchematic` (the argument reader). The updater runs in `ccRunBoardUpdate` (pcbnew_embind.cpp about 3982, NOT leased), which hard codes `updater.SetTransferGroups( false )` and `SetApplyDesignBlockLayouts( false )` and takes `CC_UPDATE_ARGS` (about 3963, not leased); KiCad's Update dialog also lays out `updater.GetAddedGroups()` after `OnNetlistChanged` (dialog_update_pcb.cpp 122 to 136), which must go in the same runner, and the preview token (`ccUpdateToken`) should fold the two flags in. The fix needs the lease widened to `CC_UPDATE_ARGS` and `ccRunBoardUpdate` (about 15 lines: two fields, the two setters, the layout loop with the reporter scope, a `layouts` key in report.json). Not written here, and the marker not registered (the island lists the cap on the marker, so it must not exist before the widening works).
+
+What the build train must probe:
+1. Frame pcb on blocks-small with the block row loaded and a group linked to LDO (from Update with groups once the widening lands, or a fixture board holding one): move a footprint of the group, `Module.kicadDesignBlockApplyLayout(JSON.stringify({run:1,dir:'/tmp/cc-blocklayout/1',uuids:['<group uuid>']}))` answers true; the footprint is back where the block's layout puts it; ONE undo step; record `{applied:1,failures:[],lines:[]}`; no message box.
+2. A group linked to LDO_PARTIAL: record `{applied:0, failures:[{uuid, reason}]}` with KiCad's reason; no undo step.
+3. An unlinked group's uuid: `{applied:0,failures:[],lines:["No groups with a linked design block are selected."]}`.
+4. False at once: a uuid that is not a group, a repeated uuid, upper case, an empty list, `dir` outside `/tmp/cc-blocklayout/`.
+
+Checks: see the handover block at the end.
+
+## st-paste-e (K-PASTE)
+
+Commits: kicad 8397a505; pcbjam 9183722.
+
+Kicad:
+- `include/cc_paste_special.h` (new): `CC_PASTE_SPECIAL { mode (0 unique, 1 keep, 2 remove), clearNets }`, the slot `ccPasteSpecialSlot()`, `ccTakePasteSpecial()` (taken once). A slot armed by the export, never a tool event parameter (a `TOOL_EVENT::Parameter<T>` of the wrong type asserts; every other pasteSpecial caller passes none).
+- `pcbnew/tools/pcb_control.cpp` `PCB_CONTROL::Paste` (about 1240) and `eeschema/tools/sch_editor_control.cpp` `SCH_EDITOR_CONTROL::Paste` (about 2185): under `__EMSCRIPTEN__` an armed choice replaces `DIALOG_PASTE_SPECIAL` (board Clear Nets only for a board clip, as the dialog hides the box otherwise; the schematic's `forceRemoveAnnotations` is computed by KiCad's own line after it); with nothing armed the dialog as before. Recompile reach: those two .cpp.
+
+PCBJam:
+- `kicadPasteSpecial( argsJson )` registered in `cc_e7_dispatch` (`cc_e7::pasteSpecial`): exactly `mode` ("unique", "keep", "remove") and `clearNets` (bool); halves `cc_e7::pastePcb` (`cc_e7_pcb.inc`, not merged only: it calls only common code) and `cc_e7::pasteSch` (`cc_e7_sch.inc`). On the apply coroutine: arm, `RunAction( ACTIONS::pasteSpecial )`, empty the slot. The items hang off the pointer; the press commits KiCad's paste as one undo step. No record (an interactive tool, like kicadPlaceImportedItem).
+
+What the build train must probe:
+1. Frame sch, a symbol copied: `Module.kicadPasteSpecial('{"mode":"unique","clearNets":false}')` answers true, the copy hangs off the pointer with a new designator, a press commits one undo step, no dialog. `keep` keeps the designator; `remove` gives `R?`.
+2. Frame pcb, tracks with nets copied: `{"mode":"keep","clearNets":true}` pastes them with no net; `clearNets:false` keeps the nets.
+3. After it, a plain Ctrl+Shift+V (if a door reaches KiCad's own pasteSpecial) shows the dialog path again, never a stale choice (wrong if it pastes silently).
+4. False at once: `mode` `"other"`, a missing or extra key, a non boolean clearNets.
