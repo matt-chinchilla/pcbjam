@@ -49,6 +49,15 @@ bool pastePcb( int aMode, bool aClearNets )
     return true;
 }
 
+// e-block-layout, the marker kicadBoardUpdateGroups: this engine's kicadUpdateBoardFromSchematic
+// takes Update PCB's two group options (transferGroups, applyDesignBlockLayouts), lays out the
+// groups an apply added and answers their records under layouts in report.json, so the island
+// lists the cap blockLayouts on the board update only when the engine does this.
+bool boardUpdateGroups()
+{
+    return true;
+}
+
 #ifdef KICAD_MERGED_EMBIND
 
 namespace pcb
@@ -405,6 +414,7 @@ bool blockApplyLayout( std::string aArgsJson )
 
 EMSCRIPTEN_BINDINGS( cc_e7_pcb )
 {
+    emscripten::function( "kicadBoardUpdateGroups", &cc_e7::boardUpdateGroups );
 #ifdef KICAD_MERGED_EMBIND
     emscripten::function( "kicadDesignBlockApplyLayout", &cc_e7::blockApplyLayout );
 #endif
