@@ -21,6 +21,10 @@
 // inc (ccRegisterSchSection), consulted after the built-in sections by the get, the set
 // (before Schematic Setup's OK steps, ccSchSettingsChanged) and the list (ccSchSections,
 // schSettingsSections for the export kicadSettingsSections).
+//
+// Modified by Circuit Center Inc on 2026-11-18: the sections' get reads through
+// ccSchSettingsRead, which reads a given project (the open one, or another loaded beside it
+// for kicadSettingsRead), and the registry struct gains a reader at its end.
 
 #include <bus_alias.h>
 #include <font/font.h>
@@ -1864,13 +1868,19 @@ bool ccJsonSectionSet( const CC_JSON_SECTION& aSection, const json& aPatch )
     return true;
 }
 
-std::optional<CC_JSON_SECTION> ccSchJsonSection( SCH_EDIT_FRAME* aFrame, const std::string& aName )
+/** Engine run 15 (m8-e): a project file section of aProject (the open design's, or another
+ *  design loaded beside it); nullopt for another name or a project without those settings. */
+std::optional<CC_JSON_SECTION> ccSchJsonSection( PROJECT* aProject, const std::string& aName )
 {
+    if( !aProject )
+        return std::nullopt;
+
+    PROJECT_FILE&   file = aProject->GetProjectFile();
     CC_JSON_SECTION section;
 
     if( aName == "netClasses" )
     {
-        std::shared_ptr<NET_SETTINGS>& net = aFrame->Prj().GetProjectFile().NetSettings();
+        std::shared_ptr<NET_SETTINGS>& net = file.NetSettings();
 
         if( !net )
             return std::nullopt;
@@ -1883,19 +1893,28 @@ std::optional<CC_JSON_SECTION> ccSchJsonSection( SCH_EDIT_FRAME* aFrame, const s
     }
     else if( aName == "ercSeverities" )
     {
-        section.settings = &aFrame->Schematic().ErcSettings();
+        if( !file.m_ErcSettings )
+            return std::nullopt;
+
+        section.settings = file.m_ErcSettings;
         section.keys = { { "rule_severities", "/rule_severities" } };
     }
     else if( aName == "pinMap" )
     {
-        section.settings = &aFrame->Schematic().ErcSettings();
+        if( !file.m_ErcSettings )
+            return std::nullopt;
+
+        section.settings = file.m_ErcSettings;
         section.keys = { { "pin_map", "/pin_map" } };
     }
     else if( aName == "schFormatting" )
     {
         // The Formatting panel's keys (panel_setup_formatting.cpp) and the numbering keys;
         // drawing.field_names is the Field names section's.
-        section.settings = &aFrame->Schematic().Settings();
+        if( !file.m_SchematicSettings )
+            return std::nullopt;
+
+        section.settings = file.m_SchematicSettings;
         section.keys = { { "drawing", "/drawing" },
                          { "connection_grid_size", "/connection_grid_size" },
                          { "subpart_id_separator", "/subpart_id_separator" },
@@ -1904,7 +1923,10 @@ std::optional<CC_JSON_SECTION> ccSchJsonSection( SCH_EDIT_FRAME* aFrame, const s
     }
     else if( aName == "fieldTemplates" )
     {
-        section.settings = &aFrame->Schematic().Settings();
+        if( !file.m_SchematicSettings )
+            return std::nullopt;
+
+        section.settings = file.m_SchematicSettings;
         section.keys = { { "field_names", "/drawing/field_names" } };
     }
     else
@@ -1913,6 +1935,11 @@ std::optional<CC_JSON_SECTION> ccSchJsonSection( SCH_EDIT_FRAME* aFrame, const s
     }
 
     return section;
+}
+
+std::optional<CC_JSON_SECTION> ccSchJsonSection( SCH_EDIT_FRAME* aFrame, const std::string& aName )
+{
+    return ccSchJsonSection( &aFrame->Prj(), aName );
 }
 
 json ccPageJson( const PAGE_INFO& aPage, const TITLE_BLOCK& aTitle, const wxString& aSheetFile )
@@ -2150,6 +2177,12 @@ struct CC_SCH_SECTION
 
     // With setupOk: the connectivity is rebuilt too (a net class change).
     bool reconnect = false;
+
+    // Engine run 15 (m8-e, widened at the end so every registration above keeps its meaning):
+    // the section read from a given project (another design loaded beside the open one,
+    // kicadSettingsRead), null when that design does not hold it. Left empty, the section
+    // never travels (kicadSettingsRead lists it in missing).
+    std::function<json( PROJECT* aProject )> read = nullptr;
 };
 
 /** Run 14's sections, answered by the chains of ccSchSettingsGet and ccRunSchSettingsSet. */
@@ -2202,11 +2235,19 @@ bool ccRegisterSchSection( CC_SCH_SECTION aSection )
     return true;
 }
 
-json ccSchSettingsGet( SCH_EDIT_FRAME* aFrame, const std::string& aSection )
+/**
+ * Engine run 15 (m8-e): the project file sections Import Settings carries, read from aProject
+ * (the open design's, or another design loaded beside it) with the bodies the frame's get uses;
+ * busAliases from the project file's aliases (what KiCad's Import Settings reads), then a
+ * registered section's reader. Null for a section that never travels (variants, page, a
+ * registered section with no reader) or a missing project.
+ */
+json ccSchSettingsRead( PROJECT* aProject, const std::string& aSection )
 {
-    SCHEMATIC& sch = aFrame->Schematic();
+    if( !aProject )
+        return json();
 
-    if( std::optional<CC_JSON_SECTION> section = ccSchJsonSection( aFrame, aSection ) )
+    if( std::optional<CC_JSON_SECTION> section = ccSchJsonSection( aProject, aSection ) )
     {
         json out = ccJsonSectionGet( *section );
 
@@ -2220,11 +2261,46 @@ json ccSchSettingsGet( SCH_EDIT_FRAME* aFrame, const std::string& aSection )
     {
         json out = json::object();
 
-        for( const auto& [name, text] : aFrame->Prj().GetTextVars() )
+        for( const auto& [name, text] : aProject->GetTextVars() )
             out[toUtf8( name )] = ccRulesCut( text );
 
         return out;
     }
+
+    if( aSection == "busAliases" )
+    {
+        json aliases = json::array();
+
+        for( const auto& [name, members] : aProject->GetProjectFile().m_BusAliases )
+        {
+            json entry = json::object();
+            json list = json::array();
+
+            for( const wxString& member : members )
+                list.push_back( ccRulesCut( member, 256 ) );
+
+            entry["name"] = ccRulesCut( name, 256 );
+            entry["members"] = std::move( list );
+            aliases.push_back( std::move( entry ) );
+        }
+
+        json out = json::object();
+        out["aliases"] = std::move( aliases );
+        return out;
+    }
+
+    if( const CC_SCH_SECTION* registered = ccSchRegisteredSection( aSection ) )
+        return registered->read ? registered->read( aProject ) : json();
+
+    return json();
+}
+
+json ccSchSettingsGet( SCH_EDIT_FRAME* aFrame, const std::string& aSection )
+{
+    SCHEMATIC& sch = aFrame->Schematic();
+
+    if( aSection == "textVariables" || ccSchJsonSection( aFrame, aSection ) )
+        return ccSchSettingsRead( &aFrame->Prj(), aSection );
 
     if( aSection == "variants" )
         return ccSchVariantsJson( aFrame );

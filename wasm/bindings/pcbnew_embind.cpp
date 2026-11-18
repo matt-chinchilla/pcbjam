@@ -12,6 +12,15 @@
  * Note: GetBoard() is not available when KICAD_SCRIPTING=OFF.
  * These bindings expose the classes for use when a board reference
  * is obtained through other means (e.g., from the UI).
+ *
+ * Modified by Circuit Center Inc on 2026-11-18: lane e11's leased bodies, the board outputs'
+ * per format 3D file check, the footprint export counting each library footprint once, the
+ * rules answer's solder mask figure and a pair's layers limited to the board's.
+ *
+ * Modified by Circuit Center Inc on 2026-11-18: lane e7's leased bodies, Update PCB's two
+ * options Keep groups and Apply design block layouts in the board update (transferGroups,
+ * applyDesignBlockLayouts), the added groups laid out as KiCad's Update PCB dialog does, their
+ * records under layouts in report.json and the two options folded into the preview's token.
  */
 
 #ifdef __EMSCRIPTEN__
@@ -3968,6 +3977,8 @@ struct CC_UPDATE_ARGS
     bool        replaceFootprints = true;
     bool        deleteExtra = false;
     bool        relinkByReference = false;
+    bool        transferGroups = false;            // Update PCB's Keep groups
+    bool        applyDesignBlockLayouts = false;   // its Apply design block layouts (needs groups)
     std::string token;
 };
 
@@ -3977,7 +3988,11 @@ struct CC_UPDATE_ARGS
  * an apply checks the token, runs it for real (one BOARD_COMMIT "Update Netlist"), then
  * OnNetlistChanged (nets, classes, rules) and ccPlaceNewFootprints. Writes <dir>/report.json
  * (the engine report) when the updater ran (and for a preview stopped by parts with no number,
- * so it can list them), then <dir>/.cc-update.json LAST: {error, message, lines}.
+ * so it can list them), then <dir>/.cc-update.json LAST: {error, message, lines}. With
+ * transferGroups the updater keeps the schematic's groups; with applyDesignBlockLayouts too, an
+ * apply lays out each group it added that links a design block (KiCad's Update PCB dialog,
+ * dialog_update_pcb.cpp, after OnNetlistChanged) under the host's reporter, and report.json
+ * carries layouts {applied, failures: [{uuid, reason}]} whenever transferGroups was asked.
  */
 void ccRunBoardUpdate( const CC_UPDATE_ARGS& aArgs )
 {
@@ -4076,9 +4091,12 @@ void ccRunBoardUpdate( const CC_UPDATE_ARGS& aArgs )
         netlist.SetFindByTimeStamp( !aArgs.relinkByReference );
         netlist.SetReplaceFootprints( aArgs.replaceFootprints );
 
-        const std::string token = ccUpdateToken( netlist, aArgs.replaceFootprints,
-                                                 aArgs.deleteExtra, aArgs.relinkByReference,
-                                                 fr->GetBoard()->GetTimeStamp() );
+        const std::string token =
+                ccDigest( ccUpdateToken( netlist, aArgs.replaceFootprints, aArgs.deleteExtra,
+                                         aArgs.relinkByReference,
+                                         fr->GetBoard()->GetTimeStamp() )
+                          + ( aArgs.transferGroups ? "|g1" : "|g0" )
+                          + ( aArgs.applyDesignBlockLayouts ? "|b1" : "|b0" ) );
 
         if( aArgs.apply && token != aArgs.token )
         {
@@ -4106,14 +4124,15 @@ void ccRunBoardUpdate( const CC_UPDATE_ARGS& aArgs )
         updater.SetReplaceFootprints( aArgs.replaceFootprints );
         updater.SetDeleteUnusedFootprints( aArgs.deleteExtra );
         updater.SetLookupByTimestamp( !aArgs.relinkByReference );
-        updater.SetTransferGroups( false );
-        updater.SetApplyDesignBlockLayouts( false );
+        updater.SetTransferGroups( aArgs.transferGroups );
+        updater.SetApplyDesignBlockLayouts( aArgs.applyDesignBlockLayouts );
         updater.SetOverrideLocks( false );
         updater.SetUpdateFields( true );
         updater.SetRemoveExtraFields( false );
         updater.UpdateNetlist( netlist );
 
-        json added = json::array();
+        json                        added = json::array();
+        CC_HOST_BLOCK_LAYOUT_REPORT layouts;
 
         if( aArgs.apply )
         {
@@ -4125,6 +4144,45 @@ void ccRunBoardUpdate( const CC_UPDATE_ARGS& aArgs )
 
             for( FOOTPRINT* fp : fresh )
                 added.push_back( ccText( fp->GetReference() ) );
+
+            // KiCad's Update PCB dialog: each added group that links a design block is selected
+            // alone and laid out by Apply Design Block Layout (its own commit, as there); the
+            // host's reporter takes its summary and info bar lines in place of KiCad's windows,
+            // one report per run (the tool sets its counts), summed here.
+            if( aArgs.applyDesignBlockLayouts )
+            {
+                PCB_SELECTION_TOOL* selTool = toolMgr->GetTool<PCB_SELECTION_TOOL>();
+
+                for( PCB_GROUP* group : updater.GetAddedGroups() )
+                {
+                    if( !group->HasDesignBlockLink() )
+                        continue;
+
+                    CC_HOST_BLOCK_LAYOUT_REPORT one;
+
+                    {
+                        CC_HOST_BLOCK_LAYOUT_SCOPE scope( &one );
+                        toolMgr->RunAction( ACTIONS::selectionClear );
+                        selTool->select( group );
+                        toolMgr->RunAction( PCB_ACTIONS::applyDesignBlockLayout );
+                    }
+
+                    layouts.applied += one.applied;
+                    layouts.failures.insert( layouts.failures.end(), one.failures.begin(),
+                                             one.failures.end() );
+                    layouts.lines.insert( layouts.lines.end(), one.lines.begin(),
+                                          one.lines.end() );
+                }
+
+                toolMgr->RunAction( ACTIONS::selectionClear );
+
+                // The new parts stay selected beside the board, as ccPlaceNewFootprints left them.
+                EDA_ITEMS items( fresh.begin(), fresh.end() );
+                toolMgr->RunAction<EDA_ITEMS*>( ACTIONS::selectItems, &items );
+
+                for( const wxString& line : layouts.lines )
+                    lines.Report( line, RPT_SEVERITY_INFO );
+            }
         }
 
         json changes = problems;
@@ -4154,6 +4212,24 @@ void ccRunBoardUpdate( const CC_UPDATE_ARGS& aArgs )
         report["truncated"] = truncated;
         report["unmapped"] =
                 counter.m_actions + counter.m_warnings + counter.m_errors - (int) log.size();
+
+        if( aArgs.transferGroups )
+        {
+            json failures = json::array();
+
+            for( const CC_HOST_BLOCK_LAYOUT_FAILURE& failure : layouts.failures )
+            {
+                json f = json::object();
+                f["uuid"] = ccText( failure.uuid.AsString() );
+                f["reason"] = ccText( failure.reason );
+                failures.push_back( std::move( f ) );
+            }
+
+            json l = json::object();
+            l["applied"] = layouts.applied;
+            l["failures"] = std::move( failures );
+            report["layouts"] = std::move( l );
+        }
 
         ccWriteJson( aArgs.dir, "report.json", report );
     }
@@ -5456,7 +5532,8 @@ bool pcbUpdateBoardFromSchematic( std::string aArgsJson )
 
     json args = json::parse( aArgsJson, nullptr, /*allow_exceptions*/ false );
 
-    if( args.is_discarded() || !args.is_object() || args.size() != 7 )
+    // Run 14's seven keys, or those and both of Update PCB's group options (engine run 15).
+    if( args.is_discarded() || !args.is_object() || ( args.size() != 7 && args.size() != 9 ) )
         return false;
 
     CC_UPDATE_ARGS a;
@@ -5482,6 +5559,15 @@ bool pcbUpdateBoardFromSchematic( std::string aArgsJson )
             || !flag( "replaceFootprints", a.replaceFootprints )
             || !flag( "deleteExtra", a.deleteExtra )
             || !flag( "relinkByReference", a.relinkByReference ) )
+    {
+        return false;
+    }
+
+    // KiCad's dialog enables Apply design block layouts only while Keep groups is on.
+    if( args.size() == 9
+            && ( !flag( "transferGroups", a.transferGroups )
+                 || !flag( "applyDesignBlockLayouts", a.applyDesignBlockLayouts )
+                 || ( a.applyDesignBlockLayouts && !a.transferGroups ) ) )
     {
         return false;
     }
@@ -5829,8 +5915,10 @@ int ccRunOurBoardOutput( PCB_EDIT_FRAME* aFrame, BOARD* aBoard, const CC_BOARD_O
         // PCB_EDIT_FRAME::ExportFootprintsToLibrary without its library chooser, its boxes and
         // any library table: each footprint copied and reset as KiCad resets it, written by
         // the KiCad S-expression writer into <board>.pretty/. The folder is made first (a
-        // save into a folder that is missing asks in a box). Two footprints of one name: the
-        // first is kept and the rest are named in one warning line.
+        // save into a folder that is missing asks in a box). Each library footprint is written
+        // once: a footprint placed twice (the same library and name) is one footprint, with no
+        // line. Two footprints of one name from different libraries: the first is kept and
+        // the rest are named in one warning line.
         const wxString   stem = wxFileName( aBoard->GetFileName() ).GetName();
         wxFileName       lib;
         lib.AssignDir( wxString::FromUTF8( aArgs.dir.c_str() ) );
@@ -5840,8 +5928,8 @@ int ccRunOurBoardOutput( PCB_EDIT_FRAME* aFrame, BOARD* aBoard, const CC_BOARD_O
 
         io.CreateLibrary( libPath );   // throws IO_ERROR, an error line in the caller
 
-        std::set<wxString> saved;
-        wxArrayString      twins;
+        std::map<wxString, wxString> saved;   // footprint name -> the library footprint kept
+        wxArrayString                twins;
 
         for( FOOTPRINT* footprint : aBoard->Footprints() )
         {
@@ -5849,14 +5937,18 @@ int ccRunOurBoardOutput( PCB_EDIT_FRAME* aFrame, BOARD* aBoard, const CC_BOARD_O
                 continue;
 
             const wxString name = footprint->GetFPID().GetUniStringLibItemName();
+            const wxString libraryFootprint = footprint->GetFPID().GetUniStringLibId();
+            auto           kept = saved.find( name );
 
-            if( !saved.insert( name ).second )
+            if( kept != saved.end() )
             {
-                if( twins.Index( name ) == wxNOT_FOUND )
+                if( kept->second != libraryFootprint && twins.Index( name ) == wxNOT_FOUND )
                     twins.Add( name );
 
                 continue;
             }
+
+            saved.emplace( name, libraryFootprint );
 
             std::unique_ptr<FOOTPRINT> copy(
                     static_cast<FOOTPRINT*>( footprint->Duplicate( IGNORE_PARENT_GROUP ) ) );
@@ -5981,20 +6073,26 @@ void ccRunBoardOutput( const CC_BOARD_OUTPUT& aArgs )
     if( screen && !wasModified && screen->IsContentModified() )
         screen->SetContentModified( false );
 
-    // The VRML output: on the first run 14 build KiCad's exporter answered success on Glasgow
+    // The 3D export's file, per format (cc_output_3d.h names its extension): a run that answers
+    // success must leave a file with something in it, else it is a failed output with its own
+    // line, never a file the page offers. VRML: KiCad's exporter answered success on Glasgow
     // and wrote only the 16 byte "#VRML V2.0 utf8" header (kicad-cli 10.0.4 writes 18 MB from
-    // the same board). Until that is found, a header-only file is a failed output with its own
-    // line, never a file the page offers.
-    if( code == 0 && aArgs.job == "pcb_export_3d" )
+    // the same board), because the WebAssembly GLU tessellator never calls VRML_LAYER's begin
+    // and end callbacks (engine run 15 notes, lane e11, PE46); until that is fixed a header only
+    // file keeps this line.
+    if( code == 0 && !aArgs.merge.expectFile.empty() )
     {
-        wxFileName wrl( ccOutputFile( aArgs.dir, brd, wxS( "wrl" ) ) );
+        const bool vrml = aArgs.merge.expectFile == "wrl";
+        wxFileName made( ccOutputFile( aArgs.dir, brd,
+                                       wxString::FromUTF8( aArgs.merge.expectFile.c_str() ) ) );
 
-        if( !wrl.FileExists() || wrl.GetSize() <= 64 )
+        if( !made.FileExists() || made.GetSize() <= ( vrml ? 64 : 0 ) )
         {
-            if( wrl.FileExists() )
-                wxRemoveFile( wrl.GetFullPath() );
+            if( made.FileExists() )
+                wxRemoveFile( made.GetFullPath() );
 
-            lines.Report( wxS( "The VRML exporter wrote no board (an empty scene)." ),
+            lines.Report( vrml ? wxS( "The VRML exporter wrote no board (an empty scene)." )
+                               : wxS( "The 3D service made no file." ),
                           RPT_SEVERITY_ERROR );
             code = -1;
         }
@@ -6223,6 +6321,19 @@ void ccInspectConstraints( CC_RULES_ENGINE& aEngine, BOARD_ITEM* aItem, bool aCo
     {
         c = aEngine.EvalRules( SOLDER_MASK_EXPANSION_CONSTRAINT, aItem, nullptr, UNDEFINED_LAYER,
                                nullptr );
+
+        // No rule and no local value: KiCad's engine names no figure for a track or a shape
+        // (its board setup default is given to a pad only), while the item itself uses the
+        // board setup's expansion (PCB_TRACK::GetSolderMaskExpansion,
+        // PCB_SHAPE::GetSolderMaskExpansion). Answer that figure, from the board setup, as the
+        // engine answers a pad's.
+        if( !c.m_Value.HasMin() && !c.m_Value.HasOpt() && !c.m_Value.HasMax() )
+        {
+            c.SetParentRule( nullptr );
+            c.SetName( wxS( "board setup" ) );
+            c.m_Value.SetOpt( aItem->GetBoard()->GetDesignSettings().m_SolderMaskExpansion );
+        }
+
         aOut.add( "solder_mask_expansion", "mm", c, "", UNDEFINED_LAYER );
     }
 
@@ -6327,7 +6438,11 @@ void ccReportClearance( PCB_EDIT_FRAME* aFrame, CC_RULES_ENGINE& aEngine, BOARD_
     aOut.b = b;
 
     const PCB_LAYER_ID    active = aFrame->GetActiveLayer();
-    const LSET            layerIntersection = a->GetLayerSet() & b->GetLayerSet();
+    // Only the board's enabled layers: a through hole pad's set is every copper layer KiCad
+    // knows (32), not the board's.
+    const LSET            enabled = a->GetBoard() ? a->GetBoard()->GetEnabledLayers()
+                                                  : LSET::AllLayersMask();
+    const LSET            layerIntersection = a->GetLayerSet() & b->GetLayerSet() & enabled;
     const LSET            copperIntersection = layerIntersection & LSET::AllCuMask();
     BOARD_CONNECTED_ITEM* ac = dynamic_cast<BOARD_CONNECTED_ITEM*>( a );
     BOARD_CONNECTED_ITEM* bc = dynamic_cast<BOARD_CONNECTED_ITEM*>( b );
@@ -6434,7 +6549,8 @@ void ccReportClearance( PCB_EDIT_FRAME* aFrame, CC_RULES_ENGINE& aEngine, BOARD_
         if( DRC_ENGINE::MatchDpSuffix( ac->GetNet()->GetNetname(), coupledNet, dummy )
                 && bc->GetNetname() == coupledNet )
         {
-            const LSET   dpIntersection = ac->GetLayerSet() & bc->GetLayerSet() & LSET::AllCuMask();
+            const LSET   dpIntersection = ac->GetLayerSet() & bc->GetLayerSet() & LSET::AllCuMask()
+                                          & enabled;
             PCB_LAYER_ID dpLayer = active;
 
             if( !dpIntersection.test( dpLayer ) && dpIntersection.any() )
@@ -6566,11 +6682,11 @@ void ccReportClearance( PCB_EDIT_FRAME* aFrame, CC_RULES_ENGINE& aEngine, BOARD_
 
         if( a->IsOnLayer( Edge_Cuts ) )
             reportLayers |= bFP ? LSET( { F_CrtYd, B_CrtYd } )
-                                : LSET( b->GetLayerSet() & LSET::PhysicalLayersMask() );
+                                : LSET( b->GetLayerSet() & LSET::PhysicalLayersMask() & enabled );
 
         if( b->IsOnLayer( Edge_Cuts ) )
             reportLayers |= aFP ? LSET( { F_CrtYd, B_CrtYd } )
-                                : LSET( a->GetLayerSet() & LSET::PhysicalLayersMask() );
+                                : LSET( a->GetLayerSet() & LSET::PhysicalLayersMask() & enabled );
 
         for( PCB_LAYER_ID layer : reportLayers )
         {

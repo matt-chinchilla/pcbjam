@@ -15,6 +15,11 @@
 
 #ifdef __EMSCRIPTEN__
 
+// e-block-layout: the host's reporter for Apply Design Block Layout (K-B2), which
+// ccRunBoardUpdate sets while it lays out the groups an update added. Header only (inline), so
+// it is compiled in every configuration of pcbnew_embind.cpp, occ_service's included.
+#include <cc_host_block_layout.h>
+
 namespace cc_e7
 {
 } // namespace cc_e7

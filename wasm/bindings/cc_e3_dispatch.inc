@@ -13,8 +13,18 @@
 
 namespace cc_e3
 {
+// A marker (engine run 15, fp-e1a): this engine's footprint editor asks the page before it
+// opens KiCad's item, footprint, default pad, wizard, new footprint, rename, Cleanup Graphics,
+// pad tool and drawing tool windows (kicad pcbnew/tools/footprint_editor_host.h
+// CcAskHostFpEdit, through window.kicadHostFpEdit.onRequest), so the page may take that
+// request (the island's ev.fpedit, cap fpeditHeld).
+bool kicadHostFpEdit()
+{
+    return true;
+}
 } // namespace cc_e3
 
 EMSCRIPTEN_BINDINGS( cc_e3_dispatch )
 {
+    function( "kicadHostFpEdit", &cc_e3::kicadHostFpEdit );
 }
