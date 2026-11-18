@@ -138,6 +138,32 @@ int runAction( std::string aName )
 
     return 0;
 }
+// ---- m12-e: kicadTableCsv, the CSV text of Export Table to CSV (both editors) ---------------
+
+// The halves (cc_e1_pcb.inc, cc_e1_sch.inc): {"uuid"} -> {"name","text"} or "".
+std::string tableCsvPcb( std::string aArgs );
+std::string tableCsvSch( std::string aArgs );
+
+// {"uuid"} of a table or one of its cells -> {"name","text"}, the text KiCad's own exporter
+// builds (the held action exportTableCSV, cap tableCsv: the page saves <name>.csv). "" in the
+// footprint, symbol and drawing sheet editors, with a modal dialog or a prompt up, and for
+// anything the live editor's half refuses.
+std::string tableCsv( std::string aArgs )
+{
+    if( fpEditorActive() || symEditorActive() || dsEditorActive() )
+        return "";
+
+    if( modalDialogUp() || CcHostPromptModalParked() )
+        return "";
+
+    if( pcbEditorActive() )
+        return tableCsvPcb( aArgs );
+
+    if( schEditorActive() )
+        return tableCsvSch( aArgs );
+
+    return "";
+}
 } // namespace cc_e1
 
 EMSCRIPTEN_BINDINGS( cc_e1_dispatch )
@@ -151,4 +177,5 @@ EMSCRIPTEN_BINDINGS( cc_e1_dispatch )
     emscripten::function( "kicadContextMenuChoose", &cc_e1::contextMenuChoose );
     emscripten::function( "kicadContextMenuHighlight", &cc_e1::contextMenuHighlight );
     emscripten::function( "kicadRunAction", &cc_e1::runAction );
+    emscripten::function( "kicadTableCsv", &cc_e1::tableCsv );
 }
