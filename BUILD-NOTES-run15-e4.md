@@ -205,3 +205,83 @@ What the build train must probe (fixture `fpedit-small`, the SOIC open, and `CUS
 - Refusals with depth unchanged: `{type:"smd", drill:{shape:"circle", size:[1,1]}}`, `{copper:{delta:[0.2,0.2], shape:"trapezoid"}}`, `{type:"th", drill:null}` (pad_th_with_no_hole), `{type:"npth", number:"5"}`, `{padstack:"custom"}` on an smd pad, `{layers:["F.Cu","B.Cu"]}` on an smd pad.
 - `kicadFpEditPadDefaultsSet('{"set":{"copper":{"size":[1,2]}}}')`: true, depth and modified unchanged; `kicadFpEditPadDefaultsGet()` reads size [1, 2]; the pad tool's next pad (or `ItemsAdd` of `{kind:"pad", uuid, number:"9"}`) has size [1, 2]. Wrong: an undo step, the footprint modified.
 - `kicadFpEditEnumerate('{"start":1,"step":1,"prefix":""}')`: true, no dialog, no `enumerate` ask, the bullseye cursor; a drag over three pads numbers them 1, 2, 3, a double click commits one undo step; Ctrl+Z restores. `{"start":1,"step":2,"prefix":"A"}`: A1, A3, A5. With no footprint pads it answers false and a later call does not reuse its numbers. Wrong: KiCad's numbering dialog, two undo steps.
+
+## fp-e4a: the text kinds field, text, textbox, table, barcode (FP spec 7.2)
+
+Commit `629b1c7` (`wasm/bindings/cc_item_text.h` new, `cc_e4_fpedit.inc`). The section the
+manifest names `BUILD-NOTES-run15-fp-e4a.md` is this one. No export of its own: five rows of the
+kind table (`cc_e4::kTextKindsRegistered` in `cc_e4_fpedit.inc`; bodies
+`cc_e4::textkind::kindGet`, `kindSet` and `addField`, `addText`, `addTextbox`, `addTable`,
+`addBarcode` in `cc_item_text.h`), served by `kicadFpEditItemsGet`, `Set`, `Add`, `Remove`.
+
+A set is tried on a `Clone()` first (any refusal changes nothing), then `aCommit.Modify( item )`
+and applied with the dialog's setters in the dialog's order. Text crosses as the dialogs show it:
+`ConvertKIIDsToCrossReferences( UnescapeString( text ) )` on a read, `ConvertCrossReferencesToKIIDs`
+on a set, and a multi line box (a text box, a text outside a footprint) escaped by
+`EscapeString( CTX_QUOTED_STR )` as the dialog escapes it. Sizes `TEXT_MIN_SIZE_MM` to
+`TEXT_MAX_SIZE_MM`; a pen past `ClampTextPenSize` is clamped (the dialog clamps); an empty text
+is refused (the dialog keeps nothing for it), but a NEW user field may start empty. The font by
+`EDA_TEXT::SetFontProp` / `GetFontProp` (KiCad's own name rule, "KiCad Font" the stroke font),
+after the bold and italic flags.
+
+**field, text** (`DIALOG_TEXT_PROPERTIES::TransferDataFromWindow`): `name` (a field's, read only
+on a set: given back unchanged or refused; a text's is ""), `text` (single line inside a
+footprint, 1,024; multi line outside one), `layer`, `x`, `y`, `angle` (`SetTextAngle`, normalized),
+`size`, `thickness`, `autoThickness`, `bold`, `italic`, `mirrored`, `hJustify` (left, center,
+right), `vJustify` (top, center, bottom), `knockout`, `font`; `visible` on a field only;
+`keepUpright` inside a footprint only; `locked` outside a footprint only (the dialog hides lock in
+the footprint editor). A key the item lacks is refused.
+
+**textbox** (`DIALOG_TEXTBOX_PROPERTIES`): `text` (multi line), `layer`, `points` (a cardinal box
+`[start, end]`, settable; a rotated box reads its four corners and its points are not settable),
+`angle`, `size`, `thickness`, `autoThickness`, `bold`, `italic`, `mirrored`, `hJustify`,
+`vJustify`, `knockout`, `font`, `locked`, `border`, `borderWidth`, `borderStyle` (solid, dash,
+dot, dash_dot, dash_dot_dot); after the set the box grows to `GetMinSize()` as the dialog grows it.
+
+**table** (`DIALOG_TABLE_PROPERTIES`): `x`, `y`, `layer` (cells too), `locked`, `cells` (rows of
+texts as the dialog's grid shows them, a back layer table mirrored by column, a covered cell null
+and written empty), `borderExternal`, `borderHeader`, `borderWidth` (null while both are off: KiCad
+stores -1), `borderStyle`, `rowSeparators`, `colSeparators`, `separatorsWidth`, `separatorsStyle`;
+`rows`, `cols`, `colWidths`, `rowHeights` read only on a set (given back equal or refused). Add
+takes `layer`, `colWidths`, `rowHeights` (1 to 64 each) and builds the table as `DrawTable`'s
+motion does (cells laid out from x, y, the layer's line thickness, `Normalize()`), then the rest.
+The table cell form is fp-s6's (RULINGS 2); cell spans, margins and cell text styles are not
+these keys.
+
+**barcode** (`DIALOG_BARCODE_PROPERTIES::transferDataToBarcode`): `text`, `layer`, `locked`, `x`,
+`y`, `width`, `height`, `textSize`, `angle` (`Rotate` by the difference, as the dialog), `knockout`,
+`margin`, `showText`, `kind` (code39, code128, datamatrix, qr, microqr), `errorCorrection` (L, M,
+Q, H); `AssembleBarcode()`, then refused when a non empty text yields no symbol (the dialog's
+"Barcode Error"). Add: `DrawBarcode`'s barcode (layer, the layer's text height), then the record.
+
+**New items**: a field needs `name` (new to the footprint, `HasField`) and `layer`; a text `text`
+and `layer`; a text box `text`, `layer`, `points`; a table `layer`, `colWidths`, `rowHeights`; a
+barcode `layer`. Text, field and text box start from `PlaceText`'s attributes for the layer (the
+board's text size, thickness, italic, upright, mirrored on a back layer, left and bottom). A field,
+table outside a footprint is refused (`FOOTPRINT*` parent); text, text box and barcode take any
+board item parent (the board face).
+
+All merged image only (the fpedit TU); no header change, no KiCad file, nothing reported to E0.
+
+Syntax check: `/home/matthew/cc-wave2/bin/gate.sh scripts/kicad/syntax-check-run15.sh --kicad /home/matthew/cc-engine-wt/e0-kicad all` at 629b1c7: `PASS pcbnew pcbnew_embind.cpp subdir=pcbnew -DKICAD_MERGED_EMBIND`, `PASS eeschema eeschema_embind.cpp subdir=eeschema -DKICAD_MERGED_EMBIND`, `PASS symedit symedit_embind.cpp subdir=eeschema`, `PASS fpedit fpedit_embind.cpp subdir=pcbnew`, `PASS dsedit dsedit_embind.cpp subdir=pagelayout_editor`, `PASS kicad_editor kicad_editor_embind.cpp subdir=common`, `PASS occ pcbnew_embind.cpp subdir=pcbnew`, `syntax-check: 0 failed`. The check was shown to read the kind headers: a planted undeclared name in `cc_item_text.h` gave `FAIL fpedit` (`no member named 'noSuchThing' in namespace 'cc_e4::textkind'`), then was removed before the commit. Export check: `165 names registered in the merged image (158 kicad names), 20 of 110 run 15 names, 0 failures`.
+
+What the build train must probe (fixture `fpedit-small`, the SOIC open):
+
+- `kicadFpEditItemsGet('{"kinds":["field","text"]}')`: Reference and Value (and the file's other fields) with `name`, `visible`, `keepUpright` and no `locked`; the silk `${REFERENCE}` text with `name ""`. Wrong: `locked` on a footprint text, a field without `visible`.
+- `kicadFpEditItemsAdd` of one each with page made uuids: `{kind:"field", uuid, name:"MPN", layer:"F.Fab", text:"X1"}`, `{kind:"text", uuid, text:"T", layer:"F.SilkS", x:1, y:1}`, `{kind:"textbox", uuid, text:"B", layer:"F.SilkS", points:[[0,0],[5,3]]}`, `{kind:"table", uuid, layer:"F.SilkS", colWidths:[5,5], rowHeights:[2,2], cells:[["a","b"],["c","d"]]}`, `{kind:"barcode", uuid, layer:"F.SilkS", text:"CC", kind:"qr"}`: ONE undo step "Add", each read back with its uuid and keys (the table 2 by 2 with its cells, the text box at least its text's minimum size). Wrong: two undo steps, a dialog (the drawing tool's own dialogs must not open), a table with a different cell count.
+- One `kicadFpEditItemsSet` per key on each (text, size, angle, bold, hJustify, layer, border, cells, borderExternal, kind, errorCorrection), each one undo step, Ctrl+Z through `key.press` after each restores it.
+- Refusals with depth unchanged: `{name:"Other"}` on Value, `{visible:false}` on a text, `{locked:true}` on a footprint text, `{text:""}` on any, `{rows:3}` on the table, `{kind:"code39", text:"lowercase-not-encodable~"}` if Code 39 refuses it (KiCad's error), a field add with a name the footprint holds.
+- `kicadFpEditItemsRemove` of the Reference field's uuid answers false (fp-e-items).
+
+## State of the lane (2026-11-18 07:50 EST)
+
+Done: fp-e2, fp-e-items, fp-e3, fp-e4a. The seat cut off by the machine fault left nothing
+uncommitted (the worktree was clean, every commit had its status file); nothing was stashed.
+
+Not done: **fp-e0**, the gate 0 report (`BUILD-NOTES-run15-fp-gate0.md`, written as a section
+here). It is a report, not code: items 1 and 3 (run 14 at t0, in the GPU window, by the one
+probe owner of the T0 hour, engine-run15.md section 7 step 1) and item 4 (site, no engine) have
+no recorded results in the plan, report or engine folders; item 2 is read on build G, which at
+07:16 was queued behind the gate slots (`/home/matthew/cc-engine/out/run15-launcher.log`) and has
+not answered. The next seat writes the report once build G answers and the t0 results are found
+(or run by whoever owns the GPU window): plan A (coded) or plan B, and whether fp-f1 is built.
