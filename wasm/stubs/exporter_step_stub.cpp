@@ -8,15 +8,21 @@
  * Export() bridges to the occ_service worker: stage the live BOARD as sexpr
  * text in MEMFS, ship it + the official JOB_EXPORT_PCB_3D JSON through an
  * EM_ASYNC_JS suspend (globalThis.occService.request, installed by the web
- * app), and report the outcome. The exported file's bytes never enter this
- * module — the JS provider hands them straight to the browser download path.
+ * app), and report the outcome. The JS provider writes the exported file at
+ * the request's outPath in MEMFS.
  *
  * Callers stay untouched: PCBNEW_JOBS_HANDLER::JobExportStep and the browser
  * branch of DIALOG_EXPORT_STEP construct EXPORTER_STEP exactly as on desktop.
+ *
+ * Modified by Circuit Center Inc on 2026-11-18: the request carries outPath (the absolute
+ * m_outputFile, where the 3D service's answer is written in the engine's file system); an ok
+ * answer that leaves no file there, or an empty one, is the error "The 3D service made no file.".
  */
 
 #include <cstdlib>
 #include <string>
+
+#include <wx/filefn.h>
 
 #include <emscripten.h>
 
@@ -60,11 +66,13 @@ extern "C" void Pcbjam_SetExportJobJson( const char* aJson )
 // Every resolution defers to at least a microtask (the early-resolve
 // contract, doc 22 §10 Phase E retry entry).
 EM_JS( void, js_occExportStart,
-       ( int aToken, const char* aBoardPath, const char* aJobJson, const char* aFileName ),
+       ( int aToken, const char* aBoardPath, const char* aJobJson, const char* aFileName,
+         const char* aOutPath ),
 {
     const boardPath = UTF8ToString( aBoardPath );
     const jobJson = UTF8ToString( aJobJson );
     const fileName = UTF8ToString( aFileName );
+    const outPath = UTF8ToString( aOutPath );
 
     // E-8: all native work (malloc + heap writes) runs inside the scheduler's
     // completion gate — a dead or trapped instance drops the completion
@@ -95,7 +103,8 @@ EM_JS( void, js_occExportStart,
         else
         {
             const board = FS.readFile( boardPath ); // Uint8Array copy — transferable
-            req = Promise.resolve( hook.request( { kind: 'export', board, jobJson, fileName } ) );
+            req = Promise.resolve( hook.request( { kind: 'export', board, jobJson, fileName,
+                                                    outPath } ) );
         }
     }
     catch( e )
@@ -173,7 +182,18 @@ bool EXPORTER_STEP::Export()
         jobJson = j.dump();
     }
 
-    const wxString downloadName = wxFileName( m_outputFile ).GetFullName();
+    wxFileName outFile( m_outputFile );
+
+    if( !outFile.IsAbsolute() )
+        outFile.MakeAbsolute();
+
+    const wxString downloadName = outFile.GetFullName();
+    const wxString outPath = outFile.GetFullPath();
+
+    // The answer is written at outPath: a file left there by an earlier run never stands in
+    // for this one.
+    if( wxFileExists( outPath ) )
+        wxRemoveFile( outPath );
 
     const int token = wxWasmBeginWait( "occ" );
 
@@ -188,7 +208,8 @@ bool EXPORTER_STEP::Export()
         return false;
     }
 
-    js_occExportStart( token, TMP_BOARD, jobJson.c_str(), downloadName.utf8_string().c_str() );
+    js_occExportStart( token, TMP_BOARD, jobJson.c_str(), downloadName.utf8_string().c_str(),
+                       outPath.utf8_string().c_str() );
 
     // The malloc'd JSON pointer rides the wait as an int32.
     char* response = (char*) (uintptr_t) (uint32_t) wxWasmYieldUntil( token );
@@ -216,6 +237,22 @@ bool EXPORTER_STEP::Export()
 
     std::free( response );
     wxRemoveFile( wxString::FromUTF8( TMP_BOARD ) );
+
+    if( ok )
+    {
+        wxFileName made( outPath );
+
+        if( !made.FileExists() || made.GetSize() == 0 )
+        {
+            if( made.FileExists() )
+                wxRemoveFile( outPath );
+
+            if( m_reporter )
+                m_reporter->Report( wxT( "The 3D service made no file." ), RPT_SEVERITY_ERROR );
+
+            ok = false;
+        }
+    }
 
     return ok;
 }

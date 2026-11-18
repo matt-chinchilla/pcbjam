@@ -12,6 +12,9 @@
  * Note: GetBoard() is not available when KICAD_SCRIPTING=OFF.
  * These bindings expose the classes for use when a board reference
  * is obtained through other means (e.g., from the UI).
+ *
+ * Modified by Circuit Center Inc on 2026-11-18: lane e11's leased bodies, the board outputs'
+ * per format 3D file check.
  */
 
 #ifdef __EMSCRIPTEN__
@@ -5981,20 +5984,26 @@ void ccRunBoardOutput( const CC_BOARD_OUTPUT& aArgs )
     if( screen && !wasModified && screen->IsContentModified() )
         screen->SetContentModified( false );
 
-    // The VRML output: on the first run 14 build KiCad's exporter answered success on Glasgow
+    // The 3D export's file, per format (cc_output_3d.h names its extension): a run that answers
+    // success must leave a file with something in it, else it is a failed output with its own
+    // line, never a file the page offers. VRML: KiCad's exporter answered success on Glasgow
     // and wrote only the 16 byte "#VRML V2.0 utf8" header (kicad-cli 10.0.4 writes 18 MB from
-    // the same board). Until that is found, a header-only file is a failed output with its own
-    // line, never a file the page offers.
-    if( code == 0 && aArgs.job == "pcb_export_3d" )
+    // the same board), because the WebAssembly GLU tessellator never calls VRML_LAYER's begin
+    // and end callbacks (engine run 15 notes, lane e11, PE46); until that is fixed a header only
+    // file keeps this line.
+    if( code == 0 && !aArgs.merge.expectFile.empty() )
     {
-        wxFileName wrl( ccOutputFile( aArgs.dir, brd, wxS( "wrl" ) ) );
+        const bool vrml = aArgs.merge.expectFile == "wrl";
+        wxFileName made( ccOutputFile( aArgs.dir, brd,
+                                       wxString::FromUTF8( aArgs.merge.expectFile.c_str() ) ) );
 
-        if( !wrl.FileExists() || wrl.GetSize() <= 64 )
+        if( !made.FileExists() || made.GetSize() <= ( vrml ? 64 : 0 ) )
         {
-            if( wrl.FileExists() )
-                wxRemoveFile( wrl.GetFullPath() );
+            if( made.FileExists() )
+                wxRemoveFile( made.GetFullPath() );
 
-            lines.Report( wxS( "The VRML exporter wrote no board (an empty scene)." ),
+            lines.Report( vrml ? wxS( "The VRML exporter wrote no board (an empty scene)." )
+                               : wxS( "The 3D service made no file." ),
                           RPT_SEVERITY_ERROR );
             code = -1;
         }
