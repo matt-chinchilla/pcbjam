@@ -168,6 +168,79 @@ Syntax check at this commit (the lane's full faces):
 `PASS pcbnew (11213 ms)`, `PASS eeschema (11440 ms)`, `PASS symedit (7048 ms)`, `PASS fpedit (6779 ms)`,
 `PASS dsedit (1000 ms)`, `PASS kicad_editor (4615 ms)`, `PASS occ (11128 ms)`, `syntax-check: 0 failed`.
 
+## m7-e: eight Setup sections and kicadTuningSolve
+
+Commits: kicad 97e33790 (`pcbnew/dialogs/panel_setup_tuning_profile_info.cpp`), pcbjam 7b0f3c1
+(`cc_e12_pcb.inc`, `cc_e12_sch.inc`); then `git merge run15/main` (kicad cab6dde8, pcbjam 0edfe52).
+
+**KiCad, K-TSOLVE (under `#ifdef __EMSCRIPTEN__`, `#else` keeps KiCad's text):** a block after the
+includes defines `bool ccTuningSolve( BOARD*, const EDA_IU_SCALE&, bool aDifferential, double
+aImpedance, PCB_LAYER_ID aSignal, PCB_LAYER_ID aTopRef, PCB_LAYER_ID aBottomRef, int aSolveFor (0
+width, 1 gap, 2 delay), int& aWidth, int& aGap, int& aDelay, wxString& aProblem )` at global scope:
+`calculateTrackParametersForCell`'s checks and the four `calculate*` members with
+`getMicrostripBoardParameters` / `getStriplineBoardParameters`, taking the row's facts as
+arguments (the private static helpers are copied into an anonymous namespace of that file as
+`ccTsSkinDepth`, `ccTsStackupLayerId`, `ccTsDielectricLayers`, `ccTsAverageDielectric`; the
+calculators are locals in place of the panel's members). `calculateTrackParametersForCell` reads
+the grid and calls `ccTuningSolve`, showing KiCad's same messages. No header change (only this
+`.cpp` recompiles); the declaration the pcbjam face uses is written in `cc_e12_pcb.inc`.
+
+**Sections (registered through R7 in this lane's incs; setupOk true, so Board Setup's or
+Schematic Setup's OK steps follow every taken set; no undo step):**
+
+| section | frame | wire value | the set |
+|---|---|---|---|
+| `zoneDefaults` | pcb | the 17 keys of `defaults.zones.*` by their KiCad names (mm, degrees, enumeration numbers as the project file holds them) | patch, numbers only (only `hatch_orientation` may be negative), kind kept, `Load()` |
+| `zoneHatchOffsets` | pcb | `{layers: [{layer, offset: [x, y] mm or null}]}`, every enabled copper layer in KiCad's UI order | replaces the list: an enabled copper layer not named goes back to null (Board default); layers enabled copper, once each, offsets within 1,000 mm |
+| `boardFormatting` | pcb | `{applyToFields, applyToText, applyToShapes, applyToDimensions, applyToBarcodes, dashRatio, gapRatio}` | patch; ratios over 0 and at most 1,000; the panel's own steps (SetPlotOptions, the painter's ratios, a shape repaint) |
+| `tuningPatterns` | pcb | `{single_track_defaults, diff_pair_defaults, diff_pair_skew_defaults}`, each `min_amplitude`, `max_amplitude`, `spacing` (mm), `corner_style` (0, 1), `corner_radius_percentage` (0 to 100), `single_sided` | each object merged |
+| `componentClasses` | pcb (sch reads) | `{"sheet_component_classes.enabled": bool, "assignments": [...]}` (KiCad's JSON, the nested key with a dot) | patch; assignments replaced, each closed `{component_class (not empty), conditions_operator ALL or ANY, conditions {TYPE[-n]: {primary?, secondary?}}}`, TYPE one of the seven. The schematic face registers the same name: its get reads the project file, its set answers `bad_args` "component classes are set in the board editor" |
+| `tuningProfiles` | pcb | `{tuning_profiles_impedance_geometric: [...]}` KiCad's JSON (width, gap, delay, via delays in KiCad's internal units) | the list replaced whole, every profile closed, names unique and not empty, type 0 or 1, layer names KiCad's, a signal layer once per profile |
+| `annotation` | sch | `{"annotation.sort_order", "annotation.method", annotate_start_num, reuse_designators}` | patch; sort 0 or 1, method 0 to 2, start 0 to 999,999 |
+| `bomPresets` | sch | `{bom_presets, bom_fmt_presets, bom_settings, bom_fmt_settings}` | each value first read by KiCad's own `from_json` (a value KiCad would not load is refused), then replaces its key whole, `Load()` |
+
+**Export** `kicadTuningSolve( std::string ) -> std::string` in `cc_e12_pcb.inc`, block
+`cc_e12_pcb`, **merged image only** (`KICAD_MERGED_EMBIND`, the call reaches a pcbnew dialog
+object). Args closed: `{type: "single" | "differential", impedance, signalLayer, topRef?,
+bottomRef?, solveFor: "width" | "gap" | "delay", width?, gap?}` (mm; canonical names of enabled
+copper layers; gap only for a pair). Answers `{width: mm | null, gap: mm | null, delay: ps/cm |
+null, problem: "" | KiCad's message}`; "" for any other shape, no frame or an open in flight. A
+read: no record, no change. **The delay's unit is ps/cm** (KiCad's `EDA_UNITS::PS_PER_CM`, the
+unit the panel's Delay column shows), rounded to 4 places.
+
+**What the build train must probe** (fixture `settings-from/` once m8-i lands it; until then any
+4 layer board):
+1. `kicadSettingsSections()`: the board list holds the six board names, the schematic list
+   `annotation`, `bomPresets`, `componentClasses`. Failure: a name missing (a registrar that did
+   not run).
+2. Board: `kicadSettingsGet("zoneHatchOffsets")` lists one row per enabled copper layer, F.Cu
+   first. Set `{layers: [{layer: "In1.Cu", offset: [0.5, 0.5]}]}` then get: In1.Cu has
+   `[0.5, 0.5]`, every other row null; the board reads modified; undo depth unchanged.
+3. Board: set `tuningPatterns {single_track_defaults: {spacing: 1.2}}`, get reads 1.2 and the
+   other keys of that object unchanged; undo depth unchanged. `{corner_style: 2}`: bad_args.
+4. Board: `componentClasses` get answers the fixture's POWER assignment; a set of an assignment
+   with conditions `{"BOGUS": {}}`: bad_args, nothing changed.
+5. Board: `zoneDefaults {min_clearance: 0.6}` then draw a new zone (the zone tool's defaults
+   read 0.6). `boardFormatting {dashRatio: 6}`: a dashed shape repaints with longer dashes.
+6. Board: `kicadTuningSolve('{"type":"single","impedance":50,"signalLayer":"F.Cu","bottomRef":"In1.Cu","solveFor":"width"}')`
+   answers a width over 0 and a delay over 0 and problem "". The same with `"solveFor":"gap"`:
+   "". Differential with no gap and solveFor width: problem "Diff pair gap must be greater than
+   0 to calculate width", all values null. Failure: "" for the good call (the export did not
+   register: check the merged guard) or width null (the stackup read missed the reference).
+7. Schematic: `annotation` answers `annotation.sort_order` and `annotate_start_num` (100 on
+   the fixture); set `{"annotation.method": 1}` then get reads 1; `{"annotation.method": 3}`:
+   bad_args. `bomPresets` set of `bom_presets: [{"name": "x"}]`: bad_args (KiCad's own
+   from_json throws on the missing keys).
+
+Syntax check (after the merge, the lane's full faces):
+`/home/matthew/cc-wave2/bin/gate.sh scripts/kicad/syntax-check-run15.sh --kicad /home/matthew/cc-engine-wt/e12/kicad all --kicad-file pcbnew/dialogs/panel_setup_tuning_profile_info.cpp`:
+`PASS pcbnew (25682 ms)`, `PASS eeschema (21719 ms)`, `PASS symedit (9177 ms)`, `PASS fpedit
+(8919 ms)`, `PASS dsedit (1276 ms)`, `PASS kicad_editor (6429 ms)`, `PASS occ (16452 ms)`, `PASS
+kicad pcbnew/dialogs/panel_setup_tuning_profile_info.cpp (7766 ms)`, `syntax-check: 0 failed`.
+Export check: `scripts/kicad/check-run15-exports.sh --since run15/main --kicad
+/home/matthew/cc-engine-wt/e12/kicad --kicad-since run15/main`: `214 names registered in the
+merged image (207 kicad names), 69 of 110 run 15 names, 0 failures`.
+
 ## State for the relay (after st-editprefs-e)
 
 Done and committed: lo-e3s-e (3558c9e), st-routing-e (fe4e114), st-origins-e (134c8f1),
