@@ -125,3 +125,38 @@ PASS kicad pcbnew/dialogs/dialog_outset_items.cpp (5455 ms)
 PASS kicad pcbnew/autorouter/autoplace_tool.cpp (6042 ms)
 syntax-check: 0 failed
 ```
+
+## m3-e1: the conversion settings and Create Outsets ask the host (modal)
+
+No export (e1's prompt exports answer). Nothing in `cc_e2_pcb.inc`.
+
+**Host asks** (`window.kicadHostPrompt.onAsk({token, ask, modal: true, record})`), each from the dialog's own `ShowModal` override under `__EMSCRIPTEN__` (`LoadControlState()`, its own `TransferDataToWindow()`, the record, `CcHostPromptModal`; accepted `wxID_OK`, canceled `wxID_CANCEL`, not taken KiCad's own window):
+- `convert` from `CONVERT_SETTINGS_DIALOG::ShowModal` (the class lives in `pcbnew/tools/convert_tool.cpp`, hooked there; shown by `CONVERT_TOOL::CreatePolys`, 632, with copy line width shown only for some sources and centerline and bounding hull always, and by `CONVERT_TOOL::CreateLines`, 1370, with no strategy at all). Record `{ strategies, strategy, gap, lineWidth, deleteOriginals }`: `strategies` the radio buttons the dialog shows, in order, from `copyLineWidth`, `centerline`, `boundingHull` (`CONVERT_STRATEGY`; the constructor's three show flags are kept in members under `__EMSCRIPTEN__`); `strategy` the selected one (KiCad's settings may select a strategy the dialog hides, as KiCad does); `gap`, `lineWidth` mm (the bounding hull's). Answer `{ strategy?, gap?, lineWidth?, deleteOriginals? }`, closed: a strategy not in `strategies` refuses with field `strategy`; lengths finite and >= 0. The radio set, then its own `onRadioButton`, the lengths, the box, then `TransferDataFromWindow` (fills the tool's `CONVERT_SETTINGS`), then `SaveControlState()`.
+- `outset` from `DIALOG_OUTSET_ITEMS::ShowModal` (`pcbnew/dialogs/dialog_outset_items.cpp`; shown by `CONVERT_TOOL::OutsetItems`, `convert_tool.cpp` 1679). Record `{ outsetDistance, roundCorners, useSourceLayers, useSourceWidths, layer, layers, lineWidth, gridRounding, deleteSourceItems }` (`OUTSET_ROUTINE::PARAMETERS`): lengths mm, `gridRounding` mm or null (null when Round to grid is off), `layer` the selected layer's canonical name (`LSET::Name`) and `layers` the canonical names the dialog's layer list offers (the board's enabled layers, in KiCad's UI order). Answer the same keys but `layers`, closed: `layer` must be one of `layers`; `gridRounding` null turns rounding off, a number > 0 turns it on with that grid. KiCad's one refusal ("Line width must be a positive value.", a `DisplayErrorMessage` in its `TransferDataFromWindow`) is checked BEFORE anything is written, so no message box is ever raised: field `lineWidth`, KiCad's sentence as the message (through `CcPromptCaptureMessage`). Then the values through the dialog's own controls and handlers (`OnCopyLayersChecked`, `OnRoundToGridChecked`), `TransferDataFromWindow` (which also keeps KiCad's recent values lists), `SaveControlState()`.
+
+**Files (kicad `seat/run15-e2`, commit 26d7b7e9):** `pcbnew/tools/convert_tool.cpp`, `pcbnew/dialogs/dialog_outset_items.{h,cpp}`. Everything under `#ifdef __EMSCRIPTEN__`. **Header change reach:** `dialog_outset_items.h` (host_prompt.h and the ShowModal declaration) is included by `dialog_outset_items.cpp` and `convert_tool.cpp` only.
+
+**Probes (canvas-kinds fixture, Board, Edit mode, a listener that records and returns true):**
+1. Select the two lines meeting at a corner, Convert, Create a polygon from the selection: ask `convert`, `strategies` `["copyLineWidth","centerline","boundingHull"]` (or without `copyLineWidth` where KiCad hides it); answer `{"strategy":"centerline","deleteOriginals":false}`: a polygon appears on the lines' layer, the lines stay; one Undo removes it. Wrong if: KiCad's window shows, or the lines are deleted.
+2. Convert, Create lines from a polygon: ask `convert` with `strategies` `[]`; answer `{"deleteOriginals":true}`: the lines appear, the polygon goes, one undo step. `{"strategy":"centerline"}` here refuses with field `strategy`.
+3. Select the Edge.Cuts rectangle, Create outsets: ask `outset`, `layer` `Edge.Cuts`-or-the-saved-layer, `layers` the board's enabled layers; answer `{"outsetDistance":0.5,"roundCorners":true}`: a rectangle with round corners 0.5 mm outside; Undo removes it.
+4. Refusals: `{"lineWidth":0}` gives field `lineWidth` and message "Line width must be a positive value." with no message box; `{"layer":"In30.Cu"}` on a two layer board field `layer`; `{"gridRounding":0}` field `gridRounding`; `{"layers":[]}` field `layers`.
+5. No listener: both KiCad dialogs show as before.
+
+**Syntax check:** the run pasted under m6-e1 (`PASS kicad pcbnew/tools/convert_tool.cpp`, `PASS kicad pcbnew/dialogs/dialog_outset_items.cpp`, `syntax-check: 0 failed`).
+
+## st-ap-e: K-AP, the auto-placer with no progress window, and its marker
+
+**Export** `kicadAutoplaceQuiet() -> bool` in `cc_e2_pcb.inc`, function `cc_e2::autoplaceQuiet`, block `cc_e2_pcb`: a marker, always true (the island lists cap `autoplace` when the engine registers it). Registered in both pcbnew configurations (not merged image only).
+
+**KiCad (kicad `seat/run15-e2`, commit e4659a03):** `pcbnew/autorouter/autoplace_tool.cpp`, `AUTOPLACE_TOOL::autoplace`: under `__EMSCRIPTEN__` the autoplacer gets `SetProgressReporter( nullptr )` in place of the `WX_PROGRESS_REPORTER` "Autoplace Footprints" (`AR_AUTOPLACER` checks the reporter before every report, `ar_autoplacer.cpp` 882 to 923; with none it cannot be aborted midway, as KiCad's own null reporter path). The board edges info bar error and the rest are KiCad's. No header changed.
+
+**pcbjam:** commit e1073be (`cc_e2_pcb.inc`).
+
+**Probes (Glasgow, Board, Edit mode):**
+1. `kicadAutoplaceQuiet()` true.
+2. Move two footprints off the board outline, press `pcbnew.Autoplacer.autoplaceOffboard`: no KiCad window of any kind (`visibleDialogs` empty throughout), the two footprints land inside the outline, one undo step "Autoplace Footprints". Select one footprint, `autoplaceSelected`: the same, for that one.
+3. A board with no Edge.Cuts: KiCad's info bar "Board edges must be defined on the Edge.Cuts layer.", nothing placed, no window.
+4. occ_service links with `kicadAutoplaceQuiet` registered.
+
+**Syntax check:** the run pasted under m6-e1 (`PASS pcbnew`, `PASS occ`, `PASS kicad pcbnew/autorouter/autoplace_tool.cpp`, `syntax-check: 0 failed`).
