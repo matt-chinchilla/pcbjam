@@ -25,6 +25,9 @@
 // router reads the new rules), the stackup and finish sets included; the stackup set adds and
 // removes a dielectric sublayer (Board Setup's Add and Remove Dielectric Layer); the reannotate
 // op's duplicate check skips empty and invalid designators as the dialog's does.
+// The sections' get reads through ccPcbSettingsRead, which reads a given board and project
+// (the open design's, or another loaded beside it for kicadSettingsRead), and the registry
+// struct gains a reader at its end.
 
 #include <board_stackup_manager/board_stackup.h>
 #include <board_stackup_manager/stackup_predefined_prms.h>

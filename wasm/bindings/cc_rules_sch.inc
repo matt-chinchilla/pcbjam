@@ -21,6 +21,10 @@
 // inc (ccRegisterSchSection), consulted after the built-in sections by the get, the set
 // (before Schematic Setup's OK steps, ccSchSettingsChanged) and the list (ccSchSections,
 // schSettingsSections for the export kicadSettingsSections).
+//
+// Modified by Circuit Center Inc on 2026-11-18: the sections' get reads through
+// ccSchSettingsRead, which reads a given project (the open one, or another loaded beside it
+// for kicadSettingsRead), and the registry struct gains a reader at its end.
 
 #include <bus_alias.h>
 #include <font/font.h>
