@@ -454,6 +454,54 @@ bool layerPairsSet( PCB_EDIT_FRAME* aFrame, const json& aValue, bool aDryRun, st
     return true;
 }
 
+// ── origins (st-origins-e, PE8): the board's grid origin and drill (aux) origin, mm, as
+// PCB_CONTROL::DoSetGridOrigin and BOARD_EDITOR_CONTROL::DoSetDrillOrigin set them ({x: 0,
+// y: 0} is KiCad's Reset). {grid_origin?: {x, y}, aux_origin?: {x, y}}. The two origin markers
+// follow on the tool reset of Board Setup's OK steps (both tools re-read the design settings on
+// MODEL_RELOAD); KiCad's own grid origin press makes an undo step, a settings set does not.
+
+json originsGet( PCB_EDIT_FRAME* aFrame )
+{
+    BOARD_DESIGN_SETTINGS& bds = aFrame->GetBoard()->GetDesignSettings();
+    json                   out = json::object();
+
+    out["grid_origin"] = pointJson( bds.GetGridOrigin() );
+    out["aux_origin"] = pointJson( bds.GetAuxOrigin() );
+    return out;
+}
+
+bool originsSet( PCB_EDIT_FRAME* aFrame, const json& aValue, bool aDryRun, std::string& aError,
+                 std::string& aMessage, json& aRecord )
+{
+    if( !patchKeysIn( aValue, { "grid_origin", "aux_origin" } ) )
+        return false;
+
+    std::optional<VECTOR2I> grid, aux;
+
+    if( aValue.contains( "grid_origin" ) && !( grid = readPoint( aValue["grid_origin"], 1000.0 ) ) )
+        return false;
+
+    if( aValue.contains( "aux_origin" ) && !( aux = readPoint( aValue["aux_origin"], 1000.0 ) ) )
+        return false;
+
+    if( aDryRun )
+        return true;
+
+    BOARD_DESIGN_SETTINGS& bds = aFrame->GetBoard()->GetDesignSettings();
+
+    if( grid )
+    {
+        bds.SetGridOrigin( *grid );
+        aFrame->GetCanvas()->GetGAL()->SetGridOrigin( VECTOR2D( *grid ) );
+    }
+
+    if( aux )
+        bds.SetAuxOrigin( *aux );
+
+    aFrame->GetCanvas()->GetView()->MarkDirty();
+    return true;
+}
+
 // ── stackupLayers (lo-e3s-e): the dielectric sublayers Board Setup's Add and Remove Dielectric
 // Layer work on. Its name in kicadSettingsSections tells the island the stackup set takes
 // addDielectric and removeDielectric (ccStackupDielectricEdit in cc_rules_pcb.inc).
@@ -511,6 +559,7 @@ bool stackupLayersSet( PCB_EDIT_FRAME* aFrame, const json& aValue, bool aDryRun,
 
 const bool kRouter = ccRegisterPcbSection( { "router", "pcb", &pcb::routerGet, &pcb::routerSet } );
 const bool kLayerPairs = ccRegisterPcbSection( { "layerPairs", "pcb", &pcb::layerPairsGet, &pcb::layerPairsSet } );
+const bool kOrigins = ccRegisterPcbSection( { "origins", "pcb", &pcb::originsGet, &pcb::originsSet } );
 const bool kStackupLayers = ccRegisterPcbSection( { "stackupLayers", "pcb", &pcb::stackupLayersGet,
                                                     &pcb::stackupLayersSet } );
 } // namespace cc_e12

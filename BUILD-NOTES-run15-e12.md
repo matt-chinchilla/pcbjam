@@ -23,72 +23,15 @@ settings); record `settings.json` `{value}` then `.cc-settings.json` last. None 
 code sits under `KICAD_MERGED_EMBIND`: every section exists in the merged image and in
 occ_service's compile of `pcbnew_embind.cpp` (the `occ` unit passes).
 
-## lo-e3s-e: the tool reset, numbering on Glasgow, stackup dielectric add and remove
+## lo-e4-e: net names from the board onto the schematic
 
-Changed `kicadSettingsGet`, `kicadSettingsSet`, `kicadBoardEdit` (no new export, no marker, no
-KiCad file). Files: pcbjam `wasm/bindings/cc_rules_pcb.inc` (the board settings set path, the
-stackup section, the reannotate op) and `wasm/bindings/cc_e12_pcb.inc` (section `stackupLayers`).
+Commits: kicad KLO (`backannotate.h`, `backannotate.cpp`), pcbjam PLO (`cc_e8_pcb.inc`, `cc_e8_sch.inc`).
 
-**PE31, the tool reset.** `ccPcbSettingsChanged` (Board Setup's OK steps, run after every taken
-board section set that is not a preference) now ends as `PCB_EDIT_FRAME::ShowBoardSetupDialog`
-does: `GetToolManager()->ResetTools( TOOL_BASE::MODEL_RELOAD )`, then a `TOOL_EVENT( TC_COMMAND,
-TA_MODEL_CHANGE, AS_ACTIVE )` without position through `ProcessEvent` (the event that makes the
-router reload its design rules). The dialog's `ReCreateAuxiliaryToolbar()` is left out: it is a
-protected member of `PCB_EDIT_FRAME` (the syntax check refused it) and the aux toolbar is chrome
-the engine never shows. The stackup and finish sets, which ran only `OnModify` and a repaint in
-run 14, now run `ccPcbSettingsChanged` too, so every board section set resets the tools (router
-and layerPairs of st-routing-e ride this reset and add none). ResetTools deactivates the active
-tool first (KiCad's own behavior: a route in progress is cancelled by a settings set).
+**KiCad (under `#ifdef __EMSCRIPTEN__`):** `BACK_ANNOTATE` gains `CC_PAD_NET`, `CC_NET_ROW`, `CcProcessNetNames( SCH_COMMIT*, pads )` and two members (`m_ccLastLabel`, `m_ccLastOutcome`). `CcProcessNetNames` is applyChangelist's net name loop (a pin's `Connection( &sheetPath )->Name( true )` against the pad's net, `processNetNameChange` when they differ) over the host's pads, symbols matched by reference (`GetSymbols( SYMBOL_FILTER_NON_POWER )`, each unit tried until one holds the pin). `processNetNameChange` records its outcome (`rename` with the label's uuid, `add`, `refused` for a power pin) beside its own lines. **Header change:** `eeschema/tools/backannotate.h` (class `BACK_ANNOTATE`) is included only by `backannotate.cpp` and `dialogs/dialog_update_from_pcb.cpp`: two files recompile.
 
-**PE36, diagnosis then fix.** Cause: Glasgow revC3 carries seven footprints whose designator is
-`REF**` (logos, no digit: the dialog's INVALID_REFDES). Run 14's duplicate check counted every
-footprint's final designator, so the seven `REF**` were "two parts sharing a designator" and every
-run answered `duplicate_designator`. KiCad's dialog (`dialog_board_reannotate.cpp` 583 to 605)
-scans its change array and never lets an EMPTY or INVALID entry start a duplicate. Fix: the count
-keeps, per designator, whether any entry of it is numbered or kept (not empty, not invalid); a
-designator only empty or invalid entries share is no duplicate. With it, the scope choice now
-overrides the designator's own state as `BuildFootprintList` does (selected, front or back: in
-scope is numbered, out of scope excluded, an invalid designator in scope numbered as KiCad does);
-"all" keeps empty and invalid designators unnumbered with their warning line, as before.
-
-**Stackup add and remove.** `ccStackupDielectricEdit` (cc_rules_pcb.inc) is the one home:
-`{addDielectric: {after: index}}` takes an ENABLED dielectric item (`index` is the item's index as
-the stackup section's rows carry it in `index`) and adds a sublayer after its last one with
-`BOARD_STACKUP_ITEM::AddDielectricPrms`, material set to KiCad's `NotSpecifiedPrm()` (what the
-panel's transfer writes for an empty field); refused when the stackup already reads 256 rows.
-`{removeDielectric: {index, sub}}` takes a sublayer of an enabled dielectric with two or more
-(`RemoveDielectricPrms`), as the dialog's list offers. Exactly one action per set, never beside
-`rows`. After the edit the board thickness is rebuilt from the stackup and Board Setup's OK steps
-run. No undo step. Section `stackupLayers` (cc_e12_pcb.inc, registered `kStackupLayers`): get
-`{dielectrics: [{index, name (FormatDielectricLayerName), sublayers, removable}], rows, canAdd}`
-over enabled dielectrics; set takes the same two actions (same function), so its name in
-`kicadSettingsSections` is the island's sign that the stackup set takes them.
-
-**What the build train must probe (Glasgow, board frame console, Edit mode):**
-1. `kicadSettingsSections()` lists `stackupLayers`. Wrong: absent (the registrar did not run).
-2. `kicadSettingsGet('stackup')`, note the rows count N and the index of the first dielectric
-   row D; `kicadSettingsSet({run:1, dir:'/tmp/cc-settings/1', section:'stackup', value:
-   {addDielectric:{after:D}}})` then the record's value has N+1 rows, a new row with `index` D,
-   `sub` 1, material "Not specified" (or its untranslated keyword), thickness 0, epsilon 1; undo
-   depth unchanged. Then `{removeDielectric:{index:D, sub:1}}`: N rows again. Wrong: bad_args on
-   a dielectric index, or a row added at sub 0, or the undo depth moved.
-3. `{addDielectric:{after:0}}` (index 0 is the top silkscreen or paste, not a dielectric):
-   `bad_args`. `{removeDielectric:{index:D, sub:0}}` on a one sublayer dielectric: `bad_args`.
-   `{addDielectric:{after:D}, rows:[]}`: the export answers false or bad_args.
-4. Tool reset: Setup, Net classes, Default clearance 0.6 mm; press X and route from a pad toward
-   another net's track: the router keeps 0.6 mm. Wrong: it keeps the old clearance (the reset or
-   the model change event did not reach the router).
-5. Numbering: `kicadBoardEdit({run:1, dir:'/tmp/cc-edit/1', op:'reannotate', preview:true,
-   filter:{}, set:{}})`: the record has rows and no `duplicate_designator`; its lines carry seven
-   warnings "REF** is not numbered and keeps its designator". Apply (preview false): one undo step
-   (depth +1), both engines' Undo restore. Wrong: `duplicate_designator` (the check still counts
-   invalid designators), or a REF** renumbered in scope "all".
-
-Syntax check (from this worktree, kicad worktree `/home/matthew/cc-engine-wt/e12/kicad`):
-`/home/matthew/cc-wave2/bin/gate.sh scripts/kicad/syntax-check-run15.sh --kicad /home/matthew/cc-engine-wt/e12/kicad pcbnew`
-at this commit: `PASS pcbnew pcbnew_embind.cpp subdir=pcbnew -DKICAD_MERGED_EMBIND (14076 ms)`,
-`syntax-check: 0 failed`. The first try refused `ReCreateAuxiliaryToolbar` (protected), removed.
-No header change, no include path, no CMake or build script line, no new export.
+**PCBJam:**
+- `kicadBoardPadNets()` in `cc_e8_pcb.inc`, block `cc_e8_pcb` (pcbnew TU; not merged only, it calls only the board): `{"pads": [{ref, pad, net}], "truncated"}`, the board's `MAIL_PCB_GET_NETLIST` reply's facts (board only footprints left out, `GetShortNetname`, pads with no net left out), at most 32,768. A read.
+- `kicadSchRenameNets( std::string )` in `cc_e8_sch.inc`: `{run, dir: "/tmp/cc-renameNets/<n>", preview, pads (1 to 32,768)}`. On the coroutine: `RecalculateConnections( NO_CLEANUP )`, a `BACK_ANNOTATE` with net names alone (no relink, no other property, no swaps), `aDryRun` = preview; the rows; ONE commit "Update net names" when not a preview. Record `renameNets.json` `{preview, rows: [{ref, pin, from, to, sheetPath, outcome, label?}], applied, truncated, depth}` last. `outcome` is ADDED beyond the manifest's row (for lo-e4-i).
 
 ## st-routing-e: sections router and layerPairs
 
@@ -140,3 +83,29 @@ different copper layers the board enables. KiCad's own queued events write the p
 Syntax check at this commit:
 `/home/matthew/cc-wave2/bin/gate.sh scripts/kicad/syntax-check-run15.sh --kicad /home/matthew/cc-engine-wt/e12/kicad pcbnew`:
 `PASS pcbnew pcbnew_embind.cpp subdir=pcbnew -DKICAD_MERGED_EMBIND (12064 ms)`, `syntax-check: 0 failed`.
+
+## st-origins-e: section origins
+
+Changed `kicadSettingsGet`, `kicadSettingsSet` (one registered section `origins`, `kOrigins`, in
+`cc_e12_pcb.inc`; no new export). Get `{grid_origin: {x, y}, aux_origin: {x, y}}` in mm (the
+board's design settings, KiCad's file names; the aux origin is the drill and place origin). Set
+`{grid_origin?, aux_origin?}`, each exactly `{x, y}` within plus or minus 1000 mm; `{x: 0, y: 0}`
+is KiCad's Reset (`gridResetOrigin`, `drillResetOrigin`). The set does what
+`PCB_CONTROL::DoSetGridOrigin` and `BOARD_EDITOR_CONTROL::DoSetDrillOrigin` do (design settings,
+the GAL's grid origin, the view marked dirty); the two origin markers follow on the tool reset of
+Board Setup's OK steps (`setupOk` true: both tools re-read the design settings on MODEL_RELOAD,
+`pcb_control.cpp` 124, `board_editor_control.cpp` 340). KiCad's own reset press makes an undo step
+(UNDO_REDO::GRIDORIGIN); a settings set makes none (the section rule).
+
+**What the build train must probe (Glasgow, board frame console):**
+1. `kicadSettingsSections()` lists `origins`.
+2. Set `{grid_origin:{x:10, y:20}}`: get reads 10 and 20; the grid origin marker and the grid
+   itself move to (10, 20) mm on the canvas. Set `{grid_origin:{x:0, y:0}, aux_origin:{x:0,
+   y:0}}`: both at 0, both markers at the page origin. Undo depth unchanged. Wrong: the get moves
+   but the marker or the grid stays (the tool reset did not reach PCB_CONTROL).
+3. `{grid_origin:{x:10}}`, `{origin:{x:1,y:1}}`, `{aux_origin:{x:5000, y:0}}`: bad_args.
+
+Syntax check at this commit:
+
+`/home/matthew/cc-wave2/bin/gate.sh scripts/kicad/syntax-check-run15.sh --kicad /home/matthew/cc-engine-wt/e12/kicad pcbnew`:
+`PASS pcbnew pcbnew_embind.cpp subdir=pcbnew -DKICAD_MERGED_EMBIND (11951 ms)`, `syntax-check: 0 failed`.
