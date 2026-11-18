@@ -21,6 +21,19 @@
 // one BOARD_COMMIT, and its add into a container. Positions in the read and the apply are
 // relative to aOrigin; aBoardFrame says which frame the item lives in (the board editor, or
 // the footprint editor's own).
+//
+// The contract of the three bodies (lane e4, 2026-11-18; every kind and every caller keeps it):
+//   get  the item's record WITHOUT "kind" and "uuid": ccFpItemJson writes both after it.
+//   set  the patch alone (the caller strips nothing: the patch never holds "kind" or "uuid").
+//        It reads and checks EVERY key before it changes anything; a refused patch answers
+//        false having staged and changed nothing. A taken patch calls aCommit.Modify( item )
+//        (and on any other item it changes) BEFORE the change, then answers true. A key the
+//        item does not have (a key of another subtype) is a refusal.
+//   add  the record less "kind" and "uuid": a NEW item parented to aParent (or to the
+//        footprint that aParent is or holds) and NOT yet added to it, or nullptr for a refused
+//        record. The caller stamps the page's uuid on it and stages aCommit.Add( item ): the
+//        commit's Push puts it into the footprint (the footprint editor) or the board. A body
+//        that also makes children (a table's cells) owns them through the new item.
 
 #pragma once
 
@@ -58,6 +71,9 @@ void ccRegisterItemKind( const CcItemKind& aKind );
 
 /** The kind of that name, or nullptr. */
 const CcItemKind* ccItemKind( const std::string& aName );
+
+/** The kind name of an item by its KiCad type (pad, field, ..., point), or nullptr for none. */
+const char* ccItemKindName( const BOARD_ITEM* aItem );
 
 /** An item's record, positions relative to aOrigin. */
 json ccFpItemJson( const BOARD_ITEM* aItem, const VECTOR2I& aOrigin, bool aBoardFrame );

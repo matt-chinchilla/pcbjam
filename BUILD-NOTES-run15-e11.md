@@ -45,3 +45,104 @@ syntax-check: 0 failed
 (the pcbnew unit's PASS line scrolled off this run; the handover runs `all` and pastes every line.)
 
 Export check, after `git merge run15/main` in both worktrees: `scripts/kicad/check-run15-exports.sh --since run15/main --kicad /home/matthew/cc-engine-wt/e11/kicad --kicad-since run15/main` printed `146 names registered in the merged image (139 kicad names), 1 of 110 run 15 names, 0 failures`.
+
+## 3d-e2: KiCad's 3D export in every format (P3D-1, P3D-2, K-3D3; PE47, PE46's VRML half)
+
+The relay seat after the machine fault found both worktrees clean with nothing ahead of `run15/main`: no cut off work to stash.
+
+- Exports: none new. `kicadExportBoardOutput` and `kicadOutputJobs` widened. Merged image only: nothing (the settings merge and the run are in every pcbnew tree; the stub is compiled only where the 3D service is not, kicad `pcbnew/CMakeLists.txt` 932 to 939).
+- kicad `common/jobs/job_export_pcb_3d.cpp` (commit e37af5bf), K-3D3: under `__EMSCRIPTEN__` the constructor binds the job keys `net_filter` and `component_filter` (strings, default empty) to `m_3dparams.m_NetFilter` and `m_3dparams.m_ComponentFilter` (declared in `job_export_pcb_3d.h` 77 and 78, so no header edit and no wide recompile). The stub rebuilds the job JSON from `m_3dparams`, so the filters now reach the service, whose `EXPORTER_STEP` reads them (`exporter_step.cpp` 211, 552, 1192).
+- pcbjam (commit 271a792):
+  - `wasm/stubs/exporter_step_stub.cpp`, P3D-1: the request to `globalThis.occService.request` is `{ kind: 'export', board, jobJson, fileName, outPath }`, `outPath` the absolute `m_outputFile`; a file already at `outPath` is removed before the request; after an `ok` answer an absent or empty file is the error line "The 3D service made no file." and the export fails. The job's warnings reach the reporter as before.
+  - `wasm/bindings/cc_output_3d.h`, P3D-2: `ccFixPcbExport3d( merged, defaults, sent, out )` (now `bool`; the declaration in `cc_output_common.h` and its one call follow). `format` one of `step stpz brep xao glb ply stl u3d pdf vrml` (KiCad's own names), else the refusal "The 3D file is made as STEP, STPZ, BREP, XAO, GLB, PLY, STL, U3D, PDF or VRML."; the island's `cc_occ` (not a job key: read from what was sent, taken off the dropped list) must be a boolean or the whole call is refused (false, nothing queued); `cc_occ: false` keeps "Only VRML is made here." for every format but vrml. Forced: `overwrite` true, `vrml_model_dir` "", `vrml_relative_paths` false, `variant` "". `subst_models` is now as sent (KiCad's default true; run 14 forced false). `MERGE_RESULT::expectFile` names the extension the run must leave (`wrl` for vrml, else the format's name).
+  - `wasm/bindings/pcbnew_embind.cpp`: the check after a 3D run in `ccRunBoardOutput` (the function `pcbExportBoardOutput` queues: the manifest's "the header-only check becomes the per format output check" is that hunk, the only place it lives; reported to E0 as the lease's edge) now reads `expectFile`: the format's file must exist and hold more than 0 bytes (VRML more than 64), else it is removed and the run fails with "The 3D service made no file." (VRML: "The VRML exporter wrote no board (an empty scene)."). Before, every format but VRML failed there.
+- PE46, the VRML header only file, DIAGNOSED, not fixed in this lane (RULINGS 5: the cause is in no file of this lane, nor of any lane): `S3D::WriteVRML` writes the 16 byte "#VRML V2.0 utf8" header, then `SCENEGRAPH::WriteVRML` writes nothing for a transform with no shapes (`3d-viewer/3d_cache/sg/scenegraph.cpp` 233). The scene is empty because every `VRML_LAYER::Tesselate` (`utils/idftools/vrml_layer.cpp`) collects its triangles and outlines only between its `GLU_TESS_BEGIN_DATA` and `GLU_TESS_END_DATA` callbacks (`glStart`, `glEnd`, 1424 to 1530), and the WebAssembly GLU tessellator, PCBJam's earcut shim `libs/kimath/glu_tess/glu_tess_impl.cpp` (compiled by `common/gal/CMakeLists.txt` 96), never calls the begin or end callbacks and ignores `GLU_TESS_BOUNDARY_ONLY` (the first pass `Tesselate` runs for the outlines, 754 onward). `exporter_vrml.cpp` is unchanged (the manifest allows it only if the cause is there). The fix belongs in that shim (call begin with `GL_TRIANGLES` and end around the triangles; a boundary only pass needs a real winding rule tessellator, the SGI GLU reference one KiCad's desktop links): reported to E0, held. Until then the VRML guard keeps its line.
+- Checks (before the merge of `run15/main`), from `/home/matthew/cc-engine-wt/e11/pcbjam`: `/home/matthew/cc-wave2/bin/gate.sh scripts/kicad/syntax-check-run15.sh --kicad /home/matthew/cc-engine-wt/e11/kicad all --kicad-file common/jobs/job_export_pcb_3d.cpp`
+
+```
+PASS pcbnew         pcbnew_embind.cpp subdir=pcbnew -DKICAD_MERGED_EMBIND (12481 ms)
+PASS eeschema       eeschema_embind.cpp subdir=eeschema -DKICAD_MERGED_EMBIND (12061 ms)
+PASS symedit        symedit_embind.cpp subdir=eeschema  (7511 ms)
+PASS fpedit         fpedit_embind.cpp subdir=pcbnew  (6618 ms)
+PASS dsedit         dsedit_embind.cpp subdir=pagelayout_editor  (1113 ms)
+PASS kicad_editor   kicad_editor_embind.cpp subdir=common  (4967 ms)
+PASS occ            pcbnew_embind.cpp subdir=pcbnew (11983 ms)
+PASS kicad common/jobs/job_export_pcb_3d.cpp (4675 ms)
+syntax-check: 0 failed
+```
+
+  The stub is a pcbjam file the script's `--kicad-file` cannot name (it prefixes `/workspace/kicad/`); it was checked with its own line from the cache volume's `kicad-kicad_editor/compile_commands.json` (`/workspace/wasm/stubs/exporter_step_stub.cpp`), the same extraction and mounts as the script's KiCad file mode, `-fsyntax-only`, read only: `PASS stub wasm/stubs/exporter_step_stub.cpp`. Reported to E0: the script could take pcbjam stubs (`--pcbjam-file`).
+- What the build train must probe (frame pcb, island harness, `tests/fixtures/glasgow`):
+  1. `JSON.parse(Module.kicadOutputJobs()).board.pcb_export_3d` holds `net_filter` and `component_filter` (strings, ""). Wrong if absent: K-3D3 not in the image.
+  2. `project.export` `pcb_export_3d` `{format: 'step'}` with the island's 3D service writing at `outPath`: code 0, a `.step` in the run folder whose first bytes read `ISO-10303-21`. Wrong if code -1 "The 3D service made no file." (the island ignored `outPath`, or wrote elsewhere: compare the path in the request) or "The 3D file is made as ..." (the format list).
+  3. Each of `stpz brep xao glb ply stl u3d pdf`: a non empty file with that extension. 
+  4. `{format: 'step', component_filter: 'U1'}`: fewer bodies than without (occt-import-js count).
+  5. `{format: 'step', cc_occ: false}`: code -1, "Only VRML is made here.", `dropped` does NOT list `cc_occ`; `{format: 'vrml', cc_occ: false}` runs. `{cc_occ: 'no'}`: the call answers false (nothing queued).
+  6. `{format: 'vrml'}`: today code -1 with "The VRML exporter wrote no board (an empty scene)." (PE46 held, see the diagnosis); once the GLU shim calls begin and end, a `.wrl` over 1 MB (kicad-cli 10.0.4: about 18 MB).
+  7. Undo depth unchanged and the board unmodified after each run.
+
+## 3d-e5: board model exports (PE33)
+
+- Exports, all in `wasm/bindings/cc_e11_pcb.inc` (commit bc3aa29), block `EMSCRIPTEN_BINDINGS( cc_e11_pcb )`, MERGED IMAGE ONLY (code and registration under `KICAD_MERGED_EMBIND`; occ_service has no editor and the staged model probe is the 3D viewer library's): `kicadBoardModels` -> `cc_e11::boardModels`, `kicadBoardSetModels` -> `cc_e11::boardSetModels`, `kicadBoardEmbedModels` -> `cc_e11::boardEmbedModels`. No host ask, no marker, no KiCad file.
+- `kicadBoardModels()`: `{ footprints: [{ uuid, ref, models: [{ path, offset, rotate, scale, opacity, show, found }], kind: { smd, tht, unspecified, notInPos, dnp } }], embedded: [{ name, type, bytes }] }`; `""` with no board or `pcbjam_open::busy()`. `found`: a `kicad-embed://` name the footprint or the board holds is `embedded` (else `missing`); otherwise KiCad's own resolver (`PROJECT_PCB::Get3DFilenameResolver`, the 3D cache's) resolving to an existing file is `project`, or `staged` when that file is under `/pcbjam/3dmodels/`; otherwise `PCBJAM_3D::FindStagedModel` (declared in the inc: its header `3d-viewer/3d_cache/pcbjam_model_fetch.h` is not on the bindings' include path) answering is `staged`; else `missing`. `kind.notInPos` and `kind.dnp` are for the board's current variant (`GetExcludedFromPosFilesForVariant`, `GetDNPForVariant`). `embedded` lists the board's files with KiCad's type word (`model`, `font`, `worksheet`, `datasheet`, `other`) and `bytes` the file's decompressed size.
+- `kicadBoardSetModels(argsJson)`: `{ label: 'Update model names' | 'Change models', items: [{ uuid, models: [{ path, offset, rotate, scale, opacity, show }] }] }`, closed shapes (a line with any other key, `found` included, is refused); 1 to 4,096 items, uuids lowercase 8-4-4-4-12, each a footprint of the board and none twice; 0 to 64 lines each; paths 1 to 1,024 characters with no control character; vectors three finite numbers; opacity 0 to 1. False with nothing queued otherwise. On the apply coroutine every footprint is re-resolved (one gone: nothing pushed), then ONE `BOARD_COMMIT`, `Modify` per footprint, the lines replaced, `Push( label )`: one undo step. `kicadFootprintSetModels` (cc12) unchanged.
+- `kicadBoardEmbedModels(argsJson)`: `{ items: [{ uuid, index, file, alt? }] }`, 1 to 4,096; every `file` and `alt` in ONE embed run folder `/tmp/cc-embed/<n>/<name>` (`cc_output::IsEmbedRunDir`, no deeper folder), existing, at most 25 MiB each and 512 MiB together (each file counted once); `index` a model line of that footprint, no line twice. Answers `{ embedded: lines relinked, names: [the distinct file names, sorted], bytes: their total }` once queued; `""` on refusal (nothing queued, the folder left to the host). On the coroutine: the footprints re-resolved; each file added with `EMBEDDED_FILES::AddFile( fname, false )` as `PCB_CONTROL::CollectAndEmbed3DModels` adds it (`pcbnew/tools/pcb_control.cpp` 2956, its type from the extension: model), `alt` beside it; if KiCad cannot add one, the names this call added are removed and nothing is pushed; else ONE commit, `Modify` per footprint (before the change, unlike KiCad's own function, which calls it after), each line's path set to `file->GetLink()` (`kicad-embed://<name>`), `Push( "Keep models inside the board" )`; the folder removed in every case. The embedded files themselves are board state outside the undo step, as in KiCad.
+- Checks: the same syntax check run as 3d-e2 above (pcbnew and occ PASS: the guarded code compiles in the merged unit and is absent from the occ unit).
+- What the build train must probe (frame pcb, island harness):
+  1. Glasgow: `JSON.parse(Module.kicadBoardModels())` lists 272 footprints and 224 model lines; the 8 lines that leave the project read `found: 'missing'`. Wrong if every line reads `missing` (the resolver's project path) or `staged` lines read `missing` before the island staged them (expected: staged only after the 3D tab fetched them).
+  2. `Module.kicadBoardSetModels` with 40 Glasgow footprints' lines rewritten from `${KICAD6_3DMODEL_DIR}` to `${KICAD10_3DMODEL_DIR}`: true; after `kicadCollabBusy` clears, the undo depth is one more; one Ctrl+Z (`key.press`) restores all 40 (read `kicadBoardModels` again). A uuid that is no footprint's: false, nothing changed; a line holding `found`: false.
+  3. `tests/fixtures/models3d-small`: stage `cube.step` in `/tmp/cc-embed/1/`, `kicadBoardEmbedModels({items:[{uuid, index: 0, file: '/tmp/cc-embed/1/cube.step'}]})` answers `{embedded: 1, names: ['cube.step'], bytes: <size>}`; after the queue empties the board text holds `(embedded_files` and the line reads `kicad-embed://cube.step` with `found: 'embedded'`, `/tmp/cc-embed/1` is gone, one undo step restores the old path. A file in `/tmp/elsewhere/` answers `""`. A 26 MiB file answers `""`.
+
+## lo-e3o-e: output job faults (PE48 the drill report, PE46's O23 half the footprint list)
+
+(The manifest's `BUILD-NOTES-run15-outputs-faults.md` is this section.)
+
+- Exports: none new; `kicadExportBoardOutput` changed in behavior. Merged image only: nothing.
+- PE48, diagnosed in KiCad's `PCBNEW_JOBS_HANDLER::JobExportDrill`: with a temporary output folder (our run folder, as KiCad's jobset runner sets it) `outPath` is `/tmp/cc-out/<n>/`; the default report path is built inside it, absolute (`<board>-drill.rpt`), then passed again to `JOB::ResolveOutputPath( path, true, ... )`, which turns ANY absolute path into the temporary folder itself (`common/jobs/job.cpp` 127, `fn.AssignDir( m_tempOutputDirectory )`); `GenDrillReportFile` then writes over a folder and the job ends with exit code 4 (`ERR_INVALID_OUTPUT_CONFLICT`). The drill files themselves were written first. Fixed at the cause in kicad `pcbnew/pcbnew_jobs_handler.cpp` (commit ecdf1454, this lane's file; the manifest named the settings merge, but nothing the merge can send resolves once: `report_filename` stays reset and empty), under `__EMSCRIPTEN__`: a report path the handler built itself is used as built, a configured one is resolved as KiCad does; both writers (Excellon and Gerber). Plain builds unchanged. `cc_output_common.h`'s drill merge is unchanged. The plot op (`kicadPlotBoard`) never asks for a report (`pcbnew_embind.cpp` sets `m_generateReport = false`).
+- O23, in the `cc_footprints` job body (pcbjam commit 86a6274): each library footprint is written once, keyed by name with the library footprint (`lib:name`, `GetUniStringLibId`) kept; a footprint placed twice from the same library footprint is skipped with NO line; only footprints of one name from different libraries are named in the existing warning ("More than one footprint is named ...; the first of each was kept.").
+- Header recompile reach: none (two .cpp files).
+- What the build train must probe (stack B, Glasgow, Edit mode, Board tab, Outputs):
+  1. Drill files with the report on (`pcb_export_drill` `{generate_report: true}`): code 0, no failure line, the run folder holds the drill files AND `<board>-drill.rpt` (non empty, KiCad's "Drill report for" first line). Wrong if code 4 (the handler change is not in the image) or the report lands outside the run folder.
+  2. Footprint list (`cc_footprints`): no warning line on Glasgow (it places several library footprints more than once); the `.pretty` holds one `.kicad_mod` per distinct library footprint (compare with the count of distinct `lib:name` among the board's footprints).
+
+## lo-e3r-e: the rules answer (PE23)
+
+(The manifest's `BUILD-NOTES-run15-pe23.md` is this section.)
+
+- Exports: none new; `kicadResolveRules` changed in behavior. Merged image only: nothing.
+- The answer is built by `ccInspectConstraints` and `ccReportClearance`, the helpers `pcbResolveRules` calls through `ccResolveRules` just above it; the lease names the body, the fault is in those helpers (no other lane touches them), so they were edited and this is reported to E0 as the lease's edge (pcbjam commit f4ace52).
+- Solder mask expansion: for a track or a shape with no rule and no local value KiCad's `DRC_ENGINE::EvalRules` names no figure (its board setup default, `drc_engine.cpp` 1876, is reached for a pad only), so the record carried min, opt and max null. The item itself uses the board setup's `m_SolderMaskExpansion` in that case (`PCB_TRACK::GetSolderMaskExpansion`, `pcb_track.cpp` 1432; `PCB_SHAPE`'s the same); the answer now gives that figure as the engine gives a pad's: no parent rule, named "board setup" (so the record's source reads `board`), `opt` set.
+- A pair's layers: a through hole pad's layer set is every copper layer KiCad knows, so the pair's copper intersection listed 32 layers; every layer set in `ccReportClearance` is now intersected with the board's enabled layers (`BOARD::GetEnabledLayers`), the diff pair layer and the edge cut report layers included.
+- What the build train must probe (stack B, Glasgow, Edit mode, Board tab):
+  1. `board.rules { a: <a track's uuid> }`: a `solder_mask_expansion` record with a number in mm in `opt` and source `board` (Glasgow's board setup value), never null.
+  2. `board.rules { a: <a track>, b: <a pad of another net> }`: records on F.Cu or B.Cu only where both are.
+  3. `board.rules { a, b }` for two pads of one through hole part: the records' layers name only Glasgow's 4 enabled copper layers, never `In5.Cu` and beyond. Wrong if 32 layers (the image lacks f4ace52).
+
+## Handover (every unit of the lane done: 3d-e1, 3d-e4, 3d-e2, 3d-e5, lo-e3o-e, lo-e3r-e)
+
+`git merge run15/main` in both worktrees (pcbjam `run15/main` 48e664e, build G's gitlink), then, after build G's container exited, from `/home/matthew/cc-engine-wt/e11/pcbjam`:
+
+`/home/matthew/cc-wave2/bin/gate.sh scripts/kicad/syntax-check-run15.sh --kicad /home/matthew/cc-engine-wt/e11/kicad all --kicad-file pcbnew/pcbnew_jobs_handler.cpp --kicad-file common/jobs/job_export_pcb_3d.cpp`
+
+```
+PASS pcbnew         pcbnew_embind.cpp subdir=pcbnew -DKICAD_MERGED_EMBIND (12081 ms)
+PASS eeschema       eeschema_embind.cpp subdir=eeschema -DKICAD_MERGED_EMBIND (11708 ms)
+PASS symedit        symedit_embind.cpp subdir=eeschema  (6942 ms)
+PASS fpedit         fpedit_embind.cpp subdir=pcbnew  (6591 ms)
+PASS dsedit         dsedit_embind.cpp subdir=pagelayout_editor  (994 ms)
+PASS kicad_editor   kicad_editor_embind.cpp subdir=common  (4685 ms)
+PASS occ            pcbnew_embind.cpp subdir=pcbnew (10864 ms)
+PASS kicad pcbnew/pcbnew_jobs_handler.cpp (9032 ms)
+PASS kicad common/jobs/job_export_pcb_3d.cpp (3124 ms)
+syntax-check: 0 failed
+```
+
+The stub's own compile line (the 3d-e2 section's method): `PASS stub wasm/stubs/exporter_step_stub.cpp`.
+
+`scripts/kicad/check-run15-exports.sh --since run15/main --kicad /home/matthew/cc-engine-wt/e11/kicad --kicad-since run15/main`: `check-run15-exports: 157 names registered in the merged image (150 kicad names), 12 of 110 run 15 names, 0 failures`.
+
+Reported to E0:
+1. PE46's VRML cause is PCBJam's earcut GLU shim `libs/kimath/glu_tess/glu_tess_impl.cpp` (no lane's file): it never calls the BEGIN and END callbacks and ignores `GLU_TESS_BOUNDARY_ONLY`, so every `VRML_LAYER` is empty and O17 writes only its header. Held; needs an owner (the 3d-e2 section).
+2. The lease's edge: 3d-e2 edited the 3D file check in `ccRunBoardOutput` (queued by `pcbExportBoardOutput`), lo-e3r-e edited `ccInspectConstraints` and `ccReportClearance` (called by `pcbResolveRules`); the leased bodies themselves held nothing to change. lo-e3o-e's drill fix is in kicad `pcbnew_jobs_handler.cpp` (this lane's file), not in the settings merge.
+3. The syntax check script cannot name a pcbjam stub (`--kicad-file` prefixes the KiCad tree); a `--pcbjam-file` mode would cover `wasm/stubs/exporter_step_stub.cpp`.
+4. `pcbnew_embind.cpp` carries this lane's dated line at the END of its header comment (not beside the seams' line) to keep merges with other lanes' lines apart.
