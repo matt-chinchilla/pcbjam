@@ -26,6 +26,9 @@
  * is a board job, left out of kicadOutputJobs while ccPcbRenderListed() is false; the embed run
  * folder rule (/tmp/cc-embed/<n>) shared by the footprint editor's embed and the board's
  * model embed.
+ *
+ * Modified by Circuit Center Inc on 2026-11-18: the 3D export's fixes read the host's cc_occ and
+ * name the file each format must leave (MERGE_RESULT::expectFile), every 3D format made.
  */
 
 #pragma once
@@ -321,11 +324,13 @@ struct MERGE_RESULT
     std::vector<std::string> dropped;    // sent keys the job does not have, in key order
     std::vector<std::string> warnings;   // lines the run reports as warnings
     std::string              refusal;    // not empty: the run makes nothing, code -1, this line
+    std::string              expectFile; // not empty: the extension of the file a run must leave
 };
 
 // Engine run 15: the per job fixes of the 3D export and the render job (their bodies in
 // cc_output_3d.h and cc_output_render.h, included at the end of this file).
-inline void ccFixPcbExport3d( json& aMerged, const json& aDefaults, MERGE_RESULT& aOut );
+inline bool ccFixPcbExport3d( json& aMerged, const json& aDefaults, const json& aSent,
+                              MERGE_RESULT& aOut );
 inline void ccFixPcbRender( json& aMerged, const json& aDefaults, MERGE_RESULT& aOut );
 inline bool ccPcbRenderListed();
 
@@ -426,7 +431,8 @@ inline bool MergeSettings( JOB& aJob, const std::string& aName, const json& aSen
     // CC_OUTPUT_FIXES: the per job fixes (the outputs spec, section 4's Fixed column and 6.2).
     if( aName == "pcb_export_3d" )
     {
-        ccFixPcbExport3d( merged, defaults, aOut );
+        if( !ccFixPcbExport3d( merged, defaults, aSent, aOut ) )
+            return false;
     }
     else if( aName == "pcb_render" )
     {
