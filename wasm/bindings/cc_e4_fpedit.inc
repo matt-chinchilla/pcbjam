@@ -13,8 +13,10 @@
 // code of build G), then kicadFpEditNew, kicadFpEditMarkSaved, kicadFpEditSelection and
 // kicadFpEditSelect.
 
+#include <map>
 #include <memory>
 #include <utility>
+#include <vector>
 
 #include <advanced_config.h>
 #include <io/kicad/kicad_io_utils.h>
@@ -28,6 +30,8 @@
 #include <richio.h>
 #include <tool/tool_manager.h>
 #include <tools/pad_tool.h>
+#include <tools/pcb_selection_tool.h>
+#include <tool/actions.h>
 #include <view/view_controls.h>
 
 namespace cc_e4
@@ -170,29 +174,22 @@ std::string formatFootprint( FOOTPRINT_EDIT_FRAME* aFrame, const FOOTPRINT* aFoo
 }
 
 /**
- * The open's and the new's tail, on the apply coroutine: the body of
+ * The open's and the new's tail, on the apply coroutine, the frame already cleared (Clear_Pcb
+ * with no question) and aFootprint owned by no one: the body of
  * FOOTPRINT_EDIT_FRAME::LoadFootprintFromLibrary less the library load and the tree sync
- * (Clear_Pcb with no question, the footprint added at the origin, Reference and Value refilled
+ * (the footprint added at the origin, Reference and Value refilled
  * when empty unless placed, zoom to fit, unmodified, undo cleared). The footprint is added under
  * an empty nickname (KiCad's own editable case, so no read-only info bar is raised for a
  * nickname the frame's table does not hold) and takes aLib on the next turn of the event loop,
  * after ReloadFootprint's own CallAfter has read it.
  */
-void installFootprint( std::shared_ptr<std::unique_ptr<FOOTPRINT>> aHeld, const std::string& aName,
+void installFootprint( FOOTPRINT_EDIT_FRAME* frame, FOOTPRINT* footprint, const std::string& aName,
                        const std::string& aLib, const std::string& aMode,
                        const std::string& aToken, bool aNew )
 {
-    FOOTPRINT_EDIT_FRAME* frame = fpEditFrame();   // re-resolved on the coroutine
-
-    if( !frame || !aHeld || !*aHeld )
-        return;
-
     const wxString name = wxString::FromUTF8( aName.c_str() );
     const wxString lib = wxString::FromUTF8( aLib.c_str() );
 
-    frame->Clear_Pcb( false );
-
-    FOOTPRINT* footprint = aHeld->release();
     footprint->SetFPID( LIB_ID( wxEmptyString, name ) );
 
     frame->GetCanvas()->GetViewControls()->SetCrossHairCursorPosition( VECTOR2D( 0, 0 ), false );
@@ -241,6 +238,25 @@ void installFootprint( std::shared_ptr<std::unique_ptr<FOOTPRINT>> aHeld, const 
     session().mode = aMode;
     session().lib = aLib;
     session().name = aName;
+}
+
+/** Every item of the footprint by its uuid (lowercase), children of groups and pads included. */
+std::map<std::string, BOARD_ITEM*> itemsByUuid( FOOTPRINT* aFootprint )
+{
+    std::map<std::string, BOARD_ITEM*> out;
+
+    if( !aFootprint )
+        return out;
+
+    aFootprint->RunOnChildren(
+            [&]( BOARD_ITEM* child )
+            {
+                if( child )
+                    out[utf8( child->m_Uuid.AsString() )] = child;
+            },
+            RECURSE_MODE::RECURSE );
+
+    return out;
 }
 
 } // namespace fp
@@ -305,7 +321,13 @@ bool kicadFpEditOpen( std::string aArgsJson )
     const std::string t = *token;
 
     pcbjam_collab::runOnCoroutine( fr, [held, n, l, mode, t]() {
-        fp::installFootprint( held, n, l, mode, t, /*aNew*/ false );
+        FOOTPRINT_EDIT_FRAME* frame = cc_fpedit::fpEditFrame();   // re-resolved on the coroutine
+
+        if( !frame || !held || !*held )
+            return;
+
+        frame->Clear_Pcb( false );
+        fp::installFootprint( frame, held->release(), n, l, mode, t, /*aNew*/ false );
     } );
 
     return true;
@@ -347,6 +369,199 @@ std::string kicadFpEditTake()
     return dumpJson( out );
 }
 
+// fpedit.new: {name, lib, type: "smd"|"through_hole"|"unspecified", discard, token}, those five
+// keys only: PCB_BASE_FRAME::CreateNewFootprint( name, "" ) (no library: the page keeps names
+// unique), its type set, then installed as fpedit.open installs one (mode "new"). False
+// (nothing queued) for any other shape or a modified footprint open without discard.
+bool kicadFpEditNew( std::string aArgsJson )
+{
+    using namespace cc_fpedit;
+
+    FOOTPRINT_EDIT_FRAME* fr = readyFrame();
+
+    if( !fr )
+        return false;
+
+    json args = json::parse( aArgsJson, nullptr, /*allow_exceptions*/ false );
+
+    if( args.is_discarded() || !onlyKeys( args, { "name", "lib", "type", "discard", "token" } )
+            || !hasKeys( args, { "name", "lib", "type", "discard", "token" } ) )
+    {
+        return false;
+    }
+
+    std::optional<wxString>    name = textOf( args["name"], 1, TEXT_MAX );
+    std::optional<wxString>    lib = textOf( args["lib"], 0, TEXT_MAX );
+    std::optional<bool>        discard = boolOf( args["discard"] );
+    std::optional<std::string> token = tokenOf( args["token"] );
+
+    if( !name || !lib || !discard || !token || !args["type"].is_string() )
+        return false;
+
+    const std::string type = args["type"].get<std::string>();
+    int               attrs = 0;
+
+    if( type == "smd" )
+        attrs = FP_SMD;
+    else if( type == "through_hole" )
+        attrs = FP_THROUGH_HOLE;
+    else if( type != "unspecified" )
+        return false;
+
+    if( !*discard && fr->IsContentModified() )
+        return false;
+
+    const std::string n = utf8( *name );
+    const std::string l = utf8( *lib );
+    const std::string t = *token;
+
+    pcbjam_collab::runOnCoroutine( fr, [n, l, t, attrs]() {
+        FOOTPRINT_EDIT_FRAME* frame = cc_fpedit::fpEditFrame();   // re-resolved on the coroutine
+
+        if( !frame )
+            return;
+
+        // FOOTPRINT_EDITOR_CONTROL::NewFootprint's order: the frame cleared, then the footprint
+        // made against the new board's design settings.
+        frame->Clear_Pcb( false );
+
+        FOOTPRINT* footprint =
+                frame->CreateNewFootprint( wxString::FromUTF8( n.c_str() ), wxEmptyString );
+
+        if( !footprint )
+            return;
+
+        footprint->SetAttributes( attrs );
+        fp::installFootprint( frame, footprint, n, l, "new", t, /*aNew*/ true );
+    } );
+
+    return true;
+}
+
+// fpedit.markSaved: clears the modified flag when aToken is the state's (the page wrote what it
+// took), as FOOTPRINT_EDIT_FRAME::ClearModify does after a save. No undo step.
+bool kicadFpEditMarkSaved( std::string aToken )
+{
+    using namespace cc_fpedit;
+
+    FOOTPRINT_EDIT_FRAME* fr = readyFrame();
+
+    if( !fr || !currentFootprint( fr ) || fp::session().token.empty()
+            || aToken != fp::session().token )
+    {
+        return false;
+    }
+
+    fr->ClearModify();
+    fr->UpdateTitle();
+    return true;
+}
+
+// fpedit selection: {uuids} of the selection tool's selection, in its order; "" with no
+// footprint editor frame.
+std::string kicadFpEditSelection()
+{
+    using namespace cc_fpedit;
+
+    FOOTPRINT_EDIT_FRAME* fr = fpEditFrame();
+
+    if( !fr || !fr->GetToolManager() )
+        return "";
+
+    PCB_SELECTION_TOOL* tool = fr->GetToolManager()->GetTool<PCB_SELECTION_TOOL>();
+    json                uuids = json::array();
+
+    if( tool )
+    {
+        for( EDA_ITEM* item : tool->GetSelection() )
+        {
+            if( item )
+                uuids.push_back( utf8( item->m_Uuid.AsString() ) );
+        }
+    }
+
+    json out = json::object();
+    out["uuids"] = std::move( uuids );
+    return dumpJson( out );
+}
+
+// select in an fpedit frame: {uuids: string[0..4096], zoom: bool}, those two keys only, every
+// uuid an item of the open footprint; the selection replaced by them (an empty list clears
+// it), the view fitted to them with zoom. No undo step.
+bool kicadFpEditSelect( std::string aArgsJson )
+{
+    using namespace cc_fpedit;
+
+    FOOTPRINT_EDIT_FRAME* fr = readyFrame();
+    FOOTPRINT*            footprint = currentFootprint( fr );
+
+    if( !footprint )
+        return false;
+
+    json args = json::parse( aArgsJson, nullptr, /*allow_exceptions*/ false );
+
+    if( args.is_discarded() || !onlyKeys( args, { "uuids", "zoom" } )
+            || !hasKeys( args, { "uuids", "zoom" } ) )
+    {
+        return false;
+    }
+
+    std::optional<std::vector<std::string>> uuids = uuidsOf( args["uuids"], 0, UUIDS_MAX );
+    std::optional<bool>                     zoom = boolOf( args["zoom"] );
+
+    if( !uuids || !zoom )
+        return false;
+
+    std::map<std::string, BOARD_ITEM*> byUuid = fp::itemsByUuid( footprint );
+
+    for( const std::string& u : *uuids )
+    {
+        if( !byUuid.count( u ) )
+            return false;
+    }
+
+    const std::vector<std::string> ids = *uuids;
+    const bool                     fit = *zoom;
+
+    pcbjam_collab::runOnCoroutine( fr, [ids, fit]() {
+        FOOTPRINT_EDIT_FRAME* frame = cc_fpedit::fpEditFrame();
+        FOOTPRINT*            live = cc_fpedit::currentFootprint( frame );
+
+        if( !live || !frame->GetToolManager() )
+            return;
+
+        PCB_SELECTION_TOOL* tool = frame->GetToolManager()->GetTool<PCB_SELECTION_TOOL>();
+
+        if( !tool )
+            return;
+
+        std::map<std::string, BOARD_ITEM*> byId = fp::itemsByUuid( live );
+        EDA_ITEMS                          picked;
+
+        for( const std::string& u : ids )
+        {
+            auto it = byId.find( u );
+
+            if( it != byId.end() )
+                picked.push_back( it->second );
+        }
+
+        tool->ClearSelection();
+
+        if( !picked.empty() )
+        {
+            tool->AddItemsToSel( &picked );
+
+            if( fit )
+                frame->GetToolManager()->RunAction( ACTIONS::zoomFitSelection );
+        }
+
+        frame->GetCanvas()->Refresh();
+    } );
+
+    return true;
+}
+
 } // namespace cc_e4
 
 EMSCRIPTEN_BINDINGS( cc_e4_fpedit )
@@ -354,4 +569,8 @@ EMSCRIPTEN_BINDINGS( cc_e4_fpedit )
     function( "kicadFpEditOpen", &cc_e4::kicadFpEditOpen );
     function( "kicadFpEditState", &cc_e4::kicadFpEditState );
     function( "kicadFpEditTake", &cc_e4::kicadFpEditTake );
+    function( "kicadFpEditNew", &cc_e4::kicadFpEditNew );
+    function( "kicadFpEditMarkSaved", &cc_e4::kicadFpEditMarkSaved );
+    function( "kicadFpEditSelection", &cc_e4::kicadFpEditSelection );
+    function( "kicadFpEditSelect", &cc_e4::kicadFpEditSelect );
 }
