@@ -84,3 +84,44 @@ PASS kicad pcbnew/dialogs/dialog_position_relative.cpp (8181 ms)
 PASS kicad pcbnew/tools/position_relative_tool.cpp (9619 ms)
 syntax-check: 0 failed
 ```
+
+## m6-e1: Move Exactly, Interactive Offset, Filter Selected Items and Get and Move Footprint ask the host (modal)
+
+No export (the prompt exports are e1's m1x-e1: `kicadPromptAnswer`, `kicadPromptCancel`, marker `kicadHostPrompts`). Nothing in `cc_e2_pcb.inc`.
+
+Each dialog overrides `ShowModal` under `__EMSCRIPTEN__` in its own file (no tool file touched): `LoadControlState()` then its own `TransferDataToWindow()` (the order of its init dialog event, so the record is what the dialog would show, including the values DIALOG_SHIM keeps between uses), the record, then `CcHostPromptModal( ask, record, receiver )`: 1 returns `wxID_OK` (the receiver already ran the dialog's own `TransferDataFromWindow`, which filled the caller's values), 0 `wxID_CANCEL`, -1 KiCad's own `ShowModal`. Every answer is closed and read whole before anything is written: an unknown key or a bad value refuses with `field` = that key and the prompt stays parked. Lengths mm, angles degrees.
+
+**Host asks** (`window.kicadHostPrompt.onAsk({token, ask, modal: true, record})`):
+- `moveExact` from `DIALOG_MOVE_EXACT::ShowModal` (`pcbnew/dialogs/dialog_move_exact.cpp`; called by `EDIT_TOOL::MoveExact`, `pcbnew/tools/edit_tool.cpp` 3326, unchanged). Record `{ x, y, rotation, anchor, anchors }`: x, y the move as a Cartesian vector (a polar entry turned Cartesian as `TransferDataFromWindow` delivers it), rotation degrees, `anchor` and each of `anchors` one of `item`, `selectionCenter`, `userOrigin`, `drillOrigin` (`m_menuIDs` in order: the first is the caller's own anchor, `drillOrigin` only in the board editor). Answer `{ x?, y?, rotation?, anchor? }`: a polar entry is first cleared to Cartesian (the Polar box unchecked), the values written into the dialog's own UNIT_BINDERs and anchor choice, KiCad's maximum board area bound (the one its `OnTextChanged` enforces by disabling OK) refused with field `x` (or `y` when only y was given) and KiCad's sentence "Invalid movement values.  Movement would place selection outside of the maximum board area." as the message; then `TransferDataFromWindow`, then `SaveControlState()` (KiCad keeps the values for the next use when the dialog closes). `rotation` |deg| <= 3600; a length must fit the board's int range.
+- `offset` from `DIALOG_OFFSET_ITEM::ShowModal` (`dialog_offset_item.cpp`; called by `POSITION_RELATIVE_TOOL`'s Interactive Offset, `pcbnew/tools/position_relative_tool.cpp` 349, after its two clicks). Record `{ x, y }`, the measured vector. Answer `{ x?, y? }` (Cartesian; a polar entry in the dialog is first turned back through its own `OnPolarChanged`), then `TransferDataFromWindow`, `SaveControlState()`.
+- `filterSelection` from `DIALOG_FILTER_SELECTION::ShowModal` (`dialog_filter_selection.cpp`; called by `PCB_SELECTION_TOOL::filterSelection`, `pcbnew/tools/pcb_selection_tool.cpp` 3280). Record `{ includeFootprints, includeLockedFootprints, includeTracks, includeVias, includeZones, includeItemsOnTechLayers, includeBoardOutlineLayer, includePcbTexts }` (booleans, KiCad's `OPTIONS` names). Answer any subset, booleans only; the boxes set, then the dialog's own `checkBoxClicked` (the locked footprints box follows the footprints box), then `TransferDataFromWindow`.
+- `findFootprint` from `DIALOG_GET_FOOTPRINT_BY_NAME::ShowModal` (`dialog_get_footprint_by_name.cpp`; called by `GetFootprintFromBoardByReference`, `pcbnew/tools/edit_tool.cpp` 771, for Get and Move Footprint, T). Record `{ references }`: the reference of each entry of the dialog's list in its order (KiCad sorts the "REF    ( value )" strings). Answer `{ reference }` (a string): trimmed, and refused (field `reference`, empty message) when the list holds no entry of that reference, case blind as KiCad's match; else written into the dialog's search field and OK; KiCad then finds the footprint and it hangs on the pointer (KiCad's move).
+
+**Files (kicad `seat/run15-e2`, commit 272aac33):** `pcbnew/dialogs/dialog_move_exact.{h,cpp}`, `dialog_offset_item.{h,cpp}`, `dialog_filter_selection.{h,cpp}`, `dialog_get_footprint_by_name.{h,cpp}`. Every change under `#ifdef __EMSCRIPTEN__` (`dialog_get_footprint_by_name.cpp` also gained its missing final newline). **Header change reach:** each header gains `#include <host_prompt.h>` and `int ShowModal() override;` under `__EMSCRIPTEN__`; included by its own `.cpp` and `pcbnew/tools/edit_tool.cpp`, `edit_tool_move_fct.cpp`, `position_relative_tool.cpp`, `pcb_selection_tool.cpp` (and `qa/qa_utils/mocks.cpp`, not in the wasm build): eight TUs.
+
+**Probes (canvas-kinds fixture, Board, Edit mode, a `window.kicadHostPrompt` listener that records and returns true):**
+1. Select R1, Shift+M: one `onAsk` ask `moveExact`, modal true, record `{x:0,y:0,rotation:0,anchor:"item",anchors:["item","userOrigin","drillOrigin"]}` (first use), no KiCad window. `kicadPromptAnswer(token, '{"x":2,"rotation":90}')` answers `{"accepted":true}`: R1 moves 2 mm right and turns 90 degrees, one undo step; Undo restores it. A second Shift+M shows x 2, rotation 90 (the kept values). Wrong if: the dialog shows, two undo steps, or the second record is zeros.
+2. Refusals: `{"x":"2"}` gives `field` `x`; `{"anchor":"selectionCenter"}` with one item selected gives `field` `anchor` (not offered); `{"x":3000000}` gives `field` `x` and KiCad's maximum board area sentence; `{"foo":1}` `field` `foo`; the prompt stays parked and a later good answer is accepted. `kicadPromptCancel(token)` 0: nothing moves.
+3. Interactive Offset (`pcbnew.PositionRelative.interactiveOffsetTool`): two clicks 3 mm apart horizontally: ask `offset`, record x about 3, y 0; answer `{"y":1}`: the selection moves by (3, 1), one undo step.
+4. Select everything, Filter Selected Items: ask `filterSelection`, every key true; answer `{"includeTracks":false}`: only the tracks leave the selection. Answer `{"includeTracks":1}` refuses with `field` `includeTracks`.
+5. T: ask `findFootprint`, record `references` `["R1","R2","U1"]` (the fixture's order as KiCad sorts); answer `{"reference":"u1"}`: U1 hangs on the pointer, a click places it, one undo step. `{"reference":"Q9"}` refuses with `field` `reference`.
+6. No listener: every one of the four KiCad dialogs shows as before.
+
+**Syntax check** (`--kicad /home/matthew/cc-engine-wt/e2/kicad pcbnew occ --kicad-file` each file below, through the gate; the same run also checked m3-e1's and st-ap-e's files):
+
+```
+PASS pcbnew         pcbnew_embind.cpp subdir=pcbnew -DKICAD_MERGED_EMBIND (13072 ms)
+PASS occ            pcbnew_embind.cpp subdir=pcbnew (12279 ms)
+PASS kicad pcbnew/dialogs/dialog_move_exact.cpp (5303 ms)
+PASS kicad pcbnew/dialogs/dialog_offset_item.cpp (4117 ms)
+PASS kicad pcbnew/dialogs/dialog_filter_selection.cpp (4241 ms)
+PASS kicad pcbnew/dialogs/dialog_get_footprint_by_name.cpp (4101 ms)
+PASS kicad pcbnew/tools/edit_tool.cpp (8903 ms)
+PASS kicad pcbnew/tools/edit_tool_move_fct.cpp (7366 ms)
+PASS kicad pcbnew/tools/position_relative_tool.cpp (6414 ms)
+PASS kicad pcbnew/tools/pcb_selection_tool.cpp (8918 ms)
+PASS kicad pcbnew/tools/convert_tool.cpp (6961 ms)
+PASS kicad pcbnew/dialogs/dialog_outset_items.cpp (5455 ms)
+PASS kicad pcbnew/autorouter/autoplace_tool.cpp (6042 ms)
+syntax-check: 0 failed
+```
