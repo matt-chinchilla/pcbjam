@@ -246,3 +246,5 @@ check-run15-exports: 256 names registered in the merged image (249 kicad names),
 ```
 
 Merged image only: all of it (`CcDsSaveInStringForStockKicad` is `__EMSCRIPTEN__` only; its one caller is `dsedit_embind.cpp`).
+
+Re-run after the last `git merge run15/main` (pcbjam 113c62f, kicad e44f3ad2): the same nine lines PASS, `syntax-check: 0 failed`; the export check `0 failures`.
