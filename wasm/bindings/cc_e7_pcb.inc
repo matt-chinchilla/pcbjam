@@ -27,6 +27,33 @@
 namespace cc_e7
 {
 
+// fix e7-1: the board's half of the update preview's token (declared in cc_e7_lease.h). The
+// board formatted by KiCad's own file writer with the board control set, as a save writes it,
+// but straight from Format, never FormatBoardToFormatter (that one embeds or clears the board's
+// fonts, a change). Formatting reads the board only. Every configuration (occ_service too).
+namespace pcb
+{
+class UPDATE_DIGEST_IO : public PCB_IO_KICAD_SEXPR
+{
+public:
+    explicit UPDATE_DIGEST_IO( BOARD* aBoard ) : PCB_IO_KICAD_SEXPR( CTL_FOR_BOARD )
+    {
+        m_board = aBoard;
+    }
+};
+} // namespace pcb
+
+std::string boardUpdateDigest( BOARD* aBoard )
+{
+    if( !aBoard )
+        return "";
+
+    pcb::UPDATE_DIGEST_IO io( aBoard );
+    io.Format( aBoard );
+    return ccDigest( io.GetStringOutput( true ) );
+}
+
+
 // st-paste-e (K-PASTE), the board half of kicadPasteSpecial: the choices armed for ONE Paste
 // Special (cc_paste_special.h) and KiCad's paste started on the apply coroutine: the clipboard's
 // items hang off the pointer with the chosen annotation and Clear Nets (a board clip only) and the reader's press commits them
