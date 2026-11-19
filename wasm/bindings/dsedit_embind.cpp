@@ -1230,8 +1230,11 @@ std::string dsEditState()
     return dumpJson( stateJson( fr ) );
 }
 
-// take: {name, text}, the frame's model by KiCad's own formatter (SaveInString: its header,
-// version and generator). A pure read.
+// take: {name, text}, the frame's model by KiCad's own formatter (SaveInString's: its header,
+// version and generator) with no (uuid ...) token (K-DS2, CcDsSaveInStringForStockKicad):
+// KiCad 10.0.4's parser refuses the token (kicad-cli: "Unexpected uuid"), and the take is a
+// file meant for a stock KiCad. Reopening the take gives every item a fresh uuid; the uuids
+// stay stable for the life of one open (undo copies keep them). A pure read.
 std::string dsEditTake()
 {
     PL_EDITOR_FRAME* fr = openFrame();
@@ -1240,7 +1243,7 @@ std::string dsEditTake()
         return "";
 
     wxString text;
-    model().SaveInString( &text );
+    CcDsSaveInStringForStockKicad( &model(), &text );
 
     json out = json::object();
     out["name"] = utf8( session().name );
