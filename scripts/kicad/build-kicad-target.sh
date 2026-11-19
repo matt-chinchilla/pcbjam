@@ -37,6 +37,13 @@
 # Modified by Circuit Center Inc on 2026-11-18: compile_embind_tu also takes
 # thirdparty/dxflib_qcad at the end of its list (fp-e8's Import Graphics reaches KiCad's DXF
 # importer header from the bindings).
+#
+# Modified by Circuit Center Inc on 2026-11-19: KICAD_TU_ABI_FLAGS carries -DKICAD_IPC_API, as
+# the core's own TUs do (the CMake call below sets KICAD_IPC_API=ON). Without it the TUs
+# compiled outside CMake counted one virtual fewer in PGM_BASE (GetPluginManager,
+# include/pgm_base.h), so every PGM_BASE virtual declared after it was called one slot early
+# from the bindings: kicadPathVarsSet's queued body trapped at Pgm().GetLocalEnvVariables()
+# (function signature mismatch) and no path variable was ever set (engine run 15, train 16).
 
 set -e
 
@@ -332,7 +339,11 @@ mkdir -p "${STUBS_BUILD}"
 # slot offsets by one and hung the collab apply (call_indirect signature-mismatch). Keep them in ONE
 # place so no out-of-CMake C++ TU can skew again. (EMBIND_CONFIG_DEFINES holds the build-config -DDEBUG,
 # set in the BUILD_TYPE block above; empty in Release where neither side defines DEBUG.)
-KICAD_TU_ABI_FLAGS="${EMBIND_CONFIG_DEFINES} -DKICAD_USE_PLATFORM_WASM=1 -include ${STUBS_DIR}/char_traits_uint16_workaround.h"
+# -DKICAD_IPC_API mirrors the CMake call's -DKICAD_IPC_API=ON below (kicad/CMakeLists.txt adds the
+# definition to every core TU): include/pgm_base.h declares the virtual GetPluginManager and two
+# members under it, and pcb_edit_frame.h and sch_edit_frame.h their API handlers. The two settings
+# move together: a core built without the IPC API drops the define here as well.
+KICAD_TU_ABI_FLAGS="${EMBIND_CONFIG_DEFINES} -DKICAD_USE_PLATFORM_WASM=1 -DKICAD_IPC_API -include ${STUBS_DIR}/char_traits_uint16_workaround.h"
 
 kw_stage kicad-stubs
 log_info "Building stub libraries..."
