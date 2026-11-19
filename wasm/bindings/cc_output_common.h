@@ -29,6 +29,8 @@
  *
  * Modified by Circuit Center Inc on 2026-11-18: the 3D export's fixes read the host's cc_occ and
  * name the file each format must leave (MERGE_RESULT::expectFile), every 3D format made.
+ * Modified by Circuit Center Inc on 2026-11-19: a BOM delimiter that was sent is kept (an empty
+ * ref_range_delimiter writes every reference); kicad-cli's defaults fill only the unsent ones.
  */
 
 #pragma once
@@ -483,12 +485,21 @@ inline bool MergeSettings( JOB& aJob, const std::string& aName, const json& aSen
     }
     else if( aName == "sch_export_bom" )
     {
-        // KiCad's delimiters are kicad-cli's defaults: a fresh job's are empty strings (the CLI
-        // fills them), and a CSV with empty delimiters runs every field together (measured).
-        force( "field_delimiter", "," );
-        force( "string_delimiter", "\"" );
-        force( "ref_delimiter", "," );
-        force( "ref_range_delimiter", "-" );
+        // A delimiter that was sent is the job's, as a jobset gives it to kicad-cli: an empty
+        // ref_range_delimiter is KiCad's "no ranges, every reference written out"
+        // (SCH_REFERENCE_LIST::Shorthand), an empty string_delimiter no quoting. One that was
+        // not sent takes kicad-cli's own default: a fresh job's are empty strings (the CLI fills
+        // them), and a CSV with empty delimiters runs every field together (measured).
+        auto unsentTakes = [&]( const char* aKey, const json& aValue )
+                           {
+                               if( !aSent.contains( aKey ) )
+                                   force( aKey, aValue );
+                           };
+
+        unsentTakes( "field_delimiter", "," );
+        unsentTakes( "string_delimiter", "\"" );
+        unsentTakes( "ref_delimiter", "," );
+        unsentTakes( "ref_range_delimiter", "-" );
         reset( "keep_tabs" );
         reset( "keep_line_breaks" );
     }
