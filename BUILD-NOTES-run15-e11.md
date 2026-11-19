@@ -276,3 +276,37 @@ Recompile reach: one .cpp of pcbnew, no header.
 ### What the next build must probe (e11-5)
 
 Frame pcb, island harness, `tests/fixtures/glasgow`, `project.export` `pcb_export_3d` with each format of 3d-e2's probe 3 in turn, `stpz brep xao glb ply stl u3d pdf`: each code 0 and a non empty file with that extension. For stpz: the file starts with the gzip magic `1f 8b` and unpacks to a STEP text that starts `ISO-10303-21;`, about the size of the `.step` (274,987 bytes in the integrator's probe). Wrong if stpz still answers `Unknown export format` (the image lacks kicad 7dae6c8b). The e2e stopped at stpz, so brep, ply, u3d and pdf run there for the first time: a failure of one of those is a new fault, named with its line.
+
+## Repair e11-6: the render's progress lines while it runs (RULINGS 29 b)
+
+The fault (build T3, ENGINE-FACTS lane e11): the render job's `Rendering <n> percent` lines reached the island only in the final record, because nothing wrote the island's live lines file (`bridge/export.ts` `EXPORT_LINES`, `<run folder>/.cc-export.json.lines`) while the job ran, so the 3D panel could show no running phase.
+
+The repair: kicad 11f3edda, `pcbnew/pcbnew_jobs_handler.cpp`, under `__EMSCRIPTEN__` (the file static `CC_RENDER_PASSES` of the WebAssembly copy of the render job). `SetRunFolder( dir )`, called once the job's output path is resolved (the folder of the picture, which is the run folder: the host ignores every output path key), names `<dir>/.cc-export.json.lines` and removes a file of that name left in the folder. `ReportPercent` reports the line to the job's reporter exactly as before, then appends the same text and `\n` to that file and closes it. Every `ReportPercent` call is followed by `ccRenderYield()`, so each line is whole on disk before the browser gets its turn. The record `.cc-export.json` is written by `ccRunBoardOutput` from the same reporter as before: unchanged. No pcbjam change, no export added.
+
+For the island (3d-i3): read `<run folder>/.cc-export.json.lines`, UTF-8 text, one line per progress step, each `Rendering <n> percent\n` (n 0 to 100, only when it moved, climbing, the last `Rendering 100 percent`); appended between yields, so any read between yields sees whole lines only; complete once `.cc-export.json` exists. Its name starts with the record's, so the folder read never answers it.
+
+### Checks (repair e11-6)
+
+After `git merge run15/main` in both worktrees, from `/home/matthew/cc-engine-wt/e11/pcbjam`:
+
+`/home/matthew/cc-wave2/bin/gate.sh scripts/kicad/syntax-check-run15.sh --kicad /home/matthew/cc-engine-wt/e11/kicad all --kicad-file pcbnew/pcbnew_jobs_handler.cpp`
+
+```
+PASS pcbnew         pcbnew_embind.cpp subdir=pcbnew -DKICAD_MERGED_EMBIND (16812 ms)
+PASS eeschema       eeschema_embind.cpp subdir=eeschema -DKICAD_MERGED_EMBIND (15949 ms)
+PASS symedit        symedit_embind.cpp subdir=eeschema  (7937 ms)
+PASS fpedit         fpedit_embind.cpp subdir=pcbnew  (11050 ms)
+PASS dsedit         dsedit_embind.cpp subdir=pagelayout_editor  (5989 ms)
+PASS kicad_editor   kicad_editor_embind.cpp subdir=common  (5779 ms)
+PASS occ            pcbnew_embind.cpp subdir=pcbnew (16155 ms)
+PASS kicad pcbnew/pcbnew_jobs_handler.cpp (12834 ms)
+syntax-check: 0 failed
+```
+
+`scripts/kicad/check-run15-exports.sh --join --kicad /home/matthew/cc-engine-wt/e11/kicad` and the `--since run15/main --kicad-since run15/main` form both printed `check-run15-exports: 256 names registered in the merged image (249 kicad names), 111 of 111 run 15 names, 0 failures`.
+
+Recompile reach: one .cpp of pcbnew, no header.
+
+### What the next build must probe (e11-6)
+
+Frame pcb, island harness, `tests/fixtures/glasgow`: `project.export` `pcb_render` `{format: 'png', width: 1600, height: 1200, quality: 'high', side: 'top'}` (about 15 s), and read `<dir>/.cc-export.json.lines` from the page between the engine's yields while it runs: the `Rendering <n> percent` lines appear one after another, climbing, before the answer arrives; the last is `Rendering 100 percent`; and the final `.cc-export.json` is byte for byte what build T3 gave (the same lines, "The picture is 1568 by 1176 pixels.", "Successfully created 3D render image"). Wrong if the file never appears before the record (the image lacks kicad 11f3edda), or the record gained or lost a line.
