@@ -31,6 +31,10 @@
  * applyChrome( frame, show ), so the start-up hold of cc_boot_dispatch.inc hides KiCad's chrome
  * on the frame being booted, before it is shown; kicadSetChrome paints the new layout before it
  * returns (repaintChromeNow), as a mouse button's synchronous repaint does.
+ *
+ * Modified by Circuit Center Inc on 2026-11-19: engine run 15, repair boot-1. The chrome
+ * snapshot counts a menu bar or status bar the frame has not built yet as shown, so a show after
+ * the start-up hold brings back the menu bar KiCad attaches after the frame's constructor.
  */
 
 #ifdef __EMSCRIPTEN__
@@ -505,9 +509,14 @@ static void applyChrome( wxFrame* frame, bool aShow )
         // A repeated hide keeps the original snapshot (idempotent).
         if( !s_chromeSnap.valid || s_chromeSnap.frame != frame )
         {
+            // A bar the frame has not built yet counts as KiCad's own, shown: KiCad builds its
+            // menu bar in a CallAfter (EDA_BASE_FRAME::ReCreateMenuBar), so the frame being
+            // booted has none when the start-up hold takes this snapshot, and the bar it
+            // attaches later comes shown (the held handlers hide it). Recorded as not shown,
+            // a show after a boot hold left KiCad's menu bar hidden.
             s_chromeSnap.frame = frame;
-            s_chromeSnap.menuShown = menuBar && menuBar->IsShown();
-            s_chromeSnap.statusShown = statusBar && statusBar->IsShown();
+            s_chromeSnap.menuShown = !menuBar || menuBar->IsShown();
+            s_chromeSnap.statusShown = !statusBar || statusBar->IsShown();
             s_chromeSnap.paneNames.clear();
 
             if( mgr )
