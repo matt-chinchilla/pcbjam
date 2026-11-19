@@ -157,6 +157,8 @@ The gitlink, once: 6b8c0b6 `kicad: run15/main at 6923bec3`. Every lane and boot-
 
 Train 4 (build T4, the repair build after T3's eleven fix notes). Ten repairs were merged in the cycle before (merged.log 19:47 to 19:59: e4-1, e4-2, e4-3, e5-1, e5-2, e6-1, e7-1, e8-1, e11-5, e12-1). boot-1 landed 00:10 (pcbjam ce7011d, notes e596b69, no kicad change), merged at its notes tip: 3197d6d. The gitlink once: 6e5ab71 `kicad: run15/main at c01ee866`. The checks on that tip: `check-run15-exports.sh --join` `256 names registered in the merged image (249 kicad names), 111 of 111 run 15 names, 0 failures`; `syntax-check-run15.sh all` with `ds_data_model_io.cpp`, `sch_drawing_tools.cpp`, `pcbnew_jobs_handler.cpp`, `pl_editor_frame.cpp`: 7 units and 4 files PASS, `syntax-check: 0 failed`.
 
+Train 5 (build T5, the repair build for the controller's two notes of 00:18). e11-6 landed 01:33 (kicad 11f3edda, notes pcbjam 22d6a66), e3-1 landed 01:41 (kicad 639c8bce, notes 21e7371); each read with its pasted checks (syntax check all 0 failed, export check --join 0 failures) and merged at those commits: kicad c11e0170 and 7169cafb, pcbjam 552d130 and 58ad0e2. The gitlink once: c711e7f `kicad: run15/main at 7169cafb`. The checks on that tip: `check-run15-exports.sh --join` `256 names registered in the merged image (249 kicad names), 111 of 111 run 15 names, 0 failures`; `syntax-check-run15.sh all` with `pcbnew_jobs_handler.cpp`, `pcb_edit_frame.cpp`, `footprint_edit_frame.cpp`, `edit_tool.cpp`, `drawing_tool.cpp`, `pcb_tuning_pattern.cpp`: 7 units and 6 files PASS, `syntax-check: 0 failed`.
+
 ## Builds
 
 ### Build G (2026-11-18)
@@ -241,4 +243,16 @@ The repairs: boot-1 PASS (after the hold `kicadSetChrome( true )` brings back th
 What T3 could not run: the enumerate drag (above), e-block-layout 2 (Component count mismatch, no step), 6 (applied 1, depth +2, the block's offsets; two blocks applied 2) and 7 (stale both ways), all PASS. Still not run: e12's pointer flows (the island tester's), m8 on the settings-from fixture (not in `w2/base`), the design block pane (no door), the island block specs (not in `w2/base`).
 
 Verdict: PASS, no fix note from this pass. Open after it: e11-6 and e3-1, written by the controller at 00:18 for the next repair build.
+
+### Build T5 (2026-11-19, train 5, the repair build for e11-6 and e3-1)
+
+- Launched 01:44:50 EST from `/home/matthew/cc-w2/island/e0-occ` as above (waited for gate slots), ran 01:46:47 to 02:09:49. End line: `engine build run15 done in 1382s (peak used 12 GB): /home/matthew/cc-engine/out/run15`. Sources pcbjam c711e7f, kicad 7169cafb. No undefined symbol. Kept as `out/run15-T5-keep`.
+- Sizes: `kicad_editor.wasm` 65,858,389 bytes, 17,431,105 gzip -9; occ 18,905,641 gzipped together, under the 20 MB stop.
+- How it was probed: as T4 (scratch worktree e0-probe on `w2/base` 290a34e, `fetch-engine --local`, icons re-recorded, `build:local`, the served wasm's sha256 equal to the build's, ports 4320 and 4321, the GPU window's cache and both origins' storage cleared). Every build 6 is read with NO library mirror served: with `LIBS_DIR` served, the fpedit frame's heap climbs from 268,435,456 to 2,767,912,960 in the 3 s after ready, on T4's engine as on T5's (measured both, the engine swapped in the same worktree), so it is the mirror's load, not this build. Scripts and logs: the session scratch folder `e0t5/`. Full results: `/home/matthew/cc-wave2/reports/engine-train-5.md`.
+
+Every build's seams: 1 to 6 PASS (249 `kicad*` functions = 138 + 111; board 25 and schematic 14 sections, netClasses there and back; pcb_render listed and the four 3D files; 20 fpedit and 17 dsedit names, all five frames canvas only; occ files and the island's occ e2e passed; heap at ready as T4).
+
+The repairs: e11-6 PASS (the high render's lines file read from the page 85 times while it grew, from 872 ms to 16,652 ms, before the record existed; whole lines only; climbing to one `Rendering 100 percent`; equal to the record's percent lines; the record's other lines as T4; basic PNG and JPEG byte equal to T4's; the percent count is timing bound, 84 on T3, 90 on T4, 85 and 89 on T5, so the record matches T3's in shape and not in bytes). e3-1 PARTIAL: the board's E road and the footprint editor's two roads pass; the board's run of `common.Groups.groupProperties` by name asks `kicadHostFpEdit` and, with only the board listener, opens KiCad's dialog (fix e3-2: the two frame files each define `CC_HOST_PCB_GROUP_TOOL` with different inline bodies, one definition kept for both).
+
+Verdict: FAIL, one fix note (e3-2), one repair build when it lands.
 
