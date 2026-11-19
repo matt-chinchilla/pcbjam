@@ -26,6 +26,19 @@
  * copies happen under ngSpice_LockRealloc so mid-run plot refresh cannot race
  * the growing simulation vectors (this replaces KiCad's client-side lock,
  * which is a no-op across the RPC boundary).
+ *
+ * Modified by Circuit Center Inc on 2026-11-19: a run that outgrows memory
+ * ends failed and the worker keeps answering (engine run 15, SI1). The
+ * service holds a working room while ngspice may take storage, so a request
+ * ngspice cannot be given fails inside ngspice (its own "can't allocate"
+ * message and controlled exit) before the heap's last bytes are gone; the
+ * room is let go when ngspice's thread ends. getVecInfo takes ngspice's
+ * realloc lock only while ngspice's thread runs: a thread that ended inside
+ * a failed vector extension still holds that lock, and waiting on it was the
+ * silent worker. After a controlled exit ngspice is initialized again before
+ * the next circ or command, as KiCad's NGSPICE::validate does natively (the
+ * worker's own init is a no-op on a live instance), so its locks are fresh
+ * and the next run starts.
  */
 
 #include <atomic>
@@ -45,6 +58,9 @@
 #include "ngspice/sharedspice.h"
 
 using namespace emscripten;
+
+static_assert( sizeof( ngcomplex_t ) == 2 * sizeof( double ),
+               "getVecInfo hands ngspice's complex data out as interleaved doubles" );
 
 namespace
 {
@@ -74,6 +90,43 @@ void emitEvt( int aKind, const char* aText, int aA, int aB )
         aKind, copy, aA, aB );
 }
 
+// The worker's working room. Held as one block that is never touched (address
+// space only, no page is written) whenever ngspice's thread may take storage, so
+// ngspice's own allocations can never take the heap's last kWorkingRoom bytes:
+// a storage request past that fails inside ngspice, which prints its own
+// "can't allocate" line and ends the run through its controlled exit. Let go
+// when ngspice's thread ends (finished or exited), which gives the worker room
+// to answer the requests that follow; held again at the next circ or command.
+constexpr size_t kWorkingRoom = size_t( 128 ) << 20;
+
+std::atomic<void*> s_room{ nullptr };
+
+// Set by ngspice's controlled exit: ngspice "cannot recover and awaits to be
+// reset" (sharedspice.c shared_exit). Cleared by resetAfterExit.
+std::atomic<bool> s_resetDue{ false };
+
+void letRoomGo()
+{
+    // Safe from any thread: ngspice's thread calls it as it ends, after its
+    // failed calloc or realloc returned (no allocator lock is held then).
+    std::free( s_room.exchange( nullptr ) );
+}
+
+void holdRoom()
+{
+    if( s_room.load() || ngSpice_running() )
+        return;
+
+    // May be null while an ended run's storage still fills the heap: the room
+    // is asked for again at the next circ or command (the engine destroys the
+    // kind's old plots before each run, which gives the storage back).
+    void* room = std::malloc( kWorkingRoom );
+    void* none = nullptr;
+
+    if( room && !s_room.compare_exchange_strong( none, room ) )
+        std::free( room );
+}
+
 int cbSendChar( char* aWhat, int, void* )
 {
     emitEvt( EVT_CHAR, aWhat, 0, 0 );
@@ -88,30 +141,64 @@ int cbSendStat( char* aWhat, int, void* )
 
 int cbControlledExit( int aStatus, NG_BOOL aImmediate, NG_BOOL aQuit, int, void* )
 {
+    // On ngspice's thread (shared_exit, just before the thread ends) or on this
+    // module's main thread (an exit inside a command). Either way ngspice now
+    // waits to be initialized again, and the worker needs its room.
+    s_resetDue.store( true );
+    letRoomGo();
     emitEvt( EVT_EXIT, nullptr, aStatus, ( aImmediate ? 1 : 0 ) | ( aQuit ? 2 : 0 ) );
     return 0;
 }
 
 int cbBGThreadRunning( NG_BOOL aNotRunning, int, void* )
 {
+    if( aNotRunning )
+        letRoomGo();
+
     emitEvt( EVT_BG, nullptr, aNotRunning ? 1 : 0, 0 );
     return 0;
 }
 
 std::atomic<bool> s_inited{ false };
 
+int ngspiceInit()
+{
+    return ngSpice_Init( cbSendChar, cbSendStat, cbControlledExit,
+                         nullptr, nullptr, cbBGThreadRunning, nullptr );
+}
+
 int svcInit()
 {
     if( s_inited.load() )
         return 0;
 
-    int ret = ngSpice_Init( cbSendChar, cbSendStat, cbControlledExit,
-                            nullptr, nullptr, cbBGThreadRunning, nullptr );
+    int ret = ngspiceInit();
 
     if( ret == 0 )
+    {
         s_inited.store( true );
+        holdRoom();
+    }
 
     return ret;
+}
+
+// Before every circ and command: after a controlled exit, ngspice is
+// initialized again first (its mutexes made fresh, among them the realloc lock
+// a thread that ended inside a failed vector extension still holds), exactly
+// the step KiCad's NGSPICE::validate takes natively when its ControlledExit
+// callback set m_error. KiCad's own validate then sends its init commands
+// (set noaskquit, set nomoremode, an empty circuit), which reach this fresh
+// ngspice as the requests that follow. Then the working room is held again.
+void readyForRequest()
+{
+    if( !s_inited.load() || ngSpice_running() )
+        return;
+
+    if( s_resetDue.exchange( false ) )
+        ngspiceInit();
+
+    holdRoom();
 }
 
 void mkdirRecursive( const std::string& aDir )
@@ -135,6 +222,8 @@ void mkdirRecursive( const std::string& aDir )
 // absolute paths so ngspice's own file access resolves them.
 int svcCirc( val aLines, val aFiles )
 {
+    readyForRequest();
+
     const unsigned nFiles = aFiles["length"].as<unsigned>();
 
     for( unsigned i = 0; i < nFiles; i++ )
@@ -181,6 +270,8 @@ int svcCirc( val aLines, val aFiles )
 
 int svcCommand( std::string aCmd )
 {
+    readyForRequest();
+
     return ngSpice_Command( const_cast<char*>( aCmd.c_str() ) );
 }
 
@@ -194,13 +285,26 @@ val svcGetVecInfo( std::string aName )
     static std::vector<double> s_realBuf;
     static std::vector<double> s_compBuf;
 
-    ngSpice_LockRealloc();
+    // ngspice's realloc lock guards a vector against its thread's growth. With
+    // no thread running nothing can move a vector, and a thread that ended
+    // inside a failed vector extension (its calloc or realloc refused, then
+    // its controlled exit) left the lock held for good: waiting on it was the
+    // worker that stopped answering. So the lock is taken only while ngspice's
+    // thread runs, and then the vector is copied before the lock is let go;
+    // with no thread the view is over ngspice's own data (the worker copies it
+    // out at once), which also asks no second heap block the size of the vector.
+    const bool live = ngSpice_running();
+
+    if( live )
+        ngSpice_LockRealloc();
 
     pvector_info vi = ngGet_Vec_Info( const_cast<char*>( aName.c_str() ) );
 
     if( !vi )
     {
-        ngSpice_UnlockRealloc();
+        if( live )
+            ngSpice_UnlockRealloc();
+
         out.set( "found", false );
         return out;
     }
@@ -213,8 +317,16 @@ val svcGetVecInfo( std::string aName )
 
     if( vi->v_realdata && vi->v_length > 0 )
     {
-        s_realBuf.assign( vi->v_realdata, vi->v_realdata + vi->v_length );
-        out.set( "real", val( typed_memory_view( s_realBuf.size(), s_realBuf.data() ) ) );
+        const size_t n = (size_t) vi->v_length;
+        const double* data = vi->v_realdata;
+
+        if( live )
+        {
+            s_realBuf.assign( data, data + n );
+            data = s_realBuf.data();
+        }
+
+        out.set( "real", val( typed_memory_view( n, data ) ) );
     }
     else
     {
@@ -223,22 +335,26 @@ val svcGetVecInfo( std::string aName )
 
     if( vi->v_compdata && vi->v_length > 0 )
     {
-        s_compBuf.resize( (size_t) vi->v_length * 2 );
+        // ngcomplex_t is { cx_real, cx_imag }: the data is already interleaved.
+        const size_t  n = (size_t) vi->v_length * 2;
+        const double* data = reinterpret_cast<const double*>( vi->v_compdata );
 
-        for( int i = 0; i < vi->v_length; i++ )
+        if( live )
         {
-            s_compBuf[(size_t) i * 2] = vi->v_compdata[i].cx_real;
-            s_compBuf[(size_t) i * 2 + 1] = vi->v_compdata[i].cx_imag;
+            s_compBuf.assign( data, data + n );
+            data = s_compBuf.data();
         }
 
-        out.set( "comp", val( typed_memory_view( s_compBuf.size(), s_compBuf.data() ) ) );
+        out.set( "comp", val( typed_memory_view( n, data ) ) );
     }
     else
     {
         out.set( "comp", val::null() );
     }
 
-    ngSpice_UnlockRealloc();
+    if( live )
+        ngSpice_UnlockRealloc();
+
     return out;
 }
 
