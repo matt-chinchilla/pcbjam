@@ -129,3 +129,31 @@ Both worktrees merged `run15/main` (pcbjam merge 44190d2, kicad merge efe741e8) 
 - Header changes and their reach: `eeschema/tools/sch_item_host.h` (new; included by sheet.cpp, sch_edit_tool.cpp, sch_drawing_tools.cpp and eeschema_embind.cpp through the inc), `eeschema/tools/backannotate.h` (class member additions under `__EMSCRIPTEN__`; two KiCad files include it, plus eeschema_embind.cpp through the inc). No widely included header changed.
 - Reported to E0: nothing needed (no include path, CMake line, build script line or new name; `<backannotate.h>` resolves through the TU's `eeschema/tools` include directory).
 - For the island seats (keys added beyond the spec's records): `color` on text and text box records (m5); `replaced` in `items.json` (m5); `outcome` in `renameNets.json` rows (lo-e4); table and table cell records are read only (RULINGS 2).
+
+## Repair e8-1: a block placed as a sheet in one press
+
+The fault (fix note e8-1, PJ gate 1 clause 3, build T3): `kicadDesignBlockPlace` with `asSheet: true` went through KiCad's draw sheet road: a first press drew the box, a second opened the Sheet Properties dialog, undo depth 0.
+
+The cause: K-B1's hunk took the host's block and options into `SCH_DRAWING_TOOLS::DrawSheet`, but that tool still made the sheet in two presses and, with no host form holding `sheet`, called `EditSheetProperties`.
+
+The repair, kicad 76051709 (`eeschema/tools/sch_drawing_tools.cpp`, `DrawSheet`, under `__EMSCRIPTEN__`, only while a host block's options are held): before the press KiCad's smallest sheet box with the block's name hangs off the pointer (a preview); the press makes the sheet as KiCad does (name from the block, file the block's schematic name, its fields, its page number) and queues `ACTIONS::finishInteractive`, which the tool manager runs before that press's dispatch returns, so the same press commits; the commit takes the file `ccNextSheetFileName` gives for the block's file name and `ccChangeSheetFile` (RENAME, the block's schematic as the source copy), never the dialog and no message box; then KiCad's own annotation by the block's `keepAnnotations`, the group by `asGroup`, ONE `c.Push` ("Draw Sheet"), and the tool ends. The options are cleared when the tool ends, placed or canceled. The road for a pane block and for a plain sheet is unchanged.
+
+Checks, from this worktree after `git merge run15/main` (pcbjam 690a16c, kicad merged):
+
+```
+/home/matthew/cc-wave2/bin/gate.sh scripts/kicad/syntax-check-run15.sh --kicad /home/matthew/cc-engine-wt/e8/kicad all --kicad-file eeschema/tools/sch_drawing_tools.cpp
+PASS pcbnew         pcbnew_embind.cpp subdir=pcbnew -DKICAD_MERGED_EMBIND (16231 ms)
+PASS eeschema       eeschema_embind.cpp subdir=eeschema -DKICAD_MERGED_EMBIND (15470 ms)
+PASS symedit        symedit_embind.cpp subdir=eeschema  (8340 ms)
+PASS fpedit         fpedit_embind.cpp subdir=pcbnew  (11751 ms)
+PASS dsedit         dsedit_embind.cpp subdir=pagelayout_editor  (5691 ms)
+PASS kicad_editor   kicad_editor_embind.cpp subdir=common  (6908 ms)
+PASS occ            pcbnew_embind.cpp subdir=pcbnew (15940 ms)
+PASS kicad eeschema/tools/sch_drawing_tools.cpp (9265 ms)
+syntax-check: 0 failed
+
+scripts/kicad/check-run15-exports.sh --since run15/main --kicad /home/matthew/cc-engine-wt/e8/kicad --kicad-since run15/main
+check-run15-exports: 256 names registered in the merged image (249 kicad names), 111 of 111 run 15 names, 0 failures
+```
+
+What the train must probe (the fix note's call): fixture `blocks-small`, frame `sch`, the library entry added, LDO's three files under `/tmp/cc-block/1/LDO.kicad_block/`, then `kicadDesignBlockPlace({dir:'/tmp/cc-block/1',name:'LDO',asSheet:true,keepAnnotations:false,asGroup:false})`. Expected: true, no pane and no dialog; a pointer move shows the box; ONE press puts down one sheet named LDO with file `LDO.kicad_sch` (or `LDO_2.kicad_sch` when taken), the file copied beside the project, its symbols annotated, undo depth 1, the tool ended (a second press places nothing). With `asGroup: true` and `nickname`: the sheet in one group whose `lib_id` is the block's, still one undo step. Esc before the press: nothing placed, depth 0, and a later pane placement reads the pane's settings. Failure that means it is wrong: depth 0 after one press, a second sheet on a second press, or any `wxDialog` on the canvas.
