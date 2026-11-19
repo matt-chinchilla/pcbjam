@@ -50,7 +50,7 @@ syntax-check: 0 failed
 No export (the prompt exports are e1's m1x-e1: `kicadPromptAnswer`, `kicadPromptCancel`, `kicadPromptPick`, marker `kicadHostPrompts`). Nothing in `cc_e2_pcb.inc`.
 
 **Host asks** (through `include/host_prompt.h`, e1's, merged into `run15/main` 79c5c7af):
-- `window.kicadHostPrompt.onAsk({token, ask: "array", modal: false, record})` from `DIALOG_CREATE_ARRAY::Show( true )` (`pcbnew/dialogs/dialog_create_array.cpp`, the `__EMSCRIPTEN__` block at the end; called by `ARRAY_TOOL::CreateArray`, `pcbnew/tools/array_tool.cpp` 104, unchanged). Record `{ shape: "grid" | "circular", arrangeSelection, uniqueReferences, padNumbering, grid: { nx, ny, dx, dy, offsetX, offsetY, centred, stagger, staggerRows, horizontalThenVertical, reverseNumberingAlternate, numberingStartSpecified, numbering2d, primary, secondary }, circular: { centreX, centreY, angle, angleOffset, clockwise, count, rotateItems, numberingStartSpecified, axis } }`, an axis `{ type: "numeric" | "hex" | "alphaShort" | "alphaFull", start: string, step }`; lengths mm (board coordinates for the centre), angles degrees; `padNumbering` is the dialog's `m_isFootprintEditor` (true in the footprint editor frame).
+- `window.kicadHostPrompt.onAsk({token, ask: "array", modal: false, record})` from `DIALOG_CREATE_ARRAY::Show( true )` (`pcbnew/dialogs/dialog_create_array.cpp`, the `__EMSCRIPTEN__` block at the end; called by `ARRAY_TOOL::CreateArray`, `pcbnew/tools/array_tool.cpp` 104, unchanged). Record `{ shape: "grid" | "circular", arrangeSelection, uniqueReferences, padNumbering, grid: { nx, ny, dx, dy, offsetX, offsetY, centered, stagger, staggerRows, horizontalThenVertical, reverseNumberingAlternate, numberingStartSpecified, numbering2d, primary, secondary }, circular: { centerX, centerY, angle, angleOffset, clockwise, count, rotateItems, numberingStartSpecified, axis } }`, an axis `{ type: "numeric" | "hex" | "alphaShort" | "alphaFull", start: string, step }`; lengths mm (board coordinates for the center), angles degrees; `padNumbering` is the dialog's `m_isFootprintEditor` (true in the footprint editor frame).
 - `onUpdate({token, record})` after each pick (`UpdatePickedItem`, `UpdatePickedPoint`).
 - `window.kicadHostPrompt.onAsk({token, ask: "positionRelative", modal: false, record})` from `DIALOG_POSITION_RELATIVE::Show( true )` (`pcbnew/dialogs/dialog_position_relative.cpp`; called by `POSITION_RELATIVE_TOOL::PositionRelative`, unchanged). Record `{ anchor: { kind: "item" | "point" | "gridOrigin" | "userOrigin", x, y, label }, x, y }` (label KiCad's `m_referenceInfo` text verbatim, x and y of the anchor and of the offset in mm). A later `Show( true )` while the prompt is parked (after a pick, or Shift+P again) sends `onUpdate` with the new record in place of a second ask.
 - `onEnd({token, reason: "gone"})` when a dialog with a parked prompt is destroyed (`CcHostPromptForget` in both destructors).
@@ -67,7 +67,7 @@ No export (the prompt exports are e1's m1x-e1: `kicadPromptAnswer`, `kicadPrompt
 
 **Probes (canvas-kinds fixture, Board, Edit mode, a `window.kicadHostPrompt` listener that records and returns true):**
 1. Select R1, Ctrl+T: one `onAsk` ask `array`, modal false, the record above, no KiCad window. `kicadPromptAnswer(token, {"shape":"grid","grid":{"nx":3,"ny":2,"dx":2.54,"dy":2.54},"uniqueReferences":true,"arrangeSelection":false})` answers `{"accepted":true}`; six items (R1 and five copies with new references); undo depth +1; one Undo removes them. Wrong if: the dialog shows, the answer is stale, or two undo steps.
-2. Again, `shape` circular: `kicadPromptPick(token, "point")` returns 0, a click on U1 pad 1, `onUpdate` with `circular.centreX/centreY` at that point; answer `{"shape":"circular","circular":{"count":6,"angle":60}}`: a ring of six.
+2. Again, `shape` circular: `kicadPromptPick(token, "point")` returns 0, a click on U1 pad 1, `onUpdate` with `circular.centerX/centerY` at that point; answer `{"shape":"circular","circular":{"count":6,"angle":60}}`: a ring of six.
 3. Refusal: `{"grid":{"nx":"3"}}` answers `{"accepted":false,"field":"grid","message":""}` and the prompt stays (a later good answer is accepted); `{"foo":1}` gives `field` `foo`; `{"shape":"grid","grid":{"nx":0}}` reaches KiCad (refused or accepted by KiCad's own rules, never a crash).
 4. Cancel: `kicadPromptCancel(token)` 0; nothing made; the next Ctrl+T asks again.
 5. Select R1, Shift+P: ask `positionRelative`; `kicadPromptPick(token, "item")`, click U1: `onUpdate` with anchor kind `item` at U1's position and KiCad's label; answer `{"x":5,"y":0}`: R1 sits 5 mm right of U1, one undo step "Position Relative"; the prompt has ended (`kicadPromptAnswer` on the same token answers `{"stale":true}`).
@@ -244,3 +244,49 @@ syntax-check: 0 failed
 ```
 check-run15-exports: 156 names registered in the merged image (149 kicad names), 11 of 110 run 15 names, 0 failures
 ```
+
+## Repair e2-1 (2026-11-19): the array ask's keys take the American spelling
+
+Finding (`/home/matthew/cc-wave2/engine/fix/e2-1.md`, the island's stage close): the Create
+Array record of m6-e2 named three keys of ours in the British spelling, and the island's
+spelling guard is red on the island files that repeat them.
+
+Verified in the code: the keys were written by the record builder and read by the answer reader
+of `DIALOG_CREATE_ARRAY`, `pcbnew/dialogs/dialog_create_array.cpp` (the `__EMSCRIPTEN__` block at
+the end of the file): `grid["centred"]`, `circular["centreX"]`, `circular["centreY"]`, the
+`ccOnlyKeys` lists of both halves and the `ccReadBool` and `ccReadNumber` calls. No other file of
+the lane used them (`cc_e2_pcb.inc` holds none).
+
+Change, kicad commit 9c3f1e53: the three keys are `centerX`, `centerY` and `centered`
+everywhere the record is written and the answer read, with no alias (an answer that still sends
+an old key is refused by `ccOnlyKeys` as any unknown key is). Our own locals and two of our
+comments follow; KiCad's own identifiers (`m_rbCentreOnSource`, `m_hCentre`, `m_vCentre`,
+`m_centred`, `m_centre`) stay. Dated "Modified" line added in the file's notice.
+
+Syntax check (`/home/matthew/cc-wave2/bin/gate.sh scripts/kicad/syntax-check-run15.sh --kicad
+/home/matthew/cc-engine-wt/e2/kicad all --kicad-file pcbnew/dialogs/dialog_create_array.cpp`):
+
+```
+PASS pcbnew         pcbnew_embind.cpp subdir=pcbnew -DKICAD_MERGED_EMBIND (19317 ms)
+PASS eeschema       eeschema_embind.cpp subdir=eeschema -DKICAD_MERGED_EMBIND (18721 ms)
+PASS symedit        symedit_embind.cpp subdir=eeschema  (9898 ms)
+PASS fpedit         fpedit_embind.cpp subdir=pcbnew  (13462 ms)
+PASS dsedit         dsedit_embind.cpp subdir=pagelayout_editor  (7298 ms)
+PASS kicad_editor   kicad_editor_embind.cpp subdir=common  (7045 ms)
+PASS occ            pcbnew_embind.cpp subdir=pcbnew (18047 ms)
+PASS kicad pcbnew/dialogs/dialog_create_array.cpp (8601 ms)
+syntax-check: 0 failed
+```
+
+Export check (`scripts/kicad/check-run15-exports.sh --join --kicad
+/home/matthew/cc-engine-wt/e2/kicad`):
+
+```
+check-run15-exports: 256 names registered in the merged image (249 kicad names), 111 of 111 run 15 names, 0 failures
+```
+
+The probe for the next build: the array ask on a selected item carries `grid.centered`,
+`circular.centerX` and `circular.centerY` (and no British key); an answer using them (for
+example `{"shape":"circular","circular":{"centerX":<x>,"centerY":<y>,"count":6,"angle":60}}`
+on the build T6 fixture) makes the same array build T6 made; an answer with `centreX` is refused
+as an unknown key.
