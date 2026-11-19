@@ -155,6 +155,8 @@ Train 3 (build T3), the last two handovers, each at its handover tip with `git m
 
 The gitlink, once: 6b8c0b6 `kicad: run15/main at 6923bec3`. Every lane and boot-e1 are merged. The checks on that tip: `check-run15-exports.sh --join` `256 names registered in the merged image (249 kicad names), 111 of 111 run 15 names, 0 failures` (the four held conditional units fp-f1, flt-ds4-e, sy2-e and lo-e2-svc-e list no export name, so nothing of theirs is set aside); `syntax-check-run15.sh all --kicad-file pagelayout_editor/pl_editor_frame.cpp`: 7 units and the file PASS, `syntax-check: 0 failed`.
 
+Train 4 (build T4, the repair build after T3's eleven fix notes). Ten repairs were merged in the cycle before (merged.log 19:47 to 19:59: e4-1, e4-2, e4-3, e5-1, e5-2, e6-1, e7-1, e8-1, e11-5, e12-1). boot-1 landed 00:10 (pcbjam ce7011d, notes e596b69, no kicad change), merged at its notes tip: 3197d6d. The gitlink once: 6e5ab71 `kicad: run15/main at c01ee866`. The checks on that tip: `check-run15-exports.sh --join` `256 names registered in the merged image (249 kicad names), 111 of 111 run 15 names, 0 failures`; `syntax-check-run15.sh all` with `ds_data_model_io.cpp`, `sch_drawing_tools.cpp`, `pcbnew_jobs_handler.cpp`, `pl_editor_frame.cpp`: 7 units and 4 files PASS, `syntax-check: 0 failed`.
+
 ## Builds
 
 ### Build G (2026-11-18)
@@ -225,3 +227,18 @@ What T2 owed:
 - e5, e7, e12 and the new e4, e6 lists: as the report; faults e4-1 (enumerate SuspendError), e4-2 (master pad and pad add refused), e4-3 (barcode symbology key), e5-1 (picture bytes re-encoded), e5-2 (Continue Load Schematic box on a sheet from a file), e6-1 (above, and two asks per press on Place Bitmaps), e7-1 (the update token differs between two previews on blocks-small, run 14 too, so layout probes 6 and 7 are blocked), e11-5 (STPZ "Unknown export format"), e12-1 (router custom sizes taken but not applied).
 
 Verdict: FAIL; eleven fix notes, one repair build when their fixes land.
+
+### Build T4 (2026-11-19, train 4, the repair build)
+
+- Launched 00:15:50 EST from `/home/matthew/cc-w2/island/e0-occ` as above (waited for two gate slots), ran 00:20:41 to 00:41:02. End line: `engine build run15 done in 1220s (peak used 15 GB): /home/matthew/cc-engine/out/run15`. Sources pcbjam 6e5ab71, kicad c01ee866. No undefined symbol. Kept as `out/run15-T4-keep`.
+- Sizes: `kicad_editor.wasm` 65,853,985 bytes, 17,430,008 gzip -9; occ 18,902,685 gzipped together, under the 20 MB stop.
+- How it was probed: as T3 (scratch worktree e0-probe on `w2/base` 290a34e, `fetch-engine --local`, icons re-recorded, `build:local`, the served wasm's sha256 equal to the build's, ports 4320 and 4321, the GPU window's cache and both origins' storage cleared, island id cc24). The e7 layout probes need KiCad's footprints for the update: the harness served with `LIBS_DIR` at the main island checkout's `dist/libs` (read only). Scripts and logs: the session scratch folder `e0t4/`. Full results: `/home/matthew/cc-wave2/reports/engine-train-4.md`.
+
+Every build's seams: 1 to 6 PASS (249 `kicad*` functions = 138 + 111; board 25 and schematic 14 sections; the 3D files; fpedit and ds frames; occ 18.9 MB and the island's occ e2e passed; heap at ready as T3).
+
+The repairs: boot-1 PASS (after the hold `kicadSetChrome( true )` brings back the menu bar, toolbars and status bar in all five frames, only KiCad's own panes; hide and show again; no input unchanged); boot-e1 again PASS in sch, pcb, symedit, fpedit and ds (25 starts, 0 chrome and 0 beige frames, no in-frame chrome record). e4-1 PASS (true with no throw; a drag over three pads then a double click: 11, 12, 13 in one step; Esc reverts, KiCad's loop), e4-2 PASS, e4-3 PASS, e5-1 PASS (and the T3 not-run item: a picture over 64 kB reads `bytes` and no `png`), e5-2 PASS, e6-1 PASS (ds gate 0 item 4: kicad-cli 10.0.4 exit 0 on the custom and default takes, Checked in the PDF text, no `(uuid`), e7-1 PASS (equal tokens on two previews, stale after a move), e8-1 PASS (PJ gate 1 clause 3: one press, one step, sheet LDO, no dialog), e11-5 PASS (all nine 3D formats; the render byte equal to T3's), e12-1 PASS (custom sizes read back, a free route 0.4 mm; from a pad with a track KiCad's router takes the track's width, as stock KiCad: `router_tool.cpp` 1384).
+
+What T3 could not run: the enumerate drag (above), e-block-layout 2 (Component count mismatch, no step), 6 (applied 1, depth +2, the block's offsets; two blocks applied 2) and 7 (stale both ways), all PASS. Still not run: e12's pointer flows (the island tester's), m8 on the settings-from fixture (not in `w2/base`), the design block pane (no door), the island block specs (not in `w2/base`).
+
+Verdict: PASS, no fix note from this pass. Open after it: e11-6 and e3-1, written by the controller at 00:18 for the next repair build.
+
