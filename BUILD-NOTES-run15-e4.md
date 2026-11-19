@@ -187,7 +187,7 @@ footprint or the record fails as a set would.
 |---|---|---|
 | `kicadFpEditPadDefaultsGet` | `std::string ()` | the master pad (`GetDesignSettings().m_Pad_Master`) as a pad record from 0, 0 |
 | `kicadFpEditPadDefaultsSet` | `bool (std::string)` | `{set}` exactly; the patch on a copy and checked, then on the master pad, synchronously; net cleared, `PAD_TOOL::SetLastPadNumber` when a number is given (the dialog's two lines); no commit, no undo step, footprint not modified |
-| `kicadFpEditEnumerate` | `bool (std::string)` | `{start 0..999, step 0..999, prefix text 0..64}` exactly (`DIALOG_ENUM_PADS`' ranges, prefix always set); `PAD_TOOL::enumerateLoop( params ) == 1` (e3's fp-e1b; links once e3's `pad_tool.cpp` body is merged) |
+| `kicadFpEditEnumerate` | `bool (std::string)` | `{start 0..999, step 0..999, prefix text 0..64}` exactly (`DIALOG_ENUM_PADS`' ranges, prefix always set); EnumeratePads' own checks first (pad tool, not pad edit mode, the footprint has pads), then `PAD_TOOL::enumerateLoop( params )` QUEUED on the apply coroutine (`runOnCoroutine`) and true at once (repair e4-1; e3's fp-e1b) |
 
 All in `EMSCRIPTEN_BINDINGS( cc_e4_fpedit )`, merged image only (the fpedit TU), none in the
 board TU. No header change, no KiCad file, nothing reported to E0 (the include
@@ -250,7 +250,7 @@ these keys.
 
 **barcode** (`DIALOG_BARCODE_PROPERTIES::transferDataToBarcode`): `text`, `layer`, `locked`, `x`,
 `y`, `width`, `height`, `textSize`, `angle` (`Rotate` by the difference, as the dialog), `knockout`,
-`margin`, `showText`, `kind` (code39, code128, datamatrix, qr, microqr), `errorCorrection` (L, M,
+`margin`, `showText`, `symbology` (code39, code128, datamatrix, qr, microqr), `errorCorrection` (L, M,
 Q, H); `AssembleBarcode()`, then refused when a non empty text yields no symbol (the dialog's
 "Barcode Error"). Add: `DrawBarcode`'s barcode (layer, the layer's text height), then the record.
 
@@ -268,7 +268,7 @@ Syntax check: `/home/matthew/cc-wave2/bin/gate.sh scripts/kicad/syntax-check-run
 What the build train must probe (fixture `fpedit-small`, the SOIC open):
 
 - `kicadFpEditItemsGet('{"kinds":["field","text"]}')`: Reference and Value (and the file's other fields) with `name`, `visible`, `keepUpright` and no `locked`; the silk `${REFERENCE}` text with `name ""`. Wrong: `locked` on a footprint text, a field without `visible`.
-- `kicadFpEditItemsAdd` of one each with page made uuids: `{kind:"field", uuid, name:"MPN", layer:"F.Fab", text:"X1"}`, `{kind:"text", uuid, text:"T", layer:"F.SilkS", x:1, y:1}`, `{kind:"textbox", uuid, text:"B", layer:"F.SilkS", points:[[0,0],[5,3]]}`, `{kind:"table", uuid, layer:"F.SilkS", colWidths:[5,5], rowHeights:[2,2], cells:[["a","b"],["c","d"]]}`, `{kind:"barcode", uuid, layer:"F.SilkS", text:"CC", kind:"qr"}`: ONE undo step "Add", each read back with its uuid and keys (the table 2 by 2 with its cells, the text box at least its text's minimum size). Wrong: two undo steps, a dialog (the drawing tool's own dialogs must not open), a table with a different cell count.
+- `kicadFpEditItemsAdd` of one each with page made uuids: `{kind:"field", uuid, name:"MPN", layer:"F.Fab", text:"X1"}`, `{kind:"text", uuid, text:"T", layer:"F.SilkS", x:1, y:1}`, `{kind:"textbox", uuid, text:"B", layer:"F.SilkS", points:[[0,0],[5,3]]}`, `{kind:"table", uuid, layer:"F.SilkS", colWidths:[5,5], rowHeights:[2,2], cells:[["a","b"],["c","d"]]}`, `{kind:"barcode", uuid, layer:"F.SilkS", text:"CC", symbology:"qr"}`: ONE undo step "Add", each read back with its uuid and keys (the table 2 by 2 with its cells, the text box at least its text's minimum size). Wrong: two undo steps, a dialog (the drawing tool's own dialogs must not open), a table with a different cell count.
 - One `kicadFpEditItemsSet` per key on each (text, size, angle, bold, hJustify, layer, border, cells, borderExternal, kind, errorCorrection), each one undo step, Ctrl+Z through `key.press` after each restores it.
 - Refusals with depth unchanged: `{name:"Other"}` on Value, `{visible:false}` on a text, `{locked:true}` on a footprint text, `{text:""}` on any, `{rows:3}` on the table, `{kind:"code39", text:"lowercase-not-encodable~"}` if Code 39 refuses it (KiCad's error), a field add with a name the footprint holds.
 - `kicadFpEditItemsRemove` of the Reference field's uuid answers false (fp-e-items).
@@ -308,3 +308,18 @@ The export check:
 ```
 check-run15-exports: 237 names registered in the merged image (230 kicad names), 92 of 111 run 15 names, 0 failures
 ```
+
+## Repairs e4-1, e4-2, e4-3 (2026-11-18, after build T3's probes)
+
+Merged `run15/main` (690a16c) first.
+
+- **e4-1** (a4889fe, `cc_e4_fpedit.inc`): `kicadFpEditEnumerate` threw `SuspendError` because `enumerateLoop` runs the enumeratePads action, whose tool waits on events, from the call's own stack. It now makes EnumeratePads' own checks first (pad tool present, not pad edit mode, the footprint has pads; false otherwise), then QUEUES `enumerateLoop( params )` on the apply coroutine (`pcbjam_collab::runOnCoroutine`, as `pcbShow3DViewer` runs its tool) and answers true at once. It stays a plain `bool`, NOT a Promise (no parker policy): fp-i units and probes call it synchronously; the loop is live one event turn later (wait for the bullseye cursor or poll before the drag).
+- **e4-2** (afeb978, `cc_item_pad.h`): KiCad's `SetDefaultMasterPad` makes a drill of 0.8 by 0, which CheckPad refuses (`PTH pad hole size must be larger than`, DRCE_PADSTACK_INVALID) until the pad dialog's `transferDataToPad` writes a circle hole as X by X. `applyPatch` now does the same for every pad with a hole (a circle hole's Y follows its X), so master sets and new pads (which import the master) are taken; the read gives a circle hole as its diameter both ways (`[0.8, 0.8]`).
+- **e4-3** (6cddadd, `cc_item_text.h`): a barcode's symbology key is now `symbology` (code39, code128, datamatrix, qr, microqr) in the record, the set and the add, since `kind` is the item record's own. fp-i2a and fp-s6 must use `symbology`.
+
+Probes for the next build: `kicadFpEditEnumerate('{"start":1,"step":1,"prefix":""}')` true with no throw, then a drag over three pads numbers 1, 2, 3 in one undo step. `kicadFpEditPadDefaultsGet()` reads drill `{"shape":"circle","size":[0.8,0.8]}`; `kicadFpEditPadDefaultsSet('{"set":{"copper":{"size":[1,2]}}}')` true, depth unchanged, get reads [1, 2]; `ItemsAdd` of `{kind:"pad", uuid, number:"9"}` true with size [1, 2]. A barcode add with `symbology:"qr"` reads back `symbology` "qr"; `ItemsSet {"set":{"symbology":"code128"}}` true, one undo step; `{"set":{"kind":"qr"}}` still false.
+
+Checks (from this worktree, through the gate):
+`scripts/kicad/syntax-check-run15.sh --kicad /home/matthew/cc-engine-wt/e0-kicad all`:
+PASS pcbnew, PASS eeschema, PASS symedit, PASS fpedit, PASS dsedit, PASS kicad_editor, PASS occ; `syntax-check: 0 failed`.
+`scripts/kicad/check-run15-exports.sh --since run15/main`: 256 names registered in the merged image (249 kicad names), 111 of 111 run 15 names, 0 failures.
