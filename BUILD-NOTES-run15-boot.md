@@ -96,3 +96,35 @@ From a scratch island worktree of `w2/base` on its own port pair, in the GPU win
 5. **The empty drawing area:** in each frame, before the GAL's first WebGL frame and in a frame with no document (symedit with no symbol, ds, a pcb or sch boot with no open), the 2D pixels of `#canvas` under the drawing area equal the color theme's background (`circuitcenter.json` background of that face: schematic background for sch and symedit, board background for pcb and fpedit, the drawing sheet background for ds), never (212, 208, 200) by day or (45, 45, 62) by night. Wrong if beige: the painter was not there at the erase, or another window paints over the area.
 6. **Each frame's start with the screencast classifier** (`rec.mjs`, `summ.py` in the probe folder): schematic, board, symedit, fpedit, ds, each at 1x and at 4x slowed CPU (at least 3 starts at 1x and 2 at 4x each, as build G read ds and fpedit): ZERO chrome frames and ZERO beige frames, with the island's own waits in place (cc24's reveal) and, once boot-i1 lands, with its marker path. Also the held second engine (the board engine booted while the schematic is shown, at opacity 0) and a frame switch (Schematic to Board and back on the site), the owner's report.
 7. **No regression:** `kicadChromeShown()` and `ev.chrome` report the true state after a pane toggle (Ctrl+H) while held (sticky handlers rehide, `ev.chrome` stays false); a theme switch (`setColorTheme`) leaves the chrome hidden; the right-drag pan and the first click (the island's synthetic focus click) still work; heap at ready unchanged within noise against build G's 386,662,400 bytes (ds) and the sch frame's 556,793,856.
+
+## Repair boot-1 (2026-11-19, fix note boot-1.md)
+
+**The fault (train 3):** after a boot hold, `kicadSetChrome( true )` brought back the toolbars, the panes and the status bar but not KiCad's menu bar (without the input it did).
+
+**The cause, verified in the code:** every frame (`pcb_edit_frame.cpp:289`, `sch_edit_frame.cpp:213`, `symbol_edit_frame.cpp:185`, `footprint_edit_frame.cpp:175`, `pl_editor_frame.cpp:149`) calls `ReCreateMenuBar()` in its constructor, and `EDA_BASE_FRAME::ReCreateMenuBar` (`common/eda_base_frame.cpp:836`) only queues `doReCreateMenuBar` in a `CallAfter`. So when KIWAY::Player hands the frame to the start-up hook, `GetMenuBar()` is null, and `applyChrome`'s snapshot recorded `menuShown = false`. The menu bar attached later came shown and the held size handler hid it (correct while held); the show then obeyed the snapshot and left it hidden. A `set( false )` before the show kept that first snapshot (a repeated hide keeps the original), so the fault stayed after a hide and show too. The hold itself was already the same sticky state `kicadSetChrome( false )` sets (`s_chromeSnap.hidden`, the same handlers): only the snapshot was wrong.
+
+**The change:** in `applyChrome`'s snapshot (pcbjam `wasm/bindings/kicad_editor_embind.cpp`), a menu bar or status bar the frame has not built yet counts as KiCad's own, shown (`!menuBar || menuBar->IsShown()`, the same for the status bar). The restore shows a bar only when it exists, so a frame with no bar is unchanged. No KiCad file changed.
+
+**Checks** (after `git merge run15/main` in both worktrees):
+
+```
+/home/matthew/cc-wave2/bin/gate.sh scripts/kicad/syntax-check-run15.sh --kicad /home/matthew/cc-engine-wt/boot/kicad all
+PASS pcbnew         pcbnew_embind.cpp subdir=pcbnew -DKICAD_MERGED_EMBIND (20155 ms)
+PASS eeschema       eeschema_embind.cpp subdir=eeschema -DKICAD_MERGED_EMBIND (17444 ms)
+PASS symedit        symedit_embind.cpp subdir=eeschema  (8508 ms)
+PASS fpedit         fpedit_embind.cpp subdir=pcbnew  (10503 ms)
+PASS dsedit         dsedit_embind.cpp subdir=pagelayout_editor  (5982 ms)
+PASS kicad_editor   kicad_editor_embind.cpp subdir=common  (6303 ms)
+PASS occ            pcbnew_embind.cpp subdir=pcbnew (13987 ms)
+syntax-check: 0 failed
+
+scripts/kicad/check-run15-exports.sh --join --kicad /home/matthew/cc-engine-wt/boot/kicad
+check-run15-exports: 256 names registered in the merged image (249 kicad names), 111 of 111 run 15 names, 0 failures
+```
+
+**What the next build must probe** (the input `window.kicadBoot = { chrome: false }` set in the island frame before the engine script, frames with no document):
+
+1. Boot with the hold in `sch`, `pcb`, `symedit`, `fpedit`, `ds`: `kicadChromeShown()` false at ready. Then `kicadSetChrome( true )`: `window.wxElementRegistry` shows a visible `wxMenuBar` (the File Edit View row on screen), the `wxAuiToolBar`s and the `wxStatusBar`, `kicadChromeShown()` true, `ev.chrome` true, and only the panes KiCad itself showed (pcb: Appearance and the selection filter; no Search, no Net Inspector). Wrong if no `wxMenuBar`: the snapshot was still taken with a menu bar recorded hidden.
+2. Then `kicadSetChrome( false )`: the menu bar, toolbars, panes and status bar all hidden again, `kicadChromeShown()` false, `ev.chrome` false; and `set( true )` once more brings them all back.
+3. The first painted frame is still the canvas only in `sch`, `pcb`, `symedit`, `fpedit` and `ds` (the classifier: zero chrome frames, zero beige frames), and while held, Ctrl+H and a theme switch still leave the chrome hidden with `ev.chrome` false (the menu bar attached by the CallAfter stays hidden until the show).
+4. Without the input: unchanged (chrome at boot, `set( false )` hides, `set( true )` restores the same set).
