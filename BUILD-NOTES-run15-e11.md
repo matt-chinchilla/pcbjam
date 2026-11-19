@@ -244,3 +244,35 @@ Frame pcb, island harness, `tests/fixtures/glasgow`:
 1. `project.export` `pcb_export_3d` `{format: 'vrml'}`: code 0, a `.wrl` over 1 MB (kicad-cli 10.0.4 writes about 18 MB), its text holding `IndexedFaceSet` and `coordIndex` for the board body and the copper, mask and silk layers. Wrong if code -1 "The VRML exporter wrote no board (an empty scene)." (the image lacks f24fb9ed), or a much smaller file (name which layers are missing: a boundary pass failed on them; the record's lines carry `VRML_LAYER`'s error).
 2. Beside kicad-cli 10.0.4's own `.wrl` of Glasgow: the count of `IndexedFaceSet` nodes per layer the same, and the vertex counts within a few percent (GLU and the shim may split crossings differently, never drop a region).
 3. The shim's other user unchanged: the board and the schematic of Glasgow draw as before in Edit mode (graphic polygons, filled shapes and pads drawn through `WEBGL_GAL::drawPolygon`), and a zone refill on the fixture gives the same fill (zones never pass through the shim; this confirms nothing else moved). The 3D render of build G (PNG 1600 by 1200 basic) is byte for byte the same picture as build G's (the raytracer never calls GLU).
+
+## Repair e11-5: STPZ answered Unknown export format (done)
+
+The fault (3d-e2's e2e, `pcb_export_3d` `{format: 'stpz'}` on Glasgow): `export_failed: Unknown export format`. Cause, read in the code: `PCBNEW_JOBS_HANDLER::JobExportStep` names the default output file, when the job's configured output path is empty (always so in our engine, the run folder is the working path), by a switch on `m_format` that has no `FORMAT::STEPZ` case and falls to its default, `Unknown export format`, `ERR_UNKNOWN`. Its second switch (the format handed to `EXPORTER_STEP`) has STEPZ, and `EXPORTER_STEP::Export` writes it through `STEP_PCB_MODEL::WriteSTEP( ..., true )` (wxZlib gzip). Every other format of the list (step brep xao glb ply stl u3d pdf, and vrml) has its case in both switches.
+
+The repair: kicad 7dae6c8b, `pcbnew/pcbnew_jobs_handler.cpp`, the case `JOB_EXPORT_PCB_3D::FORMAT::STEPZ` with `FILEEXT::StepZFileAbrvExtension` ("stpz", KiCad's own constant) in the default name switch, under `#ifdef __EMSCRIPTEN__` (a plain build compiles what it did; kicad-cli always passes an output path). Dated "Modified by" line added. No pcbjam change, no export added or renamed.
+
+### Checks (repair e11-5)
+
+After `git merge run15/main` in both worktrees, from `/home/matthew/cc-engine-wt/e11/pcbjam`:
+
+`/home/matthew/cc-wave2/bin/gate.sh scripts/kicad/syntax-check-run15.sh --kicad /home/matthew/cc-engine-wt/e11/kicad all --kicad-file pcbnew/pcbnew_jobs_handler.cpp`
+
+```
+PASS pcbnew         pcbnew_embind.cpp subdir=pcbnew -DKICAD_MERGED_EMBIND (14405 ms)
+PASS eeschema       eeschema_embind.cpp subdir=eeschema -DKICAD_MERGED_EMBIND (13501 ms)
+PASS symedit        symedit_embind.cpp subdir=eeschema  (6920 ms)
+PASS fpedit         fpedit_embind.cpp subdir=pcbnew  (9039 ms)
+PASS dsedit         dsedit_embind.cpp subdir=pagelayout_editor  (5126 ms)
+PASS kicad_editor   kicad_editor_embind.cpp subdir=common  (4999 ms)
+PASS occ            pcbnew_embind.cpp subdir=pcbnew (12293 ms)
+PASS kicad pcbnew/pcbnew_jobs_handler.cpp (10083 ms)
+syntax-check: 0 failed
+```
+
+`scripts/kicad/check-run15-exports.sh --since run15/main --kicad /home/matthew/cc-engine-wt/e11/kicad --kicad-since run15/main`: `check-run15-exports: 256 names registered in the merged image (249 kicad names), 111 of 111 run 15 names, 0 failures`.
+
+Recompile reach: one .cpp of pcbnew, no header.
+
+### What the next build must probe (e11-5)
+
+Frame pcb, island harness, `tests/fixtures/glasgow`, `project.export` `pcb_export_3d` with each format of 3d-e2's probe 3 in turn, `stpz brep xao glb ply stl u3d pdf`: each code 0 and a non empty file with that extension. For stpz: the file starts with the gzip magic `1f 8b` and unpacks to a STEP text that starts `ISO-10303-21;`, about the size of the `.step` (274,987 bytes in the integrator's probe). Wrong if stpz still answers `Unknown export format` (the image lacks kicad 7dae6c8b). The e2e stopped at stpz, so brep, ply, u3d and pdf run there for the first time: a failure of one of those is a new fault, named with its line.
