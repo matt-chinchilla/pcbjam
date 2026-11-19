@@ -128,8 +128,13 @@ int runAction( std::string aName )
     if( !toolMgr->GetActionManager()->FindAction( aName ) )
         return 1;
 
+    // KiCad's DIALOG_SHIM names itself the Kiway's blocking dialog from its constructor to its
+    // destructor, and a modeless dialog KiCad keeps alive hidden between uses (Position
+    // Relative) stays named after it closes: only a shown one is busy.
+    wxWindow* blocking = frame->Kiway().GetBlockingDialog();
+
     if( CcHostMenuParked() || CcHostPromptModalParked() || toolMgr->IsContextMenuActive()
-            || modalDialogUp() || frame->Kiway().GetBlockingDialog() || pcbjam_open::busy() )
+            || modalDialogUp() || ( blocking && blocking->IsShown() ) || pcbjam_open::busy() )
     {
         return 3;
     }
