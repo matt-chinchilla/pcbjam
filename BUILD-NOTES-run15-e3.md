@@ -420,3 +420,80 @@ syntax-check: 0 failed
 ### What the next build must probe (e3-2)
 
 The e3-1 list again, plus: in the pcb frame with BOTH `window.kicadHostBoardItem` and `window.kicadHostFpEdit` listening (true), select the board group of `canvas-kinds` (`cc0ca4d5-0000-4000-8000-000000000352`) and run `common.Groups.groupProperties` by name: exactly one `{kind: "group", uuid: <that group>, isNew: false}` on `kicadHostBoardItem`, nothing on `kicadHostFpEdit`, no dialog. In the fpedit frame the same run with both armed: one `{ask: "group"}` on `kicadHostFpEdit`, nothing on `kicadHostBoardItem`. Wrong if either frame's ask lands on the other editor's host. A symbol check on the image (`CC_HOST_BOARD_GROUP_TOOL` and `CC_HOST_FPEDIT_GROUP_TOOL` both present) also shows the two classes survived the link.
+
+
+## fp-f1: the footprint editor's boot loads only the project's rows
+
+Built because fp-e0's gate 0 report (`/home/matthew/cc-wave2/reports/fp-gate0.md`, build T14) asks for it: with the island's mirror served (155 footprint libraries) the fpedit frame's heap goes from about 300 MiB at `ev.ready` to 2,640 MiB (`HEAP8` 2,767,912,960) within 3 to 5 s and stays there; the pcb frame holds 386,662,400. The manifest names `BUILD-NOTES-run15-fp-f1.md`: it is this section.
+
+### The cause, read in the code
+
+The footprint editor frame has KiCad's library tree; the board frame has none. Every road that fills that tree asks `FOOTPRINT_LIBRARY_ADAPTER::GetFootprints( nickname, true )` of EVERY loaded footprint library:
+
+1. **At construction.** `FOOTPRINT_EDIT_FRAME::FOOTPRINT_EDIT_FRAME` calls `initLibraryTree()` (`pcbnew/footprint_edit_frame.cpp`, the call at 176 on `run15/main`), which runs `AsyncLoad()` and `BlockUntilLoaded()` (cheap: `FOOTPRINT_LIBRARY_ADAPTER::enumerateLibrary` is a no-op on this port, so every row just becomes LOADED) and then `FP_TREE_MODEL_ADAPTER::AddLibraries( this )` (`pcbnew/fp_tree_model_adapter.cpp` 49 to 74): for each name of `GetLibraryNames()` (every LOADED row, mirror and project alike) `m_libs->GetFootprints( libName, true )`.
+2. **After the boot's preload.** `single_top.cpp` 634 calls pcbnew's `IFACE::PreloadLibraries` after the frame exists; at its end (`pcbnew/pcbnew.cpp` 1031) it sends `MAIL_RELOAD_LIB` to `FRAME_FOOTPRINT_EDITOR`, whose `KiwayMailIn` (`pcbnew/footprint_editor_utils.cpp` 379) runs `SyncLibraryTree( true )` and so `FP_TREE_SYNCHRONIZING_ADAPTER::Sync` (`pcbnew/fp_tree_synchronizing_adapter.cpp`), whose "look for new libraries" loop calls `GetFootprints( libName, true )` for every LOADED library not yet in the tree. The same Sync runs on every later `MAIL_RELOAD_LIB` (each `kicadLibsReload` of a project library, `pcbjam_libs_reload.h`), on `HardRedraw` and on Save As.
+
+`GetFootprints` (`pcbnew/footprint_library_adapter.cpp` 184) finds nothing in `PreloadedFootprints` and calls `preloadLibrary`, which calls `PCB_IO_PCBJAM_FP::FootprintEnumerate` and so `fatLoad` (`pcbnew/pcb_io/pcbjam_fp/pcb_io_pcbjam_fp.cpp` 414): ONE `kicadLibs.request( "list", uri, "bodies" )` crossing that brings the whole library's bodies into the heap (the provider's island side reads that library's bundle), a parallel parse of every footprint into the plugin's `m_cache`, then `preloadLibrary` `Duplicate`s each footprint into the process wide `FOOTPRINT_LIBRARY_ADAPTER::PreloadedFootprints` (a `LEAK_AT_EXIT` map, kept for the whole session) and clears the plugin cache. What it holds on to: a parsed `FOOTPRINT` of every footprint of every mirrored library, plus the heap the parse and the fat buffers grew to (wasm memory never shrinks). That is the 2.3 GB.
+
+Not pinned by reading: which of the two roads runs after `ev.ready` in the T14 runs (the construction loop parks on each library's crossing through `wxWasmYieldUntil`, so ready may be reported while it still runs; the preload's mail certainly comes after the frame exists), and why fp-e0 saw no footprint bundle requested (the `list bodies` crossing reaches the island's source, `getAllItems`, which reads the bundle from IndexedDB or the network; the probe below counts the provider's own log lines to settle it). The change closes both roads, so neither question changes it.
+
+The symbol editor had the same pattern and was closed in run 14 (see below).
+
+### The change (kicad `seat/run15-e3`, commit 2caf12e2, every line under `__EMSCRIPTEN__`, plain builds unchanged)
+
+- `pcbnew/footprint_edit_frame.cpp` (the unit's file): `initLibraryTree()` builds the tree with `adapter->Sync( footprints )` in place of `adapter->AddLibraries( this )`. On the empty tree Sync adds the same library nodes AddLibraries would (name, the row's description, pinned, the footprints), limited by the rule below. `AddLibraries` itself is not touched: `FP_TREE_MODEL_ADAPTER` also serves KiCad's footprint chooser (`widgets/panel_footprint_chooser.cpp` 103), which keeps its own behavior. The dated notice line added.
+- `pcbnew/fp_tree_synchronizing_adapter.cpp` (**no lane owns it; leased to lane e3 for fp-f1**, named here as the guide asks): Sync's "look for new libraries" loop skips any row whose uri does not start `/mnt/pcbjam/prj.`, the rule the symbol editor's tree has had since run 14. The class serves the footprint editor alone (its only users: `footprint_edit_frame.cpp` and its own files). Why this file: the loop that reads every library lives here, and the frame cannot filter it from outside (`m_libMap`, `updateLibrary` and `DoAddLibrary` are the adapter's). The dated notice line added.
+
+What still loads, and when:
+
+- At the frame's start: `AsyncLoad` marks every row LOADED (no read), and the project's own footprint libraries (`prj.fp.<nickname>`, rows the island adds with `kicadLibsAddEntry`) each get their one `list bodies` crossing into the tree. No mirrored library is read.
+- A project library added or reloaded later (`kicadLibsReload`, `MAIL_RELOAD_LIB`): that library alone, as before.
+- `fpedit.open` (`kicadFpEditOpen`, plan A): the footprint's own text, no library row, no tree sync; the heap grows by that footprint only.
+- KiCad's own load of a mirrored footprint by name (`FOOTPRINT_LIBRARY_ADAPTER::LoadFootprint( nickname, name )`, as the board's round trip or a `LIB_ID` load uses): `PreloadedFootprints` holds no mirrored library now, so it falls to the plugin's single `FootprintLoad` (one `get` crossing for that one footprint); the heap grows by that footprint, never its library. A mirrored library enters the engine heap whole only if something asks `GetFootprints` of it (KiCad's footprint chooser, which the product never shows).
+- The tree is hidden chrome: the page's own footprint browser reads its own index, so nothing a reader sees depends on the tree being full.
+
+### The symbol editor frame (checked, not changed)
+
+`SYMBOL_EDIT_FRAME` fills its tree through `SyncLibraries` (`eeschema/symbol_editor/symbol_edit_frame.cpp` 1380; called from the constructor at 298 and on `MAIL_RELOAD_LIB` at 1804) and `LIB_SYMBOL_LIBRARY_MANAGER::Sync`, which is `SYMBOL_TREE_SYNCHRONIZING_ADAPTER::Sync` (`eeschema/symbol_tree_synchronizing_adapter.cpp`). Its "look for new libraries" loop already skips rows not under `/mnt/pcbjam/prj.` (142 to 148, run 14 commit 8cc0bdd9, the note there measured about 650 MB and a 4.4 s progress box before it), and its progress box is forced off (`symbol_edit_frame.cpp` 1383). The symbol editor's constructor has no AddLibraries road. So it does not have the pattern; its boot reads only the project's symbol libraries. (`SYMBOL_TREE_SYNCHRONIZING_ADAPTER::GetLibrariesCount` still counts every name, a number for the progress box that never shows; harmless.)
+
+### Checks (fp-f1)
+
+After `git merge run15/main` in both worktrees, from `/home/matthew/cc-engine-wt/e3/pcbjam`:
+
+`/home/matthew/cc-wave2/bin/gate.sh scripts/kicad/syntax-check-run15.sh --kicad /home/matthew/cc-engine-wt/e3/kicad all --kicad-file pcbnew/footprint_edit_frame.cpp --kicad-file pcbnew/fp_tree_synchronizing_adapter.cpp`
+
+```
+PASS pcbnew         pcbnew_embind.cpp subdir=pcbnew -DKICAD_MERGED_EMBIND (14856 ms)
+PASS eeschema       eeschema_embind.cpp subdir=eeschema -DKICAD_MERGED_EMBIND (14815 ms)
+PASS symedit        symedit_embind.cpp subdir=eeschema  (7022 ms)
+PASS fpedit         fpedit_embind.cpp subdir=pcbnew  (9819 ms)
+PASS dsedit         dsedit_embind.cpp subdir=pagelayout_editor  (5270 ms)
+PASS kicad_editor   kicad_editor_embind.cpp subdir=common  (5297 ms)
+PASS occ            pcbnew_embind.cpp subdir=pcbnew (13115 ms)
+PASS kicad pcbnew/footprint_edit_frame.cpp (8291 ms)
+PASS kicad pcbnew/fp_tree_synchronizing_adapter.cpp (5942 ms)
+syntax-check: 0 failed
+```
+
+`scripts/kicad/check-run15-exports.sh --join --kicad /home/matthew/cc-engine-wt/e3/kicad` and the `--since run15/main --kicad /home/matthew/cc-engine-wt/e3/kicad --kicad-since run15/main` form both printed `check-run15-exports: 256 names registered in the merged image (249 kicad names), 111 of 111 run 15 names, 0 failures`.
+
+No pcbjam code file and no export changed; no header changed (recompile reach: the two `.cpp` files only).
+
+### What the next build must probe (fp-f1)
+
+On the island's local pair with the mirror served as production serves it (`LIBS_DIR` = the 10.0.4 build `PIN.json` pins), the GPU window's HTTP cache and both origins' storage cleared, one tab at a time, closed in a finally:
+
+1. **The heap.** `?frame=fpedit`: `Module.HEAP8.length` at `ev.ready` and at +1, 2, 3, 5, 8, 12, 20, 30 s. Expected: the value 30 s after ready within a few percent of the value at ready, and under the empty pcb frame's (386,662,400 on T14). Wrong if it climbs past about 400 MB at any point (the old 1,231, 1,871, 2,640 MiB steps).
+2. **The crossings.** Count the provider's console lines `[libs] request op=list kind=footprint ... arg=bodies` from the fpedit frame's start to +30 s: zero for a design with no project footprint library; one per `prj.fp.` row when the design carries project libraries. Wrong if any `fp.<mirror nickname>` appears. (This also settles fp-e0's "no bundle requested".)
+3. **A project footprint opens.** A design with a project footprint library (`prj.fp.<nick>`, added through `kicadLibsAddEntry`): its row is in the tree (`kicadLibsReload` of it sends `MAIL_RELOAD_LIB` and its one crossing shows), and `fpedit.open` of one of its footprints answers open with its pads.
+4. **A mirrored footprint by name, on demand.** `fpedit.open` of a mirror footprint's text (e.g. `Package_SO:SOIC-8_3.9x4.9mm_P1.27mm`, body read from the mirror, `lib` = `Package_SO`): opens with 8 pads; the heap grows by that footprint only (a few MB at most, never the library). Then KiCad's own name load of a mirrored footprint (the board round trip of a footprint placed from the mirror): one `op=get` crossing, no `op=list ... arg=bodies` for that library, heap step a few MB.
+5. **T14's item 2 again**, unchanged: KiCad's pad tool through `key.press` places a pad (pads 8 to 9, depth 0 to 1, one `ev.edited`), Ctrl+Z takes it back (depth 0), `fpedit.take` byte equal after open and take, `kicadFpEditCheck` answers as on T14, 20 open and take cycles leave `HEAP8` flat.
+6. **No KiCad window, menu or progress box** at the start or during 1 to 5: `kicadChromeShown()` false, 2 wx elements shown, no `ev.menu`, no wx dialog in `window.wxElementRegistry`; the classifier sees zero chrome and zero beige frames at the start.
+
+Wrong if: the heap still climbs (another road reads the mirror: name it from the `[libs]` log), a project library does not reach the tree after its reload, or a mirrored footprint opened by name pulls its whole library (`list bodies` for it).
+
+### For the island
+
+- The fpedit frame's boot no longer asks the provider for any mirrored footprint library: no `list bodies` crossing, so the provider's `enumerateGate` (`warmUpOnEnumerate`) no longer starts the footprint warm-up at an fpedit boot. An island unit that counted on that warm-up having run (a footprint bundle stored before the page asks for one) must start what it needs itself (`prefetch(id)` of the libraries it wants, or the picker's own warm-up).
+- KiCad's library tree in the fpedit frame lists only the `prj.fp.` rows. Never open a mirrored footprint through the tree (KiCad's `MAIL_FP_EDIT` road selects the item in the tree and finds nothing for a mirror library): open it as plan A does, its body read from the mirror (`getItemBody`) and sent with `fpedit.open` (text, name, `lib` = the nickname). A project library added at run time reaches the tree through `kicadLibsAddEntry` then `kicadLibsReload`, unchanged.
+- Nothing else changes: no op, cap, marker or event; the fpedit e2e expectations of T14 stand.
