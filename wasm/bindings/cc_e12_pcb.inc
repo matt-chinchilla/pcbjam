@@ -247,7 +247,14 @@ bool routerSet( PCB_EDIT_FRAME* aFrame, const json& aValue, bool aDryRun, std::s
                                      bds.SetCustomTrackWidth( *sizes[0] );
 
                                  if( custom )
+                                 {
+                                     // ROUTER_TOOL::CustomTrackWidthDialog: the custom size
+                                     // wins over a connected track's width.
+                                     if( *custom )
+                                         bds.m_TempOverrideTrackWidth = true;
+
                                      bds.UseCustomTrackViaSize( *custom );
+                                 }
                              } );
         }
         else if( key == "currentVia" )
@@ -272,7 +279,14 @@ bool routerSet( PCB_EDIT_FRAME* aFrame, const json& aValue, bool aDryRun, std::s
                                      bds.SetCustomViaDrill( *sizes[1] );
 
                                  if( custom )
+                                 {
+                                     // ROUTER_TOOL::CustomTrackWidthDialog: the custom size
+                                     // wins over a connected track's width.
+                                     if( *custom )
+                                         bds.m_TempOverrideTrackWidth = true;
+
                                      bds.UseCustomTrackViaSize( *custom );
+                                 }
                              } );
         }
         else if( key == "currentDiffPair" )
@@ -335,6 +349,14 @@ bool routerSet( PCB_EDIT_FRAME* aFrame, const json& aValue, bool aDryRun, std::s
 
     for( const std::function<void()>& edit : edits )
         edit();
+
+    // The board editor's own path after a size change (BOARD_EDITOR_CONTROL's track and via
+    // size choices, ROUTER_TOOL::CustomTrackWidthDialog): a live route takes the new sizes.
+    if( !edits.empty() )
+    {
+        if( TOOL_MANAGER* tools = aFrame->GetToolManager() )
+            tools->RunAction( PCB_ACTIONS::trackViaSizeChanged );
+    }
 
     return true;
 }
@@ -1593,7 +1615,12 @@ void runPcb( const READ_ARGS& aArgs )
 } // namespace read
 } // namespace pcb
 
-const bool kRouter = ccRegisterPcbSection( { "router", "pcb", &pcb::routerGet, &pcb::routerSet } );
+// setupOk false (fix e12-1): the router's settings and the current sizes are editor state, never
+// saved in the board, and Board Setup's OK steps reset the custom track, via and pair sizes and
+// the custom flag (BOARD::SynchronizeNetsAndNetClasses( true )), so a taken set never showed.
+// The live router reads the settings object in place and the sizes through trackViaSizeChanged.
+const bool kRouter = ccRegisterPcbSection( { "router", "pcb", &pcb::routerGet, &pcb::routerSet,
+                                             false } );
 const bool kLayerPairs = ccRegisterPcbSection( { "layerPairs", "pcb", &pcb::layerPairsGet, &pcb::layerPairsSet } );
 const bool kOrigins = ccRegisterPcbSection( { "origins", "pcb", &pcb::originsGet, &pcb::originsSet } );
 const bool kPcbEditing = ccRegisterPcbSection( { "pcbEditing", "pcb", &pcb::pcbEditingGet, &pcb::pcbEditingSet,
