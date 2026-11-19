@@ -387,3 +387,36 @@ On a board fixture with a group (pcb frame), with a `window.kicadHostBoardItem.o
 4. With no listener: both roads open KiCad's dialog as before. The run by name now names the selected group; before, it handed KiCad a null group.
 
 In the footprint editor, with a group in the footprint and `window.kicadHostFpEdit.onRequest` answering true, E and the run by name each send one `{ask: "group", uuid, isNew: false}` and no dialog opens. With no listener, KiCad's dialog opens. Wrong if a road still opens the dialog while the listener takes it, if E gives two requests when refused, or if the run by name with no group selected opens anything.
+
+## Repair e3-2: the board's group tool asked the footprint editor's host (build T5)
+
+Fault (fix note `e3-2.md`, build T5): on the board, a run of `common.Groups.groupProperties` by name asked `window.kicadHostFpEdit` (`{ask: "group"}`), not `window.kicadHostBoardItem`, and with only the board listener armed opened KiCad's dialog. E looked right only because `EDIT_TOOL::Properties` asks the board host first.
+
+Cause: e3-1 defined a class named `CC_HOST_PCB_GROUP_TOOL` in BOTH `pcbnew/pcb_edit_frame.cpp` and `pcbnew/footprint_edit_frame.cpp`, each with an in-class (inline) `GroupProperties` passing a different `aFootprintEditor` (false, true). Both translation units link into the merged image, so the one definition rule was broken: the linker kept one inline body, vtable and typeinfo for both, here the footprint editor's. The syntax check cannot see it (each unit compiles alone).
+
+Fix (kicad `seat/run15-e3`): the two classes take names of their own, `CC_HOST_BOARD_GROUP_TOOL` in `pcb_edit_frame.cpp` and `CC_HOST_FPEDIT_GROUP_TOOL` in `footprint_edit_frame.cpp`; `board_item_host.h`'s comment names both and why they differ; each frame file's dated notice names its class. Commits 5f301cad (the rename and the header comment), fd743ed0 (the notices). No pcbjam file and no export changed; no file outside lane e3.
+
+A sweep of our own class names defined in more than one KiCad `.cpp` found only `CC_CELL_IN` and `CC_TABLE_STROKE_IN` (wave 1, m12-e, pcbnew and eeschema table dialogs): token for token identical aggregates with no inline bodies that differ, so no fault; reported, not changed (not lane e3's).
+
+### Checks (repair e3-2)
+
+`gate.sh scripts/kicad/syntax-check-run15.sh --kicad /home/matthew/cc-engine-wt/e3/kicad all --kicad-file pcbnew/pcb_edit_frame.cpp --kicad-file pcbnew/footprint_edit_frame.cpp`, after `git merge run15/main` in both worktrees:
+
+```
+PASS pcbnew         pcbnew_embind.cpp subdir=pcbnew -DKICAD_MERGED_EMBIND (17379 ms)
+PASS eeschema       eeschema_embind.cpp subdir=eeschema -DKICAD_MERGED_EMBIND (17827 ms)
+PASS symedit        symedit_embind.cpp subdir=eeschema  (9175 ms)
+PASS fpedit         fpedit_embind.cpp subdir=pcbnew  (12447 ms)
+PASS dsedit         dsedit_embind.cpp subdir=pagelayout_editor  (6705 ms)
+PASS kicad_editor   kicad_editor_embind.cpp subdir=common  (6542 ms)
+PASS occ            pcbnew_embind.cpp subdir=pcbnew (16220 ms)
+PASS kicad pcbnew/pcb_edit_frame.cpp (17014 ms)
+PASS kicad pcbnew/footprint_edit_frame.cpp (8535 ms)
+syntax-check: 0 failed
+```
+
+`scripts/kicad/check-run15-exports.sh --since run15/main --kicad /home/matthew/cc-engine-wt/e3/kicad --kicad-since run15/main`: `check-run15-exports: 256 names registered in the merged image (249 kicad names), 111 of 111 run 15 names, 0 failures`.
+
+### What the next build must probe (e3-2)
+
+The e3-1 list again, plus: in the pcb frame with BOTH `window.kicadHostBoardItem` and `window.kicadHostFpEdit` listening (true), select the board group of `canvas-kinds` (`cc0ca4d5-0000-4000-8000-000000000352`) and run `common.Groups.groupProperties` by name: exactly one `{kind: "group", uuid: <that group>, isNew: false}` on `kicadHostBoardItem`, nothing on `kicadHostFpEdit`, no dialog. In the fpedit frame the same run with both armed: one `{ask: "group"}` on `kicadHostFpEdit`, nothing on `kicadHostBoardItem`. Wrong if either frame's ask lands on the other editor's host. A symbol check on the image (`CC_HOST_BOARD_GROUP_TOOL` and `CC_HOST_FPEDIT_GROUP_TOOL` both present) also shows the two classes survived the link.
