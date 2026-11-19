@@ -310,3 +310,49 @@ Recompile reach: one .cpp of pcbnew, no header.
 ### What the next build must probe (e11-6)
 
 Frame pcb, island harness, `tests/fixtures/glasgow`: `project.export` `pcb_render` `{format: 'png', width: 1600, height: 1200, quality: 'high', side: 'top'}` (about 15 s), and read `<dir>/.cc-export.json.lines` from the page between the engine's yields while it runs: the `Rendering <n> percent` lines appear one after another, climbing, before the answer arrives; the last is `Rendering 100 percent`; and the final `.cc-export.json` is byte for byte what build T3 gave (the same lines, "The picture is 1568 by 1176 pixels.", "Successfully created 3D render image"). Wrong if the file never appears before the record (the image lacks kicad 11f3edda), or the record gained or lost a line.
+
+## Repair e11-7: a 3D model the export could not add is a warning (found by the 3D recheck after T3 and T4)
+
+The fault: when the 3D service could not add a model ("Could not add 3D model for R1. File not found: ...", KiCad's WARNING in `exporter_step.cpp`; the read and add failures of `step_pcb_model.cpp` are ERRORs), the job's lines carried it only as an INFO line, which the island leaves out of `notes`. Cause, read in the code: `occExport` (`wasm/occ-service/occ_service_main.cpp`) gathers every message in one `WX_STRING_REPORTER` text, which keeps no severity, and the editor's EXPORTER_STEP shadow (`wasm/stubs/exporter_step_stub.cpp`) reported that whole text as ONE line: INFO when the export succeeded. The island's provider passes only `{ok, report}` back to the engine, so the severity has to travel inside the report text.
+
+The repair: pcbjam c3c30d2, both files leased to this lane whole.
+
+- `occ_service_main.cpp`: `CC_OCC_REPORTER` (over `WX_STRING_REPORTER`, the report text unchanged) also keeps every WARNING and ERROR message. `ccModelProblemLines` then goes through the board's footprints' 3D models by file name (each name once, empty names skipped). For a model whose file name a kept message holds, it appends one line to the report: `The 3D model <file> was not added: <that message on one line>`. With no warning or error naming a model, nothing is appended.
+- `exporter_step_stub.cpp`: the report is split at newlines. Each line that starts `The 3D model ` and holds ` was not added: ` is reported as a WARNING of the job, after the rest, which is rejoined and reported exactly as before (INFO when ok, ERROR when not). A report with no such line is passed through byte for byte.
+
+Kept as it was: every other line, the codes, the file check after the run. No export added; no kicad change.
+
+### Checks (repair e11-7)
+
+After `git merge run15/main` in both worktrees, from `/home/matthew/cc-engine-wt/e11/pcbjam`:
+
+`/home/matthew/cc-wave2/bin/gate.sh scripts/kicad/syntax-check-run15.sh --kicad /home/matthew/cc-engine-wt/e11/kicad all --kicad-file pcbnew/pcbnew_jobs_handler.cpp`
+
+```
+PASS pcbnew         pcbnew_embind.cpp subdir=pcbnew -DKICAD_MERGED_EMBIND (20809 ms)
+PASS eeschema       eeschema_embind.cpp subdir=eeschema -DKICAD_MERGED_EMBIND (20153 ms)
+PASS symedit        symedit_embind.cpp subdir=eeschema  (9495 ms)
+PASS fpedit         fpedit_embind.cpp subdir=pcbnew  (12478 ms)
+PASS dsedit         dsedit_embind.cpp subdir=pagelayout_editor  (7198 ms)
+PASS kicad_editor   kicad_editor_embind.cpp subdir=common  (6823 ms)
+PASS occ            pcbnew_embind.cpp subdir=pcbnew (18059 ms)
+PASS kicad pcbnew/pcbnew_jobs_handler.cpp (13013 ms)
+syntax-check: 0 failed
+```
+
+The two changed files are pcbjam sources that the script's `--kicad-file` cannot name. Each was compiled `-fsyntax-only` with its own `compile_commands.json` line from the cache volume, using the script's KiCad file mode extraction and the same read only mounts: the stub's line from `kicad-kicad_editor`, the service's from `kicad-occ_service`.
+
+```
+PASS pcbjam wasm/stubs/exporter_step_stub.cpp (8554 ms)
+PASS pcbjam wasm/occ-service/occ_service_main.cpp (8299 ms)
+```
+
+To prove the check bites, an undeclared name was planted in the service and the check printed `FAIL pcbjam wasm/occ-service/occ_service_main.cpp`; then the file was restored. Reported to E0 again: the script could take pcbjam sources (`--pcbjam-file`).
+
+`scripts/kicad/check-run15-exports.sh --join --kicad /home/matthew/cc-engine-wt/e11/kicad` and the `--since run15/main --kicad-since run15/main` form both printed `check-run15-exports: 256 names registered in the merged image (249 kicad names), 111 of 111 run 15 names, 0 failures`.
+
+Rebuild reach: occ_service (one source) and the editor's stub (one source).
+
+### What the next build must probe (e11-7)
+
+Frame pcb, island harness, the `models3d-small` fixture with one body's file left out of the staging. `project.export` `pcb_export_3d` `{format: 'step'}`: the STEP is made, code 0, and the answer's `notes` hold ONE warning, `The 3D model <that file> was not added: Could not add 3D model for <ref>. File not found: <path>`. With every file present, there is no warning, and the record's lines are byte for byte those before the repair. A model used by two footprints and missing gives one warning, not two. Wrong if the warning is absent (the image lacks pcbjam c3c30d2, in the service or the editor), or if a clean board gains or loses a line.
