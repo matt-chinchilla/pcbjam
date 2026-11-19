@@ -290,3 +290,64 @@ The probe for the next build: the array ask on a selected item carries `grid.cen
 example `{"shape":"circular","circular":{"centerX":<x>,"centerY":<y>,"count":6,"angle":60}}`
 on the build T6 fixture) makes the same array build T6 made; an answer with `centreX` is refused
 as an unknown key.
+
+## Repair e2-2 (2026-11-19): an accepted answer to a modeless ask no longer traps
+
+The fault (fix note e2-2, build T9 and T6): `kicadPromptAnswer` on an accepted answer to the
+modeless `array` or `positionRelative` ask threw `SuspendError: trying to suspend without
+WebAssembly.promising` and made nothing. Cause: the receivers ran the accepting step inside the
+export's own plain stack. For the array, `TransferDataFromWindow` called `Close()`, whose
+`wxEVT_CLOSE_WINDOW` ran `ARRAY_TOOL::onDialogClosed` and its `BOARD_COMMIT::Push` at once; for
+Position Relative, `CcApply` called `OnOkClick`, whose `RelativeItemSelectionMove` pushes the
+commit. A commit may suspend, which a plain embind call cannot do. The modal asks were never
+affected: their answer only fills the controls and the parked `ShowModal` resumes on its own
+promising chain.
+
+The fix (kicad `pcbnew/dialogs/dialog_create_array.cpp`, `pcbnew/dialogs/dialog_position_relative.cpp`,
+both under `__EMSCRIPTEN__`, a dated "Modified" line in each notice): validation and refusal stay
+synchronous; the accepting step is queued with `CallAfter` on the dialog, which the port's
+promising top level tick (`wxWasmTopLevelTick`, `ProcessPendingEvents`) delivers, the same lane
+`pcbjam_collab::runOnCoroutine` queues on, where KiCad's commit may wait as after a press of OK.
+- Array: `TransferDataFromWindow` closes with `CallAfter( Close )` while `CcPromptCapturing()`
+  (only while a host answer is applied), else `Close()` as before. `CcApply` still erases the
+  token before returning, so the export answers `{"accepted":true}`, no `onEnd` follows the
+  accept (the destructor's `CcHostPromptForget` finds nothing), and a second answer is `stale`.
+- Position Relative: `CcApply` writes the controls, runs `getTranslationInIU` (OnOkClick's own
+  check; a failure refuses with the field), ends the prompt and hides the dialog, then queues
+  `OnOkClick` (one commit "Position Relative") with `CallAfter`.
+No export, marker or host ask changed; `PCBJAM_PARKER_POLICY` untouched; host_prompt.h (e1's)
+untouched. Kicad commit 2e703f5e.
+
+Syntax check (`/home/matthew/cc-wave2/bin/gate.sh scripts/kicad/syntax-check-run15.sh --kicad
+/home/matthew/cc-engine-wt/e2/kicad all --kicad-file pcbnew/dialogs/dialog_create_array.cpp
+--kicad-file pcbnew/dialogs/dialog_position_relative.cpp`):
+
+```
+PASS pcbnew         pcbnew_embind.cpp subdir=pcbnew -DKICAD_MERGED_EMBIND (19867 ms)
+PASS eeschema       eeschema_embind.cpp subdir=eeschema -DKICAD_MERGED_EMBIND (18330 ms)
+PASS symedit        symedit_embind.cpp subdir=eeschema  (9982 ms)
+PASS fpedit         fpedit_embind.cpp subdir=pcbnew  (12904 ms)
+PASS dsedit         dsedit_embind.cpp subdir=pagelayout_editor  (6971 ms)
+PASS kicad_editor   kicad_editor_embind.cpp subdir=common  (7632 ms)
+PASS occ            pcbnew_embind.cpp subdir=pcbnew (18494 ms)
+PASS kicad pcbnew/dialogs/dialog_create_array.cpp (9281 ms)
+PASS kicad pcbnew/dialogs/dialog_position_relative.cpp (8291 ms)
+syntax-check: 0 failed
+```
+
+Export check (`scripts/kicad/check-run15-exports.sh --since run15/main --kicad
+/home/matthew/cc-engine-wt/e2/kicad --kicad-since run15/main`):
+
+```
+check-run15-exports: 256 names registered in the merged image (249 kicad names), 111 of 111 run 15 names, 0 failures
+```
+
+The probe for the next build (the fix note's): the grid answer
+`{"shape":"grid","grid":{"nx":3,"ny":2,"dx":2.54,"dy":2.54}}` and the circular answer
+`{"shape":"circular","circular":{"centerX":<record x + 5>,"centerY":<record y>,"count":6,"angle":60}}`
+each answer `{"accepted":true}` with no exception; the grid makes six footprints in one undo
+step and one Undo returns to three; the circular ring is one step; Position Relative
+`{"x":5,"y":0}` moves R1 in one "Position Relative" step; a second answer to the same token
+answers `{"stale":true}`; no KiCad window shows. The array is made a tick after the answer
+returns, so the probe waits for the footprint count (or the undo depth) to change rather than
+reading it in the same task as the answer.
