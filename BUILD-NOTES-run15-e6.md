@@ -204,3 +204,45 @@ The export check:
 ```
 check-run15-exports: 253 names registered in the merged image (246 kicad names), 108 of 111 run 15 names, 0 failures
 ```
+
+## Repair e6-1 (2026-11-18): K-DS2 written; Place Bitmaps' asks stated as KiCad's
+
+The fault note: build T3's gate 0 item 4 sent a `kicadDsEditTake()` of `custom_ds.kicad_wks` (title set to "Checked") to `kicad-cli sch export pdf --drawing-sheet` in the `kicad/kicad:10.0.4` image, which refused it: `Unexpected uuid in '/w/take.kicad_wks', line 1, offset 214` (KiCad 10.0's drawing sheet keywords have no `uuid`; the fork's formatter writes one per item). And Place Bitmaps with nothing armed asked the host twice: once at the tool's start, once on the first press.
+
+1. K-DS2, the plan B of the addendum (5.3). Commits: kicad e44f3ad2, pcbjam 588039d.
+   - kicad `common/drawing_sheet/ds_data_model_io.cpp` (dated "Modified by Circuit Center Inc" line added): under `__EMSCRIPTEN__`, `DS_DATA_MODEL_IO` gains `m_ccWriteUuids` (true), its four `KICAD_FORMAT::FormatUuid` calls (tbtext, line and rect, polygon, bitmap) write only while it is true, and a new string writer `DS_DATA_MODEL_STOCK_STRINGIO` (sets it false) backs the free function `CcDsSaveInStringForStockKicad( DS_DATA_MODEL*, wxString* )`, the model's whole text exactly as `SaveInString` writes it, less the uuids. `SaveInString`, `Save`, the undo copies and the parser are unchanged (the parser still reads uuids; an item read without one takes a fresh `KIID`). Plain builds unchanged. No header of KiCad changed (`ds_data_model.h` untouched: no recompile reach).
+   - kicad `pagelayout_editor/ds_editor_host.h` (ours): the declaration, with a forward declaration of `DS_DATA_MODEL`.
+   - pcbjam `wasm/bindings/dsedit_embind.cpp`: `kicadDsEditTake()` writes through `CcDsSaveInStringForStockKicad`. The take holds no `(uuid ...)`; so reopening a take gives every item a FRESH uuid (the ids are stable for the life of one open, through undo, set, append and show, as before). Probe 4 of ds-e2 changes: "opening that text again gives the same items" means the same items in the same order with the same properties, NOT the same uuids.
+2. Place Bitmaps (no code change, the notes corrected). The start ask is KiCad's own behavior: `PL_DRAWING_TOOLS::PlaceItem` (`pagelayout_editor/tools/pl_drawing_tools.cpp` 116) primes the tool with a click (`TOOL_MANAGER::PrimeTool`, a `TA_PRIME` event the loop reads through `IsClick( BUT_LEFT )`) whenever its activation carries a position, which a hotkey (the island's `key.press`) always does; stock KiCad opens its "Choose Image" dialog at that same moment. `AddDrawingSheetItem` is not given the event and cannot tell a primed click from a press; telling them apart would need `pl_drawing_tools.cpp`, a file of no lane. So the contract, replacing probe 7 of ds-e2:
+   - With nothing armed: ONE ask per left press on the canvas, plus ONE at the start when the tool was started with a position (by its key). Started without a position (an action with no position, KiCad's toolbar), the first ask is on the first press. Nothing is placed, the undo depth is unchanged, the tool stays.
+   - The island treats an ask that comes while its own picker is already open as already answered (the start's ask opens the picker; a press before the picture is chosen asks again).
+   - Armed: the next press CREATES the bitmap (it follows the pointer, flags `IS_NEW | IS_MOVING`), the following press PLACES it (KiCad's two press flow for every item but text), one undo step, no dialog; the press after that asks again (the slot was disarmed when the bitmap was made).
+3. Corrections from the fault note's other readings (for the island spec, no engine fault): `every-item.kicad_wks` opens with 9 items (all the fixture holds: 4 lines, 1 rect, 1 polygon, 1 bitmap, 2 texts), so `dsedit.spec.ts` must expect 9, not at least 10; `broken.kicad_wks`'s message names line 8, offset 4 (KiCad's parser stops at the `(line` after the unclosed text on line 7), not line 7 (probe 5 of ds-e2).
+
+What the build train must probe for this repair:
+- Gate 0 item 4 again: `kicadDsEditTake()` of KiCad's default sheet and of `custom_ds.kicad_wks` after the "Checked" edit, saved and read by `kicad-cli sch export pdf --drawing-sheet take.kicad_wks basic_test.kicad_sch` in `kicad/kicad:10.0.4` (`--network none`): exit 0 and "Checked" in the PDF's text. The take's text holds no `(uuid`. Wrong: another `Unexpected <token>` (a second fork token KiCad 10.0 lacks: report the token).
+- `kicadDsEditItemsGet` before and after a take: the same uuids (the take is a pure read). An undo after `kicadDsEditItemsSet` still keeps the item's uuid (the undo copy keeps the uuids).
+- Place Bitmaps: the counts of item 2 above.
+
+Syntax check (from `/home/matthew/cc-engine-wt/e6/pcbjam`, after `git merge run15/main` in both worktrees, `gate.sh scripts/kicad/syntax-check-run15.sh --kicad /home/matthew/cc-engine-wt/e6/kicad all --kicad-file common/drawing_sheet/ds_data_model_io.cpp --kicad-file pagelayout_editor/pl_editor_frame.cpp`):
+
+```
+PASS pcbnew         pcbnew_embind.cpp subdir=pcbnew -DKICAD_MERGED_EMBIND (13947 ms)
+PASS eeschema       eeschema_embind.cpp subdir=eeschema -DKICAD_MERGED_EMBIND (14236 ms)
+PASS symedit        symedit_embind.cpp subdir=eeschema  (6870 ms)
+PASS fpedit         fpedit_embind.cpp subdir=pcbnew  (9109 ms)
+PASS dsedit         dsedit_embind.cpp subdir=pagelayout_editor  (5077 ms)
+PASS kicad_editor   kicad_editor_embind.cpp subdir=common  (4992 ms)
+PASS occ            pcbnew_embind.cpp subdir=pcbnew (12274 ms)
+PASS kicad common/drawing_sheet/ds_data_model_io.cpp (3883 ms)
+PASS kicad pagelayout_editor/pl_editor_frame.cpp (4977 ms)
+syntax-check: 0 failed
+```
+
+Export check (`scripts/kicad/check-run15-exports.sh --since run15/main --kicad /home/matthew/cc-engine-wt/e6/kicad --kicad-since run15/main`):
+
+```
+check-run15-exports: 256 names registered in the merged image (249 kicad names), 111 of 111 run 15 names, 0 failures
+```
+
+Merged image only: all of it (`CcDsSaveInStringForStockKicad` is `__EMSCRIPTEN__` only; its one caller is `dsedit_embind.cpp`).
