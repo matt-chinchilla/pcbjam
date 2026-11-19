@@ -310,3 +310,69 @@ Recompile reach: one .cpp of pcbnew, no header.
 ### What the next build must probe (e11-6)
 
 Frame pcb, island harness, `tests/fixtures/glasgow`: `project.export` `pcb_render` `{format: 'png', width: 1600, height: 1200, quality: 'high', side: 'top'}` (about 15 s), and read `<dir>/.cc-export.json.lines` from the page between the engine's yields while it runs: the `Rendering <n> percent` lines appear one after another, climbing, before the answer arrives; the last is `Rendering 100 percent`; and the final `.cc-export.json` is byte for byte what build T3 gave (the same lines, "The picture is 1568 by 1176 pixels.", "Successfully created 3D render image"). Wrong if the file never appears before the record (the image lacks kicad 11f3edda), or the record gained or lost a line.
+
+## Repair e11-7: a 3D model the export could not add is a warning (found by the 3D recheck after T3 and T4)
+
+The fault: when the 3D service could not add a model ("Could not add 3D model for R1. File not found: ...", KiCad's WARNING in `exporter_step.cpp`; the read and add failures of `step_pcb_model.cpp` are ERRORs), the job's lines carried it only as an INFO line, which the island leaves out of `notes`. Cause, read in the code: `occExport` (`wasm/occ-service/occ_service_main.cpp`) gathers every message in one `WX_STRING_REPORTER` text, which keeps no severity, and the editor's EXPORTER_STEP shadow (`wasm/stubs/exporter_step_stub.cpp`) reported that whole text as ONE line: INFO when the export succeeded. The island's provider passes only `{ok, report}` back to the engine, so the severity has to travel inside the report text.
+
+The repair: pcbjam c3c30d2, both files leased to this lane whole.
+
+- `occ_service_main.cpp`: `CC_OCC_REPORTER` (over `WX_STRING_REPORTER`, the report text unchanged) also keeps every WARNING and ERROR message. `ccModelProblemLines` then goes through the board's footprints' 3D models by file name (each name once, empty names skipped). For a model whose file name a kept message holds, it appends one line to the report: `The 3D model <file> was not added: <that message on one line>`. With no warning or error naming a model, nothing is appended.
+- `exporter_step_stub.cpp`: the report is split at newlines. Each line that starts `The 3D model ` and holds ` was not added: ` is reported as a WARNING of the job, after the rest, which is rejoined and reported exactly as before (INFO when ok, ERROR when not). A report with no such line is passed through byte for byte.
+
+Kept as it was: every other line, the codes, the file check after the run. No export added; no kicad change.
+
+### Checks (repair e11-7)
+
+After `git merge run15/main` in both worktrees, from `/home/matthew/cc-engine-wt/e11/pcbjam`:
+
+`/home/matthew/cc-wave2/bin/gate.sh scripts/kicad/syntax-check-run15.sh --kicad /home/matthew/cc-engine-wt/e11/kicad all --kicad-file pcbnew/pcbnew_jobs_handler.cpp`
+
+```
+PASS pcbnew         pcbnew_embind.cpp subdir=pcbnew -DKICAD_MERGED_EMBIND (20809 ms)
+PASS eeschema       eeschema_embind.cpp subdir=eeschema -DKICAD_MERGED_EMBIND (20153 ms)
+PASS symedit        symedit_embind.cpp subdir=eeschema  (9495 ms)
+PASS fpedit         fpedit_embind.cpp subdir=pcbnew  (12478 ms)
+PASS dsedit         dsedit_embind.cpp subdir=pagelayout_editor  (7198 ms)
+PASS kicad_editor   kicad_editor_embind.cpp subdir=common  (6823 ms)
+PASS occ            pcbnew_embind.cpp subdir=pcbnew (18059 ms)
+PASS kicad pcbnew/pcbnew_jobs_handler.cpp (13013 ms)
+syntax-check: 0 failed
+```
+
+The two changed files are pcbjam sources that the script's `--kicad-file` cannot name. Each was compiled `-fsyntax-only` with its own `compile_commands.json` line from the cache volume, using the script's KiCad file mode extraction and the same read only mounts: the stub's line from `kicad-kicad_editor`, the service's from `kicad-occ_service`.
+
+```
+PASS pcbjam wasm/stubs/exporter_step_stub.cpp (8554 ms)
+PASS pcbjam wasm/occ-service/occ_service_main.cpp (8299 ms)
+```
+
+To prove the check bites, an undeclared name was planted in the service and the check printed `FAIL pcbjam wasm/occ-service/occ_service_main.cpp`; then the file was restored. Reported to E0 again: the script could take pcbjam sources (`--pcbjam-file`).
+
+`scripts/kicad/check-run15-exports.sh --join --kicad /home/matthew/cc-engine-wt/e11/kicad` and the `--since run15/main --kicad-since run15/main` form both printed `check-run15-exports: 256 names registered in the merged image (249 kicad names), 111 of 111 run 15 names, 0 failures`.
+
+Rebuild reach: occ_service (one source) and the editor's stub (one source).
+
+### What the next build must probe (e11-7)
+
+Frame pcb, island harness, the `models3d-small` fixture with one body's file left out of the staging. `project.export` `pcb_export_3d` `{format: 'step'}`: the STEP is made, code 0, and the answer's `notes` hold ONE warning, `The 3D model <that file> was not added: Could not add 3D model for <ref>. File not found: <path>`. With every file present, there is no warning, and the record's lines are byte for byte those before the repair. A model used by two footprints and missing gives one warning, not two. Wrong if the warning is absent (the image lacks pcbjam c3c30d2, in the service or the editor), or if a clean board gains or loses a line.
+
+## Repair e11-8: a render of the last saved board (diagnosed, no engine change: the cause is in the island)
+
+What the board output jobs read, from the code:
+
+- **KiCad's jobs** (`pcb_render`, the drill files, the footprint position and report files, and the rest run through `ccRunBoardOutput`): these go to `fr->Kiway().ProcessJob( KIWAY::FACE_PCB, ... )`. Before that, `ccRunBoardOutput` refuses any run unless `Pgm().IsGUI()` is true and a project is open, so in this engine `PCBNEW_JOBS_HANDLER::getBoard` (kicad `pcbnew/pcbnew_jobs_handler.cpp` 481 to 518) always takes its GUI road: `editFrame->GetBoard()`, the frame's live board. The render's copy `ccJobExportRender` takes its board through the same `getBoard` (the lambda in the constructor), and hands that `BOARD*` straight to `BOARD_ADAPTER::SetBoard` and the raytracer. No file is read and nothing is saved.
+- **The 3D exports**: the editor's EXPORTER_STEP shadow (`wasm/stubs/exporter_step_stub.cpp`) writes its `m_board`, the same live board, as text, and sends that text to the 3D service.
+- **Our own outputs** (`ccRunOurBoardOutput`) are given `fr->GetBoard()`.
+
+So the render does not differ from the other jobs: its picture is drawn from the board on screen, a moved part included. What reads the saved file is the island's staging of the model bodies before a render: `bridge/ext/3d-i3.ts` `before()` reads `ctx.readBytes( ctx.opened() )`, the `.kicad_pcb` as last saved, and stages only the model lines that file names (island-close-1 row 3d-i3, "Staging reads the saved board", DESIGN). A footprint added since the save, or a model line changed since the save, has no body in the engine's model folder. The raytracer then draws that footprint with no body, while every moved part is drawn at its new place. The 3D exports are not affected: their staging goes through the 3D service's stage hook, which is given the live board text.
+
+The repair is therefore the island's (unit 3d-i3, `bridge/ext/3d-i3.ts`), not this lane's. Options:
+- (a) the site saves before a render, as the close report recommends;
+- (b) the island stages from the live board's model lines. That needs a read of the live board, which no engine export answers today for this purpose; it would be a new export, which E0 would list.
+
+No engine file was changed. No `e11-8.fixed` is written: nothing is fixed in the engine.
+
+### What the next build must probe (e11-8, the diagnosis)
+
+On the Glasgow fixture (pcb frame), move one footprint without saving and run `project.export` `pcb_render`. The picture shows the part at its new place, the board is still marked modified and the undo depth is unchanged (a render is no edit). If the moved part is drawn at its saved place, this diagnosis is wrong and the job reads a file. Then add a footprint with a model not on the saved board and render: its body is missing until the board is saved. That gap is the island staging fault above.

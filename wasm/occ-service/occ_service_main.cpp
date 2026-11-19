@@ -26,9 +26,17 @@
  * kicad-cli way (SetPgm + InitPgm(headless)) — EXPORTER_STEP's
  * FILENAME_RESOLVER calls Pgm() unconditionally (exporter_step.cpp:154).
  * Settings land in the in-memory wxConfig store from occ_service_pre.js.
+ *
+ * Modified by Circuit Center Inc on 2026-11-19: a 3D model of the board that KiCad's exporter
+ * reported a warning or an error about (a file not found, a model it could not read or add) gets
+ * one line of its own at the end of the export's report, "The 3D model <file> was not added:
+ * <KiCad's message>", which the editor's EXPORTER_STEP shadow reports as a warning of the job (the
+ * report reaches the editor as one text, which loses each message's severity). A board whose
+ * models all load answers the report it answered before.
  */
 
 #include <cstdio>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -50,6 +58,7 @@
 #include <jobs/job_export_pcb_3d.h>
 
 #include <board.h>
+#include <footprint.h>
 #include <pcb_io/pcb_io_mgr.h>
 #include <exporters/step/exporter_step.h>
 
@@ -222,6 +231,76 @@ std::vector<wxString> stageModelFiles( const emscripten::val& aModels )
 }
 
 
+/**
+ * KiCad's export reporter (the one report text the service answers), keeping also every warning
+ * and error message in the order reported, whose severity the report text does not carry.
+ */
+class CC_OCC_REPORTER : public WX_STRING_REPORTER
+{
+public:
+    using REPORTER::Report;
+
+    REPORTER& Report( const wxString& aText, SEVERITY aSeverity = RPT_SEVERITY_UNDEFINED ) override
+    {
+        WX_STRING_REPORTER::Report( aText, aSeverity );
+
+        if( aSeverity == RPT_SEVERITY_WARNING || aSeverity == RPT_SEVERITY_ERROR )
+            m_problems.push_back( aText );
+
+        return *this;
+    }
+
+    std::vector<wxString> m_problems;
+};
+
+
+/**
+ * One line per 3D model file of the board (by file name, each once) that a warning or an error
+ * of the export names: "The 3D model <file> was not added: <the first such message>", the message
+ * on one line. The editor's EXPORTER_STEP shadow (wasm/stubs/exporter_step_stub.cpp) reports each
+ * line that starts "The 3D model " and holds " was not added: " as a warning of the job.
+ */
+wxString ccModelProblemLines( BOARD* aBoard, const std::vector<wxString>& aProblems )
+{
+    wxString           lines;
+    std::set<wxString> seen;
+
+    if( aProblems.empty() )
+        return lines;
+
+    for( FOOTPRINT* footprint : aBoard->Footprints() )
+    {
+        for( const FP_3DMODEL& model : footprint->Models() )
+        {
+            const wxString file = model.m_Filename.AfterLast( '/' ).AfterLast( '\\' );
+
+            if( file.IsEmpty() || !seen.insert( file ).second )
+                continue;
+
+            for( const wxString& problem : aProblems )
+            {
+                if( !problem.Contains( file ) )
+                    continue;
+
+                wxString text = problem;
+                text.Replace( wxS( "\r" ), wxS( " " ) );
+                text.Replace( wxS( "\n" ), wxS( " " ) );
+
+                while( text.Replace( wxS( "  " ), wxS( " " ) ) )
+                    ;
+
+                text.Trim( true ).Trim( false );
+                lines << wxS( "\n" )
+                      << wxString::Format( wxS( "The 3D model %s was not added: %s" ), file, text );
+                break;
+            }
+        }
+    }
+
+    return lines;
+}
+
+
 emscripten::val occExport( std::string aBoardSexpr, std::string aParamsJson,
                            emscripten::val aModels )
 {
@@ -284,8 +363,8 @@ emscripten::val occExport( std::string aBoardSexpr, std::string aParamsJson,
     std::fprintf( stderr, "[occ_service] export: board parsed, running EXPORTER_STEP (%s)\n",
                   params.GetFormatName().utf8_string().c_str() );
 
-    WX_STRING_REPORTER reporter;
-    EXPORTER_STEP      exporter( brd, params, &reporter );
+    CC_OCC_REPORTER reporter;
+    EXPORTER_STEP   exporter( brd, params, &reporter );
 
     wxFileName outFn( wxT( "/tmp" ), wxT( "occ_service_out" ),
                       params.GetDefaultExportExtension() );
@@ -313,7 +392,10 @@ emscripten::val occExport( std::string aBoardSexpr, std::string aParamsJson,
         ok = readFile( exporter.m_outputFile, &outBytes );
 
     ret.set( "ok", ok );
-    ret.set( "report", std::string( reporter.GetMessages().utf8_string() ) );
+    // KiCad's messages as before, then one line per 3D model it could not add (none when every
+    // model loaded, so that report is unchanged).
+    const wxString report = reporter.GetMessages() + ccModelProblemLines( brd, reporter.m_problems );
+    ret.set( "report", std::string( report.utf8_string() ) );
     ret.set( "fileName", std::string( outFn.GetFullName().utf8_string() ) );
 
     if( ok )
