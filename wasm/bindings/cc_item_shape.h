@@ -1253,11 +1253,31 @@ inline BOARD_ITEM* addZone( BOARD_ITEM_CONTAINER* aParent, const json& aItem,
 
 // ── image (DIALOG_REFERENCE_IMAGE_PROPERTIES) ─────────────────────────────────────────
 
-/** The picture as PNG bytes (its stored data when it is a PNG, else re-encoded). */
+/**
+ * The picture as PNG bytes: the stored data when it is a PNG, else re-encoded. KiCad's
+ * readers (ReadImageFile from memory, the file parser) keep the original bytes but leave
+ * the image type INVALID, so the stored data is taken by its PNG signature, not the type.
+ */
 inline bool pngOf( const BITMAP_BASE& aBitmap, wxMemoryOutputStream& aOut )
 {
-    if( aBitmap.GetImageType() == wxBITMAP_TYPE_PNG )
-        return aBitmap.SaveImageData( aOut );
+    static const unsigned char kPngSignature[8] = { 0x89, 'P', 'N', 'G', 0x0d, 0x0a, 0x1a,
+                                                    0x0a };
+
+    wxMemoryOutputStream stored;
+
+    if( aBitmap.SaveImageData( stored )
+            && stored.GetLength() >= (wxFileOffset) sizeof( kPngSignature ) )
+    {
+        const size_t               len = (size_t) stored.GetLength();
+        std::vector<unsigned char> data( len );
+        stored.CopyTo( data.data(), len );
+
+        if( std::memcmp( data.data(), kPngSignature, sizeof( kPngSignature ) ) == 0 )
+        {
+            aOut.Write( data.data(), len );
+            return aOut.IsOk();
+        }
+    }
 
     const wxImage* image = aBitmap.GetImageData();
     return image && image->IsOk() && image->SaveFile( aOut, wxBITMAP_TYPE_PNG );
