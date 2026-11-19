@@ -303,3 +303,42 @@ check-run15-exports: 256 names registered in the merged image (249 kicad names),
 ```
 
 What the build train must probe: e-block-layout probes 6 and 7 as written above, plus (a) on blocks-small, two `kicadUpdateBoardFromSchematic` previews in a row with the seven keys give the SAME token, and a third after the apply gives a different one; (b) on first-board the preview and apply still run; (c) a preview, then a moved footprint, then the apply with the old token answers `stale`. Wrong if: (a) still differs (something else in the dry run changes the board's text), or (c) applies (the digest does not see the board). The preview costs one extra format of the board (a save's text, in memory); report its time on the largest board fixture beside the preview's own.
+
+## Repair e7-2 (2026-11-19): kicadPathVarsSet admits the versioned 3RD_PARTY variable
+
+The fault (`/home/matthew/cc-wave2/engine/fix/e7-2.md`, site close row D1, RULINGS 35 option (a)): `pathVarNameOk` refused every name `ENV_VAR::IsEnvVarImmutable` lists, and KiCad's predefined list (kicad `common/env_vars.cpp` 45) holds `GetVersionedEnvVarName( "3RD_PARTY" )`, so `kicadPathVarsSet` answered false for `KICAD10_3RD_PARTY` and the add-on parts recipe could not point it.
+
+What changed (pcbjam only, no KiCad file):
+
+1. `wasm/bindings/pcbjam_libs_reload.h` `pathVarNameOk`: `KIPRJMOD` refused first; then the name equal to `ENV_VAR::GetVersionedEnvVarName( wxS( "3RD_PARTY" ) )` (asked of KiCad, never typed) is admitted; every other predefined name (`IsEnvVarImmutable`) stays refused. The function's and `setPathVars`' comments and the dated line in the header say so.
+2. `wasm/bindings/cc_e7_dispatch.inc`: `kicadPathVarsSet`'s comment; the marker `kicadPathVarsThirdParty() -> bool`, always true (`cc_e7::pathVarsThirdParty`), registered in `cc_e7_dispatch` beside `kicadPathVarsSet`, so it is in the same images (the merged image only, as every dispatcher name).
+3. `wasm/bindings/run15-exports.txt`: `new kicadPathVarsThirdParty e7 e-librows` (as the fix note asks; the list now holds 112 run 15 names).
+
+What was read for item 2 (it already holds; nothing else changed):
+
+- `setPathVars` sets each name as Configure Paths' OK does (kicad `common/dialogs/dialog_configure_paths.cpp` 259 to 262 and 287): `envVarMap.at( n ).SetValue( v )` on an existing entry, else a new `ENV_VAR_ITEM`, then `Pgm().SetLocalEnvVariables()`, which `wxSetEnv`s every entry of the common settings' map (`common/pgm_base.cpp` 781 to 794). The versioned 3RD_PARTY variable already has its map entry from `COMMON_SETTINGS::InitializeEnvironment` (`common/settings/common_settings.cpp` 862), so the existing entry branch runs, value set, default kept, exactly the dialog's path. The dialog locks only the name cell of a predefined variable (`dialog_configure_paths.cpp` 202, `SetReadOnly( IsEnvVarImmutable( aName ) )`), never its value.
+- KiCad expands a row's `${NAME}` in `ExpandEnvVarSubstitutions` (`common/common.cpp` 457 to 467): the project's text variables first, then `wxGetEnv`, so the value set above is the one expanded (a project text variable of the same name would win, as in KiCad). The library manager expands through it (`common/libraries/library_manager.cpp` 946, 956).
+- The rows naming the variable reload through the same loop as for a user variable: every symbol, footprint and design block row whose uri holds `${NAME}` or `$(NAME)` gets `ReloadLibraryEntry` + `LoadLibraryEntry` and its editor tree `MAIL_RELOAD_LIB`; the dispatcher drops pcbnew's preloaded footprints of the footprint rows named (`footprintRowsNaming`). The name test is by string, so nothing differs for a predefined name.
+- Configure Paths' callers then send `CommonSettingsChanged( ENVVARS_CHANGED )` (`common/tool/common_control.cpp` 106); `setPathVars` does the library part of it itself (row reload and tree sync) for every name alike, as e-librows built it. Not changed here.
+
+Checks:
+
+```
+/home/matthew/cc-wave2/bin/gate.sh scripts/kicad/syntax-check-run15.sh --kicad /home/matthew/cc-engine-wt/e7/kicad kicad_editor pcbnew eeschema occ
+PASS pcbnew         pcbnew_embind.cpp subdir=pcbnew -DKICAD_MERGED_EMBIND (20464 ms)
+PASS eeschema       eeschema_embind.cpp subdir=eeschema -DKICAD_MERGED_EMBIND (17978 ms)
+PASS kicad_editor   kicad_editor_embind.cpp subdir=common  (7003 ms)
+PASS occ            pcbnew_embind.cpp subdir=pcbnew (16922 ms)
+syntax-check: 0 failed
+
+/home/matthew/cc-wave2/bin/gate.sh scripts/kicad/check-run15-exports.sh --kicad /home/matthew/cc-engine-wt/e7/kicad
+check-run15-exports: 257 names registered in the merged image (250 kicad names), 112 of 112 run 15 names, 0 failures
+```
+
+The probe for the next build (frames sch and pcb, each):
+
+1. `typeof Module.kicadPathVarsThirdParty === 'function'` and `Module.kicadPathVarsThirdParty()` is `true`. Wrong if missing: the dispatcher inc or the list line did not reach the build.
+2. `Module.kicadPathVarsSet(JSON.stringify({vars:{KICAD10_3RD_PARTY:'<an absolute folder holding a library>'}}))` answers `true`; after the apply queue empties, a library row whose uri is `${KICAD10_3RD_PARTY}/<lib file or folder>` (added with `kicadLibsAddEntry` before or after the set) loads from that folder (`lib.index` lists its items; on pcb its footprints place). Wrong if: false (the name test), or the row still fails (the value did not reach the environment or the row was not reloaded).
+3. Still `false`: `{vars:{KIPRJMOD:'/x'}}`, `{vars:{KICAD10_SYMBOL_DIR:'/x'}}`, `{vars:{KICAD10_FOOTPRINT_DIR:'/x'}}`, `{vars:{KICAD10_3RD_PARTY:'rel'}}`. Nothing marked modified, no undo step.
+
+For the island: list the cap that lets the add-on parts recipe point `KICAD10_3RD_PARTY` only when `Module.kicadPathVarsThirdParty` exists (an older engine answers false for the name). Reported to E0: nothing new (no include path, CMake or build line; the list line was asked by the fix note).

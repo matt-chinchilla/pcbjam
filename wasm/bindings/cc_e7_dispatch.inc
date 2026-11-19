@@ -37,8 +37,9 @@ bool libsRemoveEntry( std::string aKind, std::string aNickname )
 
 // kicadPathVarsSet( {"vars": {NAME: "/absolute/folder"}} ): read whole and checked before
 // anything is queued: exactly the one key vars, an object of 1 to 64 entries, each name in the
-// island's form and neither KIPRJMOD nor one of KiCad's predefined variables
-// (pcbjam_libs::pathVarNameOk), each value a string starting with '/' and holding no NUL.
+// island's form and neither KIPRJMOD nor one of KiCad's predefined variables other than the
+// versioned 3RD_PARTY one (pcbjam_libs::pathVarNameOk), each value a string starting with '/'
+// and holding no NUL.
 // Any other shape, an open in flight or no frame answers false and sets nothing. Then the
 // variables are set as KiCad's Configure Paths sets them and every row naming one is reloaded
 // (pcbjam_libs::setPathVars). Not a design change: no undo step, nothing marked modified.
@@ -83,6 +84,14 @@ bool pathVarsSet( std::string aArgsJson )
             pcbLibsInvalidatePreloaded( nick );
     }
 
+    return true;
+}
+
+// Repair e7-2, the marker kicadPathVarsThirdParty: this engine's kicadPathVarsSet admits KiCad's
+// versioned 3RD_PARTY variable (KICAD10_3RD_PARTY on KiCad 10), so the island may point the
+// add-on parts folder with it. Always true; registered beside kicadPathVarsSet.
+bool pathVarsThirdParty()
+{
     return true;
 }
 
@@ -191,4 +200,5 @@ EMSCRIPTEN_BINDINGS( cc_e7_dispatch )
     emscripten::function( "kicadDesignBlockSave", &cc_e7::designBlockSave );
     emscripten::function( "kicadLibsRemoveEntry", &cc_e7::libsRemoveEntry );
     emscripten::function( "kicadPathVarsSet", &cc_e7::pathVarsSet );
+    emscripten::function( "kicadPathVarsThirdParty", &cc_e7::pathVarsThirdParty );
 }

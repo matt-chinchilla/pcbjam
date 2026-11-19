@@ -91,6 +91,7 @@ new kicadDrawingSheetReload e7 e-sheetreload
 new kicadLibsRemoveEntry e7 e-librows
 new kicadPasteSpecial e7 st-paste-e
 new kicadPathVarsSet e7 e-librows
+new kicadPathVarsThirdParty e7 e-librows
 new kicadBoardPadNets e8 lo-e4-e
 new kicadHostSchItems e8 m5-e
 new kicadSchIncrementAnnotations e8 st-incanno-e
