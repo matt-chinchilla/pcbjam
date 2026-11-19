@@ -21,6 +21,10 @@
  * options Keep groups and Apply design block layouts in the board update (transferGroups,
  * applyDesignBlockLayouts), the added groups laid out as KiCad's Update PCB dialog does, their
  * records under layouts in report.json and the two options folded into the preview's token.
+ *
+ * Modified by Circuit Center Inc on 2026-11-18: lane e7's repair e7-1, the board update's
+ * preview token takes a digest of the board as its file writer formats it in place of the
+ * board's change counter, which a dry run adding parts bumps, so a preview and its apply agree.
  */
 
 #ifdef __EMSCRIPTEN__
@@ -4093,8 +4097,8 @@ void ccRunBoardUpdate( const CC_UPDATE_ARGS& aArgs )
 
         const std::string token =
                 ccDigest( ccUpdateToken( netlist, aArgs.replaceFootprints, aArgs.deleteExtra,
-                                         aArgs.relinkByReference,
-                                         fr->GetBoard()->GetTimeStamp() )
+                                         aArgs.relinkByReference, 0 )
+                          + "|p" + cc_e7::boardUpdateDigest( fr->GetBoard() )
                           + ( aArgs.transferGroups ? "|g1" : "|g0" )
                           + ( aArgs.applyDesignBlockLayouts ? "|b1" : "|b0" ) );
 
