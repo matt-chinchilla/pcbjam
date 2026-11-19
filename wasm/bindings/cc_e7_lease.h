@@ -22,6 +22,12 @@
 
 namespace cc_e7
 {
+// fix e7-1: the board's half of the update preview's token. The board as its own .kicad_pcb
+// save writes it (no file, nothing on the board changed), hashed. KiCad's change counter
+// (BOARD::GetTimeStamp) is not a function of the board: a dry run that loads a new part's
+// footprint and deletes it bumps it, so two previews of a design with parts to add never agreed
+// and every apply was stale. Defined in cc_e7_pcb.inc.
+std::string boardUpdateDigest( BOARD* aBoard );
 } // namespace cc_e7
 
 #endif // __EMSCRIPTEN__

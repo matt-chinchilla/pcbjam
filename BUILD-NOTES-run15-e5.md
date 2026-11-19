@@ -526,3 +526,22 @@ syntax-check: 0 failed
 scripts/kicad/check-run15-exports.sh --since run15/main
 check-run15-exports: 227 names registered in the merged image (220 kicad names), 82 of 111 run 15 names, 0 failures
 ```
+
+## Repairs after build T3 (fix notes e5-1 and e5-2)
+
+Merged `run15/main` (690a16c) first. Checks after both repairs, from this worktree through the gate:
+
+- `/home/matthew/cc-wave2/bin/gate.sh scripts/kicad/syntax-check-run15.sh --kicad /home/matthew/cc-engine-wt/e0-kicad all`: PASS pcbnew, PASS eeschema, PASS symedit, PASS fpedit, PASS dsedit, PASS kicad_editor, PASS occ, `syntax-check: 0 failed`.
+- `scripts/kicad/check-run15-exports.sh --since run15/main`: 256 names registered (249 kicad names), 111 of 111 run 15 names, 0 failures.
+
+### e5-1 (fp-e4b): a picture read back re-encoded, commit 7d4fb78
+
+Cause: `BITMAP_BASE::ReadImageFile( wxMemoryBuffer& )` (and KiCad's file parser, which takes the same road) keeps the original bytes in `m_imageData` but never sets `m_imageType`, which stays `wxBITMAP_TYPE_INVALID`. `pngOf` asked `SaveImageData` only when the type said PNG, so every picture fell to the re-encode (195 bytes for the 12,420 byte fixture). Fix in `cc_item_shape.h` `pngOf`: `SaveImageData` into a buffer (it writes the stored original when it holds one, else KiCad's own PNG encode), keep it when it starts with the PNG signature, else re-encode the wxImage as PNG (a JPEG original). After `{grayscale: true}` KiCad clears the stored data, so `png` still changes there, as before. No change of contract.
+
+Probe: the fp-e4b add of `mark.png` then `kicadFpEditItemsGet`: `bytes` 12420 and `png` equal to the given base64; a footprint read from a file with a PNG picture gives its file's bytes; grayscale still one step and `png` changed.
+
+### e5-2 (st-placefile-e): the Continue Load Schematic box, commit ec260a0
+
+Cause: `SCH_EDIT_FRAME::LoadSheetFromFile` (`eeschema/sheet.cpp`) builds its own `KICAD_MESSAGE_DIALOG` question boxes, all titled "Continue Load Schematic" (another project's file, library names missing from a table, a conflicting library name, an older file without symbol instances), never through a host ask. The stage folder is always outside the project folder, so the contents road meets the "different project" box every time. sheet.cpp is no lane's file, so the fix stays in this lane's own inc: `cc_e5::sch::placefile::CONTINUE_LOAD_HOOK`, a `wxModalDialogHook` (wx's own hook, called at the top of `wxGenericMessageDialog::ShowModal`), registered for the span of the `importSheet` `RunAction` on the coroutine only. Its `Enter` answers a dialog titled `_( "Continue Load Schematic" )` with `wxID_OK` (KiCad's Continue Load, the reader having chosen the file) and returns `wxID_NONE` for every other modal, which goes on as before. Placing the contents, `LoadSheetFromFile` runs inside that call before the tool's first wait; placing a sheet, the drawn sheet loads the file later through `ccChangeSheetFile` or `EditSheetProperties`, which pass `aSkipLibCheck` true, so only the older file box could show there (not met by the fixtures).
+
+Probe: the e5-2 recipe (complex_hierarchy_shared open, first-board staged at `/tmp/cc-stage/2/`, `kicadPlaceFromFile` sheet): true, no window, the contents on the pointer, one undo step on the click, Esc leaves no step; a later unrelated message box (any other title) still shows or reaches the host ask as before.

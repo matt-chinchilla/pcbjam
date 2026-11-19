@@ -12,6 +12,7 @@
 
 #include <wx/dialog.h>
 #include <wx/filename.h>
+#include <wx/modalhook.h>
 #include <wx/toplevel.h>
 
 #include <sys/stat.h>
@@ -576,6 +577,31 @@ inline std::optional<std::string> pathOf( const std::string& aArgsJson, const ch
     return path;
 }
 
+/**
+ * SCH_EDIT_FRAME::LoadSheetFromFile's own question boxes, all titled "Continue Load Schematic"
+ * (sheet.cpp: a file of another project, library names missing from a table, a conflicting
+ * library name, an older file without symbol instances), are KICAD_MESSAGE_DIALOGs built in
+ * place, never a host ask. A staged file always sits outside the project folder, so the sheet
+ * road meets the first of them every time. The page's Import is the reader's choice to place
+ * that file, so while importSheet runs on the coroutine this hook answers those boxes with
+ * KiCad's Continue Load (wxID_OK) and shows none; any other modal goes on as before.
+ */
+class CONTINUE_LOAD_HOOK : public wxModalDialogHook
+{
+public:
+    CONTINUE_LOAD_HOOK() { Register(); }
+    ~CONTINUE_LOAD_HOOK() override { Unregister(); }
+
+protected:
+    int Enter( wxDialog* aDialog ) override
+    {
+        if( aDialog && aDialog->GetTitle() == _( "Continue Load Schematic" ) )
+            return wxID_OK;
+
+        return wxID_NONE;
+    }
+};
+
 } // namespace placefile
 } // namespace cc_e5::sch
 
@@ -684,6 +710,11 @@ bool placeFromFileSch( std::string aArgsJson )
             return;
 
         s_sheetFile = file;
+
+        // Placing the contents, LoadSheetFromFile runs inside this call, before the tool's
+        // first wait. Placing a sheet, the drawn sheet loads the file later through
+        // ccChangeSheetFile or EditSheetProperties, which skip KiCad's library check.
+        sch::placefile::CONTINUE_LOAD_HOOK continueLoad;
         frame->GetToolManager()->RunAction<wxString*>( SCH_ACTIONS::importSheet, &s_sheetFile );
     } );
 
