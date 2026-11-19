@@ -106,3 +106,60 @@ check-run15-exports: 160 names registered in the merged image (153 kicad names),
 **e10-2 (train build T1, the models3d-small STEP holds one body).** Not the engine's resolver: the island's staging. `bridge/occModels.ts` (w2/base 39f1811, 3d-i3) `stagedModels` hands `occExport` each body with `path` set to the ABSOLUTE engine path it staged (`/pcbjam/3dmodels/kiprjmod/cube.step`, from `report.staged`). occ_service's `stageModelFiles` (`wasm/occ-service/occ_service_main.cpp`) takes paths relative to `MODELS_MEMFS_ROOT` only and skips any path starting with `/` (stderr "[occ_service] models: skipping bad entry"), so nothing reaches `/pcbjam/3dmodels/kiprjmod/` in the 3D service and `FindStagedModel` correctly finds nothing. The fix is the island's: send `path` relative to `MODELS_ROOT` (`kiprjmod/cube.step`, and the library bodies as `<lib>.3dshapes/<name>.<ext>`). Second island fault: the exporter reports every miss through its reporter ("Could not add 3D model for U1. File not found: ..." for the cube, the block and R1), occ_service returns that text as `report`, and the island's answer showed `notes` [] and `dropped` []: the island does not carry the service's `report` into the answer. Both go to E0 for the controller; no engine change.
 
 Checks after the repairs, from this worktree after `git merge run15/main` in both repositories: `syntax-check-run15.sh --kicad /home/matthew/cc-engine-wt/e10/kicad all --kicad-file 3d-viewer/3d_cache/pcbjam_model_fetch.cpp`: PASS pcbnew, PASS eeschema, PASS symedit, PASS fpedit, PASS dsedit, PASS kicad_editor, PASS occ, PASS kicad 3d-viewer/3d_cache/pcbjam_model_fetch.cpp, `syntax-check: 0 failed`. `check-run15-exports.sh --since run15/main --kicad ... --kicad-since run15/main`: 214 names registered in the merged image (207 kicad names), 69 of 111 run 15 names, 0 failures.
+
+## Repair e10-3 (2026-11-19): the corners exports in the footprint editor
+
+Fault (`/home/matthew/cc-wave2/engine/fix/e10-3.md`, island stage close row m3-i):
+`kicadBoardVerticesGet` and `kicadBoardVerticesSet` answered "" in the footprint editor frame,
+so the island lists cap `vertices` in the board frame only and KiCad's Edit Corners pane
+stays the door there.
+
+Cause, verified in the code: both bodies (`cc_e10_pcb.inc`) began with `pcbFrame()`, which
+is `dynamic_cast<PCB_EDIT_FRAME*>` of the top window: the footprint editor is a
+`FOOTPRINT_EDIT_FRAME`, so they answered "". KiCad's own pane is `PCB_BASE_EDIT_FRAME`'s
+(`PCB_BASE_EDIT_FRAME::OpenVertexEditor`, opened by `EDIT_TOOL::EditVertices` in either
+frame, its `OnGridCellChange` commits through `BOARD_COMMIT( m_frame )`), so nothing in
+KiCad limits it to the board.
+
+Change, pcbjam commit cb8b9bc (`cc_e10_pcb.inc` only, no KiCad file): a helper
+`cc_e10::pcb::vertexFrame()` answers the board editor when it is the top window, else the
+top window as a `PCB_BASE_EDIT_FRAME` whose type is `FRAME_FOOTPRINT_EDITOR`, else nullptr;
+both exports take it in place of `pcbFrame()`. Everything else is unchanged: the same
+record (the frame's own board coordinates in mm, no origin transform), the same refusals, the
+same `BOARD_COMMIT` Modify, `SetVertex`, zone refill marks and `Push( "Edit Vertex" )`
+(`BOARD_COMMIT( EDA_DRAW_FRAME* )` reads the footprint editor's rules from the frame type,
+as for the pane, so a corner of a footprint's shape or zone is one undo step of the
+footprint). The footprint editor is matched by frame type, never by class, so the board TU
+names no footprint editor symbol: no `KICAD_MERGED_EMBIND` guard is needed and occ_service
+links as before (it never meets that frame). `BOARD::ResolveItem` finds a footprint's own
+shapes and zones by uuid.
+
+Syntax check (`/home/matthew/cc-wave2/bin/gate.sh scripts/kicad/syntax-check-run15.sh --kicad
+/home/matthew/cc-engine-wt/e10/kicad all`):
+
+```
+PASS pcbnew         pcbnew_embind.cpp subdir=pcbnew -DKICAD_MERGED_EMBIND (18526 ms)
+PASS eeschema       eeschema_embind.cpp subdir=eeschema -DKICAD_MERGED_EMBIND (21180 ms)
+PASS symedit        symedit_embind.cpp subdir=eeschema  (10143 ms)
+PASS fpedit         fpedit_embind.cpp subdir=pcbnew  (13633 ms)
+PASS dsedit         dsedit_embind.cpp subdir=pagelayout_editor  (7728 ms)
+PASS kicad_editor   kicad_editor_embind.cpp subdir=common  (6944 ms)
+PASS occ            pcbnew_embind.cpp subdir=pcbnew (17826 ms)
+syntax-check: 0 failed
+```
+
+Export check (`scripts/kicad/check-run15-exports.sh --join --kicad
+/home/matthew/cc-engine-wt/e10/kicad`):
+
+```
+check-run15-exports: 256 names registered in the merged image (249 kicad names), 111 of 111 run 15 names, 0 failures
+```
+
+The probe for the next build: in the footprint editor frame on a footprint holding a polygon
+shape (and once more a footprint zone), select it; `kicadBoardVerticesGet(uuid)` answers
+`{uuid, kind: "polygon", outlines: [...]}` with its corners; `kicadBoardVerticesSet` with
+one corner moved answers the read back record with that corner moved and adds exactly one
+undo step ("Edit Vertex"; undo restores it, a second set to the same point adds none); with a
+host listener holding the Edit Corners action, the corners request opens no KiCad pane. The
+board frame answers exactly as before. The wrong result: "" in the footprint editor, two undo
+steps, or a pane shown.
