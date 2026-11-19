@@ -270,3 +270,34 @@ Export check: `scripts/kicad/check-run15-exports.sh --since run15/main --kicad /
 Both worktrees hold `run15/main` (pcbjam 48e664e, kicad caf17fbe: `git merge run15/main` says already up to date) and are clean. The `all` syntax check and the export check above ran on the final code of both branches: `syntax-check: 0 failed` (eleven PASS lines above), `0 failures`.
 
 Lane units: m1x-e1, st-hold-e, m1-e, m1x-e2 (first seat), m12-e, st-keys-e, m6-e3 (relay seat). Merged image only: kicadSelectionFilterGet, kicadSelectionFilterSet halves (and every dispatcher export by its TU). Reported to E0: the two table tools' `ExportTableToCSV` keep KiCad's own copy of the CSV builder (`sch_edit_table_tool.cpp`, `pcb_edit_table_tool.cpp` belong to no lane); `CcTableCsvText` is the one builder `kicadTableCsv` uses.
+
+## Repair e1-1 (2026-11-19): kicadRunAction busy for good after one Position Relative
+
+The fault: `cc_e1::runAction` (`wasm/bindings/cc_e1_dispatch.inc`) answered 3 while `frame->Kiway().GetBlockingDialog()` was non null. KiCad's `DIALOG_SHIM` sets the Kiway's blocking dialog in its constructor and clears it only in its destructor (common/dialog_shim.cpp), and `POSITION_RELATIVE_TOOL` keeps its modeless dialog alive and hidden between uses, so after the first Shift+P every by-name action answered 3 for the frame's life.
+
+The repair (pcbjam 12df0ed, this file only, no KiCad file): the blocking dialog counts as busy only while it is shown (`blocking && blocking->IsShown()`). A real modal stays covered by `modalDialogUp()` and `CcHostPromptModalParked()`.
+
+Syntax check (`all`, after `git merge run15/main` in both worktrees):
+
+```
+PASS pcbnew         pcbnew_embind.cpp subdir=pcbnew -DKICAD_MERGED_EMBIND (17585 ms)
+PASS eeschema       eeschema_embind.cpp subdir=eeschema -DKICAD_MERGED_EMBIND (17744 ms)
+PASS symedit        symedit_embind.cpp subdir=eeschema  (8822 ms)
+PASS fpedit         fpedit_embind.cpp subdir=pcbnew  (11353 ms)
+PASS dsedit         dsedit_embind.cpp subdir=pagelayout_editor  (7190 ms)
+PASS kicad_editor   kicad_editor_embind.cpp subdir=common  (7127 ms)
+PASS occ            pcbnew_embind.cpp subdir=pcbnew (17605 ms)
+syntax-check: 0 failed
+```
+
+Export check: `256 names registered in the merged image (249 kicad names), 111 of 111 run 15 names, 0 failures`.
+
+What the build train must probe (canvas-kinds fixture, pcb frame, a recording `window.kicadHostPrompt`, R1 selected): rotateCcw 0; positionRelative 0 with one `positionRelative` ask; then either `kicadPromptCancel(token)` or `kicadPromptAnswer(token, '{"x":5,"y":0}')`; after both roads `kicadRunAction("pcbnew.InteractiveEdit.rotateCcw")` answers 0 and turns R1 (depth +1), and a by-name positionRelative asks anew (a new token). Still 3 while a modal prompt is parked (moveExact asked and not answered). Wrong: 3 after the prompt ends (the hidden dialog still counted), or 0 while moveExact's prompt is parked.
+
+Other dialogs and roads, read in the code on 2026-11-19:
+- Create Array (`pcbnew/tools/array_tool.cpp`) makes its dialog per use and `Destroy()`s it in `onDialogClosed`, so `~DIALOG_SHIM` clears the blocking dialog: it never had the fault. The same probe after an accepted grid answer and after `kicadPromptCancel`: `kicadRunAction("pcbnew.InteractiveEdit.rotateCcw")` answers 0 and turns R1 (depth +1).
+- Other dialogs KiCad keeps alive hidden between uses (the DRC dialog of `pcbnew/tools/drc_tool.cpp`, kept until `DestroyDRCDialog`; the group properties dialog of `common/tool/group_tool.cpp`, kept until the next use) left the same state before this repair; the shown test covers every one of them, with no case per dialog.
+- No other road shared the refusal: `contextMenuChoose`, `promptAnswer`, `promptCancel`, `tableCsv`, `hotkeysSet` and `selectionFilterSet` refuse on `modalDialogUp()` and `CcHostPromptModalParked()` only, never on the Kiway's blocking dialog. The island's by-name roads (`action.run`, the held door's run, `st-placefile-i`) all go through `kicadRunAction`, so they are repaired with it. The `kicadOpenFile` family's `GetBlockingDialog()->Close( true )` is KiCad's own single_top pattern, not a refusal; on the hidden Position Relative dialog it is a no-op hide.
+- A real modal stays refused: while KiCad's own modal dialog is up (`wxDialog::IsModal()`, `modalDialogUp()`), or a quasi-modal `DIALOG_SHIM` is shown (it is the Kiway's blocking dialog and `IsShown()`), `kicadRunAction` answers 3. Probe: with the prompt hook absent (`window.kicadHostPrompt` deleted, so KiCad's own Move Exact dialog shows modal), `kicadRunAction("pcbnew.InteractiveEdit.rotateCcw")` answers 3 until that dialog is closed, then 0.
+
+Checks rerun on the same code (no KiCad file changed, so no `--kicad-file`): `syntax-check: 0 failed`; `check-run15-exports: 256 names registered in the merged image (249 kicad names), 111 of 111 run 15 names, 0 failures`.
