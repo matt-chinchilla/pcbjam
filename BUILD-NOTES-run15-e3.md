@@ -333,3 +333,57 @@ kicad names), 16 of 110 run 15 names, 0 failures`.
 Held, not built (RULINGS 5): fp-f1 waits for fp-e0's gate item 1 to ask for it; flt-ds4-e waits
 for flt-ds4-i's diagnosis to name a pcbnew file (cause (b) or (c) of addendum 13.1). Neither
 diagnosis existed under `/home/matthew/cc-wave2/reports/` or `plan/` at this handover.
+
+## Repair e3-1: Edit Group Properties asks the host on every road (RULINGS 29 c)
+
+The fault (ENGINE-FACTS lane e3, "Board asks that do not happen"): E on a group asked the host, but KiCad's Group Properties dialog still opened from its other roads. Cause, read in the code: the dialog is opened only by `GROUP_TOOL::GroupProperties` (`common/tool/group_tool.cpp`, the handler of `ACTIONS::groupProperties`, `common.Groups.groupProperties`), reached from `OnEditItemRequest` of both frames (E after a refused ask, DRC cross probes, any other edit request) and from a run of the action by name, which is how the canvas menu's group item sends it (addendum canvas 3.5). That run carries no group parameter, so KiCad's own handler built the dialog over a null group. In the footprint editor, E on a group asked nothing.
+
+The repair: kicad 639c8bce, every change under `__EMSCRIPTEN__`, all in the lane's own files:
+
+- `pcbnew/tools/board_item_host.h`: `CcHostGroupProperties( event, selectionTool, footprintEditor, groupOf, kicad )`. It takes the group from the event's parameter or, for a run by name, the one selected group, and asks the host with the ask E makes in that editor: `window.kicadHostBoardItem` `{kind: "group", uuid, isNew: false}` on the board, `window.kicadHostFpEdit` `{ask: "group", uuid, isNew: false}` in the footprint editor. A taken ask opens no dialog and keeps the selection as it is, no longer a hover selection. A refused ask or no listener opens KiCad's dialog for that group. With no group, nothing opens. `CcBoardItemLeftToKiCad()` names the item E already asked about and the host left to KiCad, so the group tool does not ask it a second time.
+- `pcbnew/pcb_edit_frame.cpp`, `pcbnew/footprint_edit_frame.cpp`: each registers `CC_HOST_PCB_GROUP_TOOL`, a `PCB_GROUP_TOOL` whose virtual `GroupProperties` calls the helper (board false, footprint editor true). The class lives in each frame file because `tools/pcb_group_tool.h` has no include guard, and both frames include it already. The tool keeps the name `common.Groups`; nothing looks it up by type.
+- `pcbnew/tools/edit_tool.cpp`: `fpEditAskSubject` names `PCB_GROUP_T` as `group`. After a refused board item ask or footprint editor ask, the asked item is named (`SCOPED_SET_RESET`) around `OnEditItemRequest`. E on a group therefore asks once, exactly as before on the board.
+- `pcbnew/tools/footprint_editor_host.h`: the doc lists `group`.
+
+Double click on a group enters the group (KiCad's own), and KiCad's selection menu reaches a group's properties only through E's action, so neither of those roads opens the dialog. No pcbjam change, no export added (the markers `kicadHostBoardItems` and `kicadHostFpEdit` stand). Recompile reach: `board_item_host.h` (edit_tool.cpp, drawing_tool.cpp, pcb_tuning_pattern.cpp, the two frames) and `footprint_editor_host.h` (its includers); no widely included header.
+
+### For the island
+
+- Footprint editor: a new ask name, `group`, on `window.kicadHostFpEdit.onRequest`: `{ask: "group", uuid: <the group's>, isNew: false}`, from E on a group and from every other road to the Group Properties dialog. The island and site decide what opens for it. A truthy answer means no KiCad dialog opens; a falsy answer opens KiCad's dialog.
+- Board: the same `{kind: "group"}` ask as E now also arrives from the canvas menu's `common.Groups.groupProperties` and any other edit request of a group.
+
+### Checks (repair e3-1)
+
+After `git merge run15/main` in both worktrees, from `/home/matthew/cc-engine-wt/e3/pcbjam`:
+
+`/home/matthew/cc-wave2/bin/gate.sh scripts/kicad/syntax-check-run15.sh --kicad /home/matthew/cc-engine-wt/e3/kicad all --kicad-file pcbnew/pcb_edit_frame.cpp --kicad-file pcbnew/footprint_edit_frame.cpp --kicad-file pcbnew/tools/edit_tool.cpp --kicad-file pcbnew/tools/drawing_tool.cpp --kicad-file pcbnew/generators/pcb_tuning_pattern.cpp`
+
+```
+PASS pcbnew         pcbnew_embind.cpp subdir=pcbnew -DKICAD_MERGED_EMBIND (17239 ms)
+PASS eeschema       eeschema_embind.cpp subdir=eeschema -DKICAD_MERGED_EMBIND (15691 ms)
+PASS symedit        symedit_embind.cpp subdir=eeschema  (7545 ms)
+PASS fpedit         fpedit_embind.cpp subdir=pcbnew  (9905 ms)
+PASS dsedit         dsedit_embind.cpp subdir=pagelayout_editor  (5463 ms)
+PASS kicad_editor   kicad_editor_embind.cpp subdir=common  (5711 ms)
+PASS occ            pcbnew_embind.cpp subdir=pcbnew (14738 ms)
+PASS kicad pcbnew/pcb_edit_frame.cpp (14639 ms)
+PASS kicad pcbnew/footprint_edit_frame.cpp (7138 ms)
+PASS kicad pcbnew/tools/edit_tool.cpp (9182 ms)
+PASS kicad pcbnew/tools/drawing_tool.cpp (8069 ms)
+PASS kicad pcbnew/generators/pcb_tuning_pattern.cpp (8476 ms)
+syntax-check: 0 failed
+```
+
+(The first try, with the class in `board_item_host.h` including `pcb_group_tool.h`, failed the two frames with `redefinition of 'PCB_GROUP_TOOL'`, the unguarded header. Hence the split above.)
+
+`scripts/kicad/check-run15-exports.sh --join --kicad /home/matthew/cc-engine-wt/e3/kicad` and the `--since run15/main --kicad-since run15/main` form both printed `check-run15-exports: 256 names registered in the merged image (249 kicad names), 111 of 111 run 15 names, 0 failures`.
+
+### What the next build must probe (e3-1)
+
+On a board fixture with a group (pcb frame), with a `window.kicadHostBoardItem.onRequest` listener answering true:
+1. Select the group and run `common.Groups.groupProperties` by name, as the canvas menu's Group properties item does. Exactly one request `{kind: "group", uuid: <the group's>, isNew: false}` arrives, no KiCad dialog opens, and the group stays selected.
+2. E on the group: one request, as before.
+3. With the listener answering false: E gives ONE request, then KiCad's dialog opens.
+4. With no listener: both roads open KiCad's dialog as before. The run by name now names the selected group; before, it handed KiCad a null group.
+
+In the footprint editor, with a group in the footprint and `window.kicadHostFpEdit.onRequest` answering true, E and the run by name each send one `{ask: "group", uuid, isNew: false}` and no dialog opens. With no listener, KiCad's dialog opens. Wrong if a road still opens the dialog while the listener takes it, if E gives two requests when refused, or if the run by name with no group selected opens anything.
