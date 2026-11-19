@@ -618,6 +618,26 @@ std::string netReport( std::string aArgsJson )
 
 namespace pcb
 {
+/**
+ * The frame the vertex exports serve: the board editor or the footprint editor, whichever is
+ * the top window, else nullptr. KiCad's own vertex editor pane serves both (it is
+ * PCB_BASE_EDIT_FRAME's, opened by EDIT_TOOL::EditVertices in either frame), so the exports
+ * read and commit on the same base frame; BOARD_COMMIT takes the footprint editor's rules from
+ * the frame type, as it does for the pane. The footprint editor is matched by its frame type,
+ * never by its class, so the board TU names no footprint editor symbol (occ_service links it
+ * without the footprint editor and simply never meets that frame).
+ */
+PCB_BASE_EDIT_FRAME* vertexFrame()
+{
+    if( PCB_EDIT_FRAME* board = pcbFrame() )
+        return board;
+
+    PCB_BASE_EDIT_FRAME* frame =
+            wxTheApp ? dynamic_cast<PCB_BASE_EDIT_FRAME*>( wxTheApp->GetTopWindow() ) : nullptr;
+
+    return frame && frame->IsType( FRAME_FOOTPRINT_EDITOR ) ? frame : nullptr;
+}
+
 /** The polygon the vertex editor pane edits: a zone's outline (any kind) or a polygon shape's. */
 SHAPE_POLY_SET* vertexPoly( BOARD_ITEM* aItem, const char*& aKind )
 {
@@ -695,13 +715,14 @@ std::string verticesUuid( const std::string& aArgs )
 
 /**
  * kicadBoardVerticesGet (m3-e3, cap vertices): {uuid} (or the bare uuid) of a zone (copper,
- * non copper or rule area) or a polygon shape on the board. The vertex editor pane's grid
+ * non copper or rule area) or a polygon shape on the board, in the board editor or the
+ * footprint editor (pcb::vertexFrame, fix e10-3). The vertex editor pane's grid
  * (pcbnew/widgets/vertex_editor_pane.cpp) as a record: pcb::verticesJson. A read; "" for any
  * other shape, no frame, an open in flight, or an item that has no corners to edit.
  */
 std::string boardVerticesGet( std::string aArgsJson )
 {
-    PCB_EDIT_FRAME* fr = pcbFrame();
+    PCB_BASE_EDIT_FRAME* fr = pcb::vertexFrame();
 
     if( !fr || !fr->GetBoard() || pcbjam_open::busy() )
         return "";
@@ -728,7 +749,7 @@ std::string boardVerticesGet( std::string aArgsJson )
  */
 std::string boardVerticesSet( std::string aArgsJson )
 {
-    PCB_EDIT_FRAME* fr = pcbFrame();
+    PCB_BASE_EDIT_FRAME* fr = pcb::vertexFrame();
 
     if( !fr || !fr->GetBoard() || pcbjam_open::busy() )
         return "";
