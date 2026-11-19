@@ -376,3 +376,40 @@ No engine file was changed. No `e11-8.fixed` is written: nothing is fixed in the
 ### What the next build must probe (e11-8, the diagnosis)
 
 On the Glasgow fixture (pcb frame), move one footprint without saving and run `project.export` `pcb_render`. The picture shows the part at its new place, the board is still marked modified and the undo depth is unchanged (a render is no edit). If the moved part is drawn at its saved place, this diagnosis is wrong and the job reads a file. Then add a footprint with a model not on the saved board and render: its body is missing until the board is saved. That gap is the island staging fault above.
+
+## Repair e11-9: three outputs against kicad-cli 10.0.4 (site close rows E1, E2, E4; RULINGS 36)
+
+Found by the site's Outputs parity test (unit lo-l8-s, captures on engine run 14). Two of the three causes are in KiCad files outside this lane's list, leased to this lane for this repair by the note: `pcbnew/dialogs/dialog_export_odbpp.cpp` and `pcbnew/exporters/export_d356.cpp`. No other lane changes either file.
+
+1. **E1, the editor held after ODB++** (kicad 749b7b85). `DIALOG_EXPORT_ODBPP::GenerateODBPPFiles` runs the save on KiCad's thread pool and waits for it. `ccRunBoardOutput` holds a `wxLogNull`, but wx's logging switch is per thread: a pool thread's messages are buffered (`wxLog::OnLog`, `gs_bufferedLogRecords`) and shown from the main thread at its next idle, after the run has ended, as a message box. That box is a visible wx dialog, so the island's `keysBlocked` answers every later op busy until a reload. On the business card (no Edge.Cuts outline), `BuildBoardPolygonOutlines` returns false, so `ODB_STEP_ENTITY::GenerateProfileFile` logs "Failed to get board outline" every time. kicad-cli prints nothing and exits 0 on the same board (measured in kicad/kicad:10.0.4). The fix, under `__EMSCRIPTEN__`: the caller's `wxLog::IsEnabled()` is read on the calling thread, and the save lambda sets the pool thread's own logging to it for the save and restores it after (RAII, every road: success, a thrown IO_ERROR, an exception caught in ExportODB). KiCad's own menu road logs as before. The zip, the file and the job's lines are unchanged.
+2. **E2, the IPC-D-356 via field** (kicad 9e0befee). `D356_RECORD` has no initializers, and `build_via_testpoints` only ORs the tented sides into `rk.soldermask`, so the field kept the stack's value: `S-2147483613` (0x80000023, garbage with both sides ORed in). Pads set the field to 3 first and were right (S0 to S3 equal on Glasgow). The fix, under `__EMSCRIPTEN__`: `rk.soldermask = 0` before the ORs. kicad-cli 10.0.4 writes `S3` on all 416 Glasgow vias (measured); the engine's file with `S-2147483613` replaced by `S3` equals the reference byte for byte, Glasgow and the business card.
+3. **E4, BOM ranges** (pcbjam 67b4351). KiCad's `SCH_REFERENCE_LIST::Shorthand` already writes every reference when the range delimiter is empty. The cause was ours: `MergeSettings` forced the four delimiters for `sch_export_bom` to kicad-cli's CLI defaults (`-` for ranges) over whatever was sent, and the page sends `ref_range_delimiter: ""`. Now a delimiter that was sent is the job's, as a jobset gives it to kicad-cli; one not sent still takes the CLI default. This also applies to the other three: a sent empty `string_delimiter` now means no quoting (the TSV preset). kicad-cli 10.0.4 with an empty range delimiter writes `C1,C14,C19,C26,C27,C28,...` (measured), the reference capture's lines.
+
+### Checks (repair e11-9)
+
+After `git merge run15/main` in both worktrees, from `/home/matthew/cc-engine-wt/e11/pcbjam`:
+
+`/home/matthew/cc-wave2/bin/gate.sh scripts/kicad/syntax-check-run15.sh --kicad /home/matthew/cc-engine-wt/e11/kicad all --kicad-file pcbnew/dialogs/dialog_export_odbpp.cpp --kicad-file pcbnew/exporters/export_d356.cpp`
+
+```
+PASS pcbnew         pcbnew_embind.cpp subdir=pcbnew -DKICAD_MERGED_EMBIND (16901 ms)
+PASS eeschema       eeschema_embind.cpp subdir=eeschema -DKICAD_MERGED_EMBIND (15483 ms)
+PASS symedit        symedit_embind.cpp subdir=eeschema  (7851 ms)
+PASS fpedit         fpedit_embind.cpp subdir=pcbnew  (10222 ms)
+PASS dsedit         dsedit_embind.cpp subdir=pagelayout_editor  (5542 ms)
+PASS kicad_editor   kicad_editor_embind.cpp subdir=common  (5324 ms)
+PASS occ            pcbnew_embind.cpp subdir=pcbnew (13945 ms)
+PASS kicad pcbnew/dialogs/dialog_export_odbpp.cpp (7587 ms)
+PASS kicad pcbnew/exporters/export_d356.cpp (6230 ms)
+syntax-check: 0 failed
+```
+
+After the header's dated line was added to `cc_output_common.h`, `pcbnew eeschema occ` again: all PASS, `syntax-check: 0 failed`.
+
+`scripts/kicad/check-run15-exports.sh --join --kicad /home/matthew/cc-engine-wt/e11/kicad` and the `--since run15/main --kicad-since run15/main` form both printed `check-run15-exports: 257 names registered in the merged image (250 kicad names), 112 of 112 run 15 names, 0 failures`.
+
+Recompile reach: two pcbnew .cpp files, no header; `cc_output_common.h` is included by the binding TUs only.
+
+### What the next build must probe (e11-9)
+
+On the business card, board frame (no reload between rows): `project.export` `pcb_export_odb` (defaults, compression zip) answers its zip, then `project.export` `cc_gencad` (or any board row) answers files, not `busy`; no visible wx dialog in the registry after the next idle. Wrong if busy: the image lacks kicad 749b7b85, or another pool thread logs. On Glasgow, `project.export` `pcb_export_ipcd356`: every `VIA` line ends `S3` and the file equals the lo-l8-s reference but for its date line. On Glasgow, sch frame, `project.export` `sch_export_bom` with the catalog's settings (`ref_range_delimiter: ""`): rows read `C1,C14,C19,C26,C27,C28,...` and `D11,D12,D13`, the file equal to the reference; with `ref_range_delimiter: "-"` sent, `C26-C28` again. Wrong if ranges show with the empty delimiter (the image lacks pcbjam 67b4351).
