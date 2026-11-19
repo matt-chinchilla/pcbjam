@@ -393,3 +393,63 @@ What the next build must probe:
    with the engine's library set present (a symbol of `Device` not yet loaded makes the read
    park): resolves to the candidates JSON of the st-rescue-e list above, no `SuspendError`.
    `kicadSchRescue('{"x":1}')` resolves `""`.
+
+## Repair e9-2 (2026-11-19): a CADSTAR schematic archive with no screen grid
+
+Fault (`/home/matthew/cc-wave2/engine/fix/e9-2.md`, island unit st-open-foreign-i, measured on
+cc24): importing a CADSTAR schematic archive whose `GRIDS` sets no `SCREENGRID` stopped the
+engine with `RuntimeError: divide by zero`.
+
+Cause, verified in the code: `CADSTAR_SCH_ARCHIVE_LOADER::Load`
+(`eeschema/sch_io/cadstar/cadstar_sch_archive_loader.cpp`, the per sheet fit after step 10)
+takes `Assignments.Grids.ScreenGrid` without asking whether the file set one. With no
+`SCREENGRID` node `GRID::Parse` never runs, so `Param1` and `Param2` are whatever the members
+hold (zero in the measured run); `grid` becomes 0 and the `roundToNearestGrid` lambda's
+`aNumber % grid` traps (a FRACTIONALGRID with a zero divisor traps one line earlier, at
+`grid / Param2`). KiCad has no fallback for a missing screen grid; the loader's own fixed
+grid is the 50 mil one it places hidden pins on (`schIUScale.MilsToIU( 50 )`, "place on a
+50mil grid").
+
+Change, kicad commit fe72bacb (the loader's file, leased to e9 for this repair), under
+`#ifdef __EMSCRIPTEN__` with KiCad's lines word for word in the `#else`: a fractional grid
+with no positive divisor yields no grid; after `getKiCadLength`, a grid that is not positive
+(none set, no divisor, or one that rounds to nothing) becomes 50 mil, and the import's report
+gets one warning for the whole design (`RPT_SEVERITY_WARNING`, "The CADSTAR design sets no
+screen grid. Its sheets were sized and centered on a 50 mil grid."), not one per sheet. A
+file with a screen grid takes exactly KiCad's arithmetic. Dated "Modified" line added.
+
+The board half: `pcbnew/pcb_io/cadstar/` parses `GRIDS` (`cadstar_pcb_archive_parser.cpp`
+154) but its loader never reads `Grids` (grep of `Grids.`, `ScreenGrid`, `WorkingGrid` over
+`pcbnew/pcb_io/cadstar/` and `common/io/cadstar/*.cpp`: only the parser lines), so it has no
+such division. No change there.
+
+Syntax check (`/home/matthew/cc-wave2/bin/gate.sh scripts/kicad/syntax-check-run15.sh --kicad
+/home/matthew/cc-engine-wt/e9/kicad all --kicad-file
+eeschema/sch_io/cadstar/cadstar_sch_archive_loader.cpp`):
+
+```
+PASS pcbnew         pcbnew_embind.cpp subdir=pcbnew -DKICAD_MERGED_EMBIND (19666 ms)
+PASS eeschema       eeschema_embind.cpp subdir=eeschema -DKICAD_MERGED_EMBIND (18147 ms)
+PASS symedit        symedit_embind.cpp subdir=eeschema  (9722 ms)
+PASS fpedit         fpedit_embind.cpp subdir=pcbnew  (12674 ms)
+PASS dsedit         dsedit_embind.cpp subdir=pagelayout_editor  (7010 ms)
+PASS kicad_editor   kicad_editor_embind.cpp subdir=common  (6953 ms)
+PASS occ            pcbnew_embind.cpp subdir=pcbnew (17773 ms)
+PASS kicad eeschema/sch_io/cadstar/cadstar_sch_archive_loader.cpp (12579 ms)
+syntax-check: 0 failed
+```
+
+Export check (`scripts/kicad/check-run15-exports.sh --join --kicad
+/home/matthew/cc-engine-wt/e9/kicad`):
+
+```
+check-run15-exports: 256 names registered in the merged image (249 kicad names), 111 of 111 run 15 names, 0 failures
+```
+
+The probe for the next build: the island fixture `tests/fixtures/st-cadstar-minimal/minimal.csa`
+with its `(SCREENGRID ...)` block removed (and once more with the whole `GRIDS` block removed),
+imported through `project.import` in a sch frame as "CADSTAR Schematic Archive": it converts to
+`minimal.kicad_sch` holding "Divider", the import's warnings carry the one screen grid line,
+and the engine answers the next call (a second import of the unchanged fixture converts with
+no such warning). A `(SCREENGRID (FRACTIONALGRID "Screen" 254000 0))` file imports the same
+way. The wrong result: `RuntimeError: divide by zero`, or the warning on the unchanged fixture.
