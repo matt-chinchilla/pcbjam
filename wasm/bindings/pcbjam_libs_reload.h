@@ -22,6 +22,9 @@
  * KiCad row of the design block global table whose uri is a real folder), and the run time rows
  * it adds can be removed again (removeLibraryEntry); setPathVars sets path variables as KiCad's
  * Configure Paths does and reloads the rows that name them (engine run 15, e-librows).
+ * Modified by Circuit Center Inc on 2026-11-19: pathVarNameOk admits the versioned 3RD_PARTY
+ * variable, whose value KiCad's Configure Paths may set (it locks only the name), so the host
+ * can point it at a folder (engine run 15, repair e7-2).
  */
 
 #pragma once
@@ -310,7 +313,10 @@ inline bool removeLibraryEntry( std::string aKind, std::string aNickname )
  * Whether a path variable name may be set from the host: the island's form (an upper case
  * letter, then up to 63 upper case letters, digits or underscores), never KIPRJMOD and never
  * one of KiCad's predefined variables (ENV_VAR::IsEnvVarImmutable, the versioned library
- * folders among them).
+ * folders among them), with one exception: the versioned 3RD_PARTY variable, asked of KiCad
+ * (ENV_VAR::GetVersionedEnvVarName), never typed. KiCad's Configure Paths locks only the NAME
+ * of a predefined variable, so setting its value is KiCad's own behavior; the host points the
+ * add-on parts folder through it (marker kicadPathVarsThirdParty).
  */
 inline bool pathVarNameOk( const std::string& aName )
 {
@@ -325,7 +331,13 @@ inline bool pathVarNameOk( const std::string& aName )
 
     const wxString name = wxString::FromUTF8( aName.c_str() );
 
-    if( name == PROJECT_VAR_NAME || ENV_VAR::IsEnvVarImmutable( name ) )
+    if( name == PROJECT_VAR_NAME )
+        return false;
+
+    if( name == ENV_VAR::GetVersionedEnvVarName( wxS( "3RD_PARTY" ) ) )
+        return true;
+
+    if( ENV_VAR::IsEnvVarImmutable( name ) )
         return false;
 
     return true;
@@ -337,7 +349,11 @@ inline bool pathVarNameOk( const std::string& aName )
  * PGM_BASE::SetLocalEnvVariables puts the map into the process environment. Then every row of
  * every table whose uri names one of them, ${NAME} or $(NAME), is reloaded as reloadLibrary
  * reloads one (its plugin dropped and loaded again), so a row that failed before the variable
- * existed now loads. A variable is never removed here.
+ * existed now loads. A variable is never removed here. A predefined variable (the versioned
+ * 3RD_PARTY one, the only one pathVarNameOk admits) already holds its map entry
+ * (COMMON_SETTINGS::InitializeEnvironment), so its value is set in place with its default kept,
+ * as the dialog sets it; KiCad expands a row's ${NAME} from the process environment
+ * (ExpandEnvVarSubstitutions: the project's text variables first, then wxGetEnv).
  *
  * @param aVars name to absolute folder, already checked by the caller (pathVarNameOk, values
  *        starting with '/').
