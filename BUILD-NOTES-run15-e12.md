@@ -394,3 +394,30 @@ dispatcher picks one in `cc_e12_dispatch`). Helpers the relay can reuse: `cc_e12
 patchKeysIn`, `readPoint`, `pointJson`, `prefSection` style JSON sections over run 14's
 `ccPcbJsonGet` / `ccPcbJsonSet` and the sch twins `ccJsonSectionGet` / `ccJsonSectionSet`.
 Watch: the scratchpad folder of the seat sessions is shared; keep per unit file copies elsewhere.
+
+## Repair e12-2: tuning profiles take UNDEFINED reference layers (site close row E3; RULINGS 36)
+
+The fault (site unit m7-s2): `kicadSettingsSet` for `tuningProfiles` refused any layer row whose `top_reference_layer` or `bottom_reference_layer` is `UNDEFINED`. Cause, read in the code: `tuningProfileListOk`'s `layerOk` takes a name only when `LSET::NameToLayer` answers 0 or more. KiCad itself writes a row with no reference layer (an outer layer microstrip, a track on F.Cu has nothing above it) as `LSET::Name( UNDEFINED_LAYER )`, the string `UNDEFINED` (kicad `common/lset.cpp`, the `aLayerId < 0` branch), and `TUNING_PROFILES` reads it back through `NameToLayer`, which answers -1, `UNDEFINED_LAYER` (`common/project/tuning_profiles.cpp` 123 to 131). So a saved KiCad profile with such a row could not be set back at all.
+
+The repair (pcbjam b0424c8, `wasm/bindings/cc_e12_pcb.inc`): `referenceOk` takes the exact string `UNDEFINED` or what `layerOk` takes, for the two reference keys only; `signal_layer` and the via override layers keep `layerOk`. The value is stored as sent through `jsonSectionSet`, so KiCad's own load makes it `UNDEFINED_LAYER` and the get writes `UNDEFINED` again. No KiCad file, no export, no header.
+
+### Checks (repair e12-2)
+
+After `git merge run15/main` in both worktrees, from `/home/matthew/cc-engine-wt/e12/pcbjam`: `/home/matthew/cc-wave2/bin/gate.sh scripts/kicad/syntax-check-run15.sh --kicad /home/matthew/cc-engine-wt/e12/kicad all`
+
+```
+PASS pcbnew         pcbnew_embind.cpp subdir=pcbnew -DKICAD_MERGED_EMBIND (16126 ms)
+PASS eeschema       eeschema_embind.cpp subdir=eeschema -DKICAD_MERGED_EMBIND (15251 ms)
+PASS symedit        symedit_embind.cpp subdir=eeschema  (7793 ms)
+PASS fpedit         fpedit_embind.cpp subdir=pcbnew  (10517 ms)
+PASS dsedit         dsedit_embind.cpp subdir=pagelayout_editor  (5706 ms)
+PASS kicad_editor   kicad_editor_embind.cpp subdir=common  (5426 ms)
+PASS occ            pcbnew_embind.cpp subdir=pcbnew (13677 ms)
+syntax-check: 0 failed
+```
+
+`scripts/kicad/check-run15-exports.sh --join --kicad /home/matthew/cc-engine-wt/e12/kicad` and the `--since run15/main --kicad-since run15/main` form both printed `check-run15-exports: 257 names registered in the merged image (250 kicad names), 112 of 112 run 15 names, 0 failures`.
+
+### What the next build must probe (e12-2)
+
+Glasgow, board frame: `settings.set` `tuningProfiles` with one profile whose `layer_entries` hold `{signal_layer: "F.Cu", top_reference_layer: "UNDEFINED", bottom_reference_layer: "In1.Cu", ...}`: accepted; `settings.get` `tuningProfiles` reads the row back with `top_reference_layer` `UNDEFINED`, equal to what was set. The same row with `top_reference_layer: "Nowhere.Cu"` is refused (`bad_args`), and `signal_layer: "UNDEFINED"` is still refused. Wrong if the UNDEFINED row answers `bad_args` (the image lacks pcbjam b0424c8).

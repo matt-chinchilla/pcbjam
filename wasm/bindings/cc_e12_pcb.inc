@@ -1283,7 +1283,8 @@ bool componentClassesSet( PCB_EDIT_FRAME* aFrame, const json& aValue, bool aDryR
 // [{signal_layer_from, signal_layer_to, via_layer_from, via_layer_to, delay}]}]}: KiCad's own
 // JSON (lengths and delays in KiCad's internal units, as the project file holds them), the
 // list replaced whole. A profile's name is unique and not empty, a layer once per profile
-// (the panel's ValidateProfile). Board Setup's OK steps run SynchronizeTuningProfileProperties.
+// (the panel's ValidateProfile), a reference layer a layer's name or "UNDEFINED" (none).
+// Board Setup's OK steps run SynchronizeTuningProfileProperties.
 
 bool tuningProfileListOk( const json& aValue )
 {
@@ -1294,6 +1295,15 @@ bool tuningProfileListOk( const json& aValue )
 
         wxString name = wxString::FromUTF8( aName.get<std::string>() );
         return LSET::NameToLayer( name ) >= 0;
+    };
+
+    // A reference layer may be KiCad's "no reference layer": an outer layer microstrip row (a
+    // track on F.Cu has no layer above it) holds UNDEFINED_LAYER, which the project file writes
+    // as LSET::Name's "UNDEFINED" and reads back through NameToLayer as -1, UNDEFINED_LAYER.
+    // That exact name is taken for the two reference keys only.
+    auto referenceOk = [&]( const json& aName ) -> bool
+    {
+        return ( aName.is_string() && aName.get<std::string>() == "UNDEFINED" ) || layerOk( aName );
     };
 
     if( !aValue.is_array() || aValue.size() > 256 )
@@ -1327,8 +1337,8 @@ bool tuningProfileListOk( const json& aValue )
                                     { "bottom_reference_layer", 's' }, { "width", 'i' },
                                     { "diff_pair_gap", 'i' }, { "delay", 'i' } },
                            true )
-                    || !layerOk( entry["signal_layer"] ) || !layerOk( entry["top_reference_layer"] )
-                    || !layerOk( entry["bottom_reference_layer"] )
+                    || !layerOk( entry["signal_layer"] ) || !referenceOk( entry["top_reference_layer"] )
+                    || !referenceOk( entry["bottom_reference_layer"] )
                     || !signals.insert( entry["signal_layer"].get<std::string>() ).second )
             {
                 return false;
