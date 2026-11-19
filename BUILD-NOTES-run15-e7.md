@@ -272,3 +272,34 @@ check-run15-exports: 219 names registered in the merged image (212 kicad names),
 ```
 
 The lane's eight new names are all registered: kicadLibsRemoveEntry, kicadPathVarsSet, kicadDesignBlockSave, kicadDesignBlockPlace, kicadPasteSpecial, kicadDrawingSheetReload (cc_e7_dispatch), kicadDesignBlockApplyLayout (cc_e7_pcb, merged only), kicadBoardUpdateGroups (cc_e7_pcb).
+
+## Repair e7-1 (2026-11-18): the board update's preview token is stable
+
+The fault (`/home/matthew/cc-wave2/engine/fix/e7-1.md`): on `blocks-small` two previews in a row gave two tokens, so every apply answered `stale`; on `first-board` they agreed. Run 14 had it too.
+
+The cause: the token hashed the board's change counter, `BOARD::GetTimeStamp()`. That counter is not a function of the board: `FOOTPRINT::~FOOTPRINT` calls `board->IncrementTimeStamp()` (kicad `pcbnew/footprint.cpp` 310), and a dry run of `BOARD_NETLIST_UPDATER::addNewFootprint` loads the new part's footprint from its library and deletes it (`pcbnew/netlist_reader/board_netlist_updater.cpp` 196 to 204). A design with parts to add (blocks-small's LDO sheet) bumps the counter on every preview; first-board has none to add. The run 14 tokens in the note (`46ff82dfe52ad653`, `46ff87dfe52aded2`) differ only in the bits FNV-1a's last step moves (hex digit 6 and the low three), which is a change in the text's last byte: the counter's last digit.
+
+The repair: the token takes a digest of the board as KiCad's own file writer formats it with the board control set (`PCB_IO_KICAD_SEXPR::Format( BOARD* )` straight, never `FormatBoardToFormatter`, which embeds or clears the board's fonts), in place of the counter: `ccDigest( ccUpdateToken( netlist, replace, delete, relink, 0 ) + "|p" + cc_e7::boardUpdateDigest( board ) + "|g0/1" + "|b0/1" )`. Formatting reads the board only. A dry run never adds a net (`board_netlist_updater.cpp` 1223), so nothing it does reaches the formatted text. The token is now a function of the schematic's netlist, the board's saved content and the options.
+
+Files (pcbjam only, no KiCad file): `wasm/bindings/cc_e7_lease.h` (the declaration of `cc_e7::boardUpdateDigest`), `wasm/bindings/cc_e7_pcb.inc` (its definition and the writer subclass `cc_e7::pcb::UPDATE_DIGEST_IO`, every configuration, occ_service included), `wasm/bindings/pcbnew_embind.cpp` (the leased `ccRunBoardUpdate`: the token line, and the dated line in the header). Commit 4c8bbfc on `seat/run15-e7`, after `git merge run15/main`.
+
+Checks:
+
+```
+/home/matthew/cc-wave2/bin/gate.sh scripts/kicad/syntax-check-run15.sh --kicad /home/matthew/cc-engine-wt/e7/kicad all
+PASS pcbnew         pcbnew_embind.cpp subdir=pcbnew -DKICAD_MERGED_EMBIND (15442 ms)
+PASS eeschema       eeschema_embind.cpp subdir=eeschema -DKICAD_MERGED_EMBIND (15758 ms)
+PASS symedit        symedit_embind.cpp subdir=eeschema  (8307 ms)
+PASS fpedit         fpedit_embind.cpp subdir=pcbnew  (10959 ms)
+PASS dsedit         dsedit_embind.cpp subdir=pagelayout_editor  (5963 ms)
+PASS kicad_editor   kicad_editor_embind.cpp subdir=common  (5559 ms)
+PASS occ            pcbnew_embind.cpp subdir=pcbnew (15419 ms)
+syntax-check: 0 failed
+
+(after the header line was added, pcbnew and occ again: PASS, PASS, syntax-check: 0 failed)
+
+scripts/kicad/check-run15-exports.sh --since run15/main --kicad /home/matthew/cc-engine-wt/e7/kicad --kicad-since run15/main
+check-run15-exports: 256 names registered in the merged image (249 kicad names), 111 of 111 run 15 names, 0 failures
+```
+
+What the build train must probe: e-block-layout probes 6 and 7 as written above, plus (a) on blocks-small, two `kicadUpdateBoardFromSchematic` previews in a row with the seven keys give the SAME token, and a third after the apply gives a different one; (b) on first-board the preview and apply still run; (c) a preview, then a moved footprint, then the apply with the old token answers `stale`. Wrong if: (a) still differs (something else in the dry run changes the board's text), or (c) applies (the digest does not see the board). The preview costs one extra format of the board (a save's text, in memory); report its time on the largest board fixture beside the preview's own.
