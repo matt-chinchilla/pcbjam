@@ -17,10 +17,16 @@
  * Modified by Circuit Center Inc on 2026-11-18: the request carries outPath (the absolute
  * m_outputFile, where the 3D service's answer is written in the engine's file system); an ok
  * answer that leaves no file there, or an empty one, is the error "The 3D service made no file.".
+ *
+ * Modified by Circuit Center Inc on 2026-11-19: each line of the 3D service's report that names a
+ * 3D model the export could not add ("The 3D model <file> was not added: ...", one per model,
+ * written by occ_service_main.cpp) is reported as a warning of the job; the rest of the report is
+ * reported as before.
  */
 
 #include <cstdlib>
 #include <string>
+#include <vector>
 
 #include <wx/filefn.h>
 
@@ -223,10 +229,55 @@ bool EXPORTER_STEP::Export()
 
         const std::string report = res.value( "report", std::string() );
 
-        if( m_reporter && !report.empty() )
+        // The service's lines for the 3D models it could not add are warnings of the job, one
+        // per model; the rest of the report is reported as before (unchanged when every model
+        // loaded, as the service then writes no such line).
+        std::vector<std::string> kept;
+        std::vector<std::string> modelLines;
+        size_t                   start = 0;
+
+        while( start <= report.size() )
         {
-            m_reporter->Report( wxString::FromUTF8( report.c_str() ),
+            size_t end = report.find( '\n', start );
+
+            if( end == std::string::npos )
+                end = report.size();
+
+            std::string line = report.substr( start, end - start );
+
+            if( line.rfind( "The 3D model ", 0 ) == 0
+                    && line.find( " was not added: " ) != std::string::npos )
+            {
+                modelLines.push_back( std::move( line ) );
+            }
+            else
+            {
+                kept.push_back( std::move( line ) );
+            }
+
+            start = end + 1;
+        }
+
+        std::string rest;
+
+        for( size_t i = 0; i < kept.size(); ++i )
+        {
+            if( i > 0 )
+                rest += '\n';
+
+            rest += kept[i];
+        }
+
+        if( m_reporter && !rest.empty() )
+        {
+            m_reporter->Report( wxString::FromUTF8( rest.c_str() ),
                                 ok ? RPT_SEVERITY_INFO : RPT_SEVERITY_ERROR );
+        }
+
+        for( const std::string& line : modelLines )
+        {
+            if( m_reporter )
+                m_reporter->Report( wxString::FromUTF8( line.c_str() ), RPT_SEVERITY_WARNING );
         }
     }
     catch( ... )
