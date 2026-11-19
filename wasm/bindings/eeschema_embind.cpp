@@ -22,6 +22,9 @@
 // Modified by Circuit Center Inc on 2026-11-18: the simulator's faults (engine run 15, lane e13):
 // KiCad's logged errors kept as problems instead of a modal box, no_model and pin_map problems,
 // a value KiCad wants as a number refused, a subcircuit's pins listed, runs keyed by number.
+// Modified by Circuit Center Inc on 2026-11-19: a run whose ngspice ended with an error (its
+// controlled exit) is recorded failed with the cause, out of memory in plain words, and its
+// results are never read; Stop finishes at once a run whose ngspice already ended.
 
 #ifdef __EMSCRIPTEN__
 #include <emscripten.h>
@@ -5253,6 +5256,10 @@ struct SIM_LIVE_RUN
                                                       // only now does an idle event end it
     bool                     stopRequested = false;
     bool                     finishQueued = false;
+    bool                     ngspiceExited = false;   // ngspice ended with an error (its
+                                                      // controlled exit): the run failed
+    bool                     outOfMemory = false;     // ngspice said it could not get memory
+    std::string              ngspiceError;            // the run's first ngspice error line
     json                     problems = json::array();
     json                     lines = json::array();
 };
@@ -5312,9 +5319,41 @@ public:
 
             while( m_console.size() > 2000 )
                 m_console.pop_front();
+
+            noteRunLine( line );
         }
 
         return *this;
+    }
+
+    /**
+     * What ngspice's own lines say about the live run, kept on it (stored only: this is called
+     * from the event entry). ngspice prints "ngspice.dll cannot recover and awaits to be reset"
+     * in shared_exit for every controlled exit that is not a quit, before its thread's finished
+     * event, so the run is marked before its finish is queued. Its allocator prints "can't
+     * allocate" and "Not enough memory" (misc/alloc.c), and its output storage check "is more
+     * than memory available" (frontend/outitf.c), when a run's storage cannot be had.
+     */
+    void noteRunLine( const wxString& aLine )
+    {
+        std::optional<SIM_LIVE_RUN>& live = simLive();
+
+        if( !live || !live->started )
+            return;
+
+        const wxString lower = aLine.Lower();
+
+        if( live->ngspiceError.empty() && lower.Contains( wxS( "error" ) ) )
+            live->ngspiceError = toUtf8( aLine );
+
+        if( lower.Contains( wxS( "cannot recover" ) ) )
+            live->ngspiceExited = true;
+
+        if( lower.Contains( wxS( "can't allocate" ) ) || lower.Contains( wxS( "not enough memory" ) )
+                || lower.Contains( wxS( "more than memory available" ) ) )
+        {
+            live->outOfMemory = true;
+        }
     }
 
     void OnSimStateChange( SIMULATOR* aObject, SIM_STATE aNewState ) override
@@ -5823,7 +5862,20 @@ void finishSimRun( long long aRun )
 
     try
     {
-        if( engine )
+        if( engine && run.ngspiceExited )
+        {
+            // ngspice ended the run with an error: nothing it holds is read (its thread may have
+            // ended inside a vector extension). Only the plots it made are listed, so the next
+            // run of this kind destroys them and gives their storage back.
+            const std::set<std::string> before( run.plotsBefore.begin(), run.plotsBefore.end() );
+
+            for( const std::string& plot : simAllPlots() )
+            {
+                if( !before.count( plot ) && plot != "const" )
+                    made.push_back( plot );
+            }
+        }
+        else if( engine )
         {
             // SIMULATOR_FRAME::onSimFinished's grace: the simulator may report idle while
             // it still writes; IsRunning is the client's own mirror, never an RPC.
@@ -5940,7 +5992,26 @@ void finishSimRun( long long aRun )
 
     std::string ended = "done";
 
-    if( run.stopRequested )
+    if( run.ngspiceExited )
+    {
+        // Before a Stop: ngspice's error ended the run whether or not Stop was pressed.
+        error = "sim_failed";
+
+        if( run.outOfMemory )
+        {
+            message = "The simulation needs more memory than the simulator can hold. Use fewer "
+                      "points, for example a larger step or a shorter span.";
+        }
+        else if( !run.ngspiceError.empty() )
+        {
+            message = run.ngspiceError;
+        }
+        else
+        {
+            message = "ngspice ended the run with an error.";
+        }
+    }
+    else if( run.stopRequested )
     {
         ended = "stopped";
         error = "stopped";
@@ -5963,7 +6034,9 @@ void finishSimRun( long long aRun )
     if( *error && std::string( error ) == "sim_failed" )
         ended = "failed";
 
-    simRunPlots()[run.run] = made;
+    // A failed run's plots are no run's results (an FFT never reads them); the kind still owns
+    // them, so its next run destroys them.
+    simRunPlots()[run.run] = run.ngspiceExited ? std::vector<std::string>() : made;
     simKindPlots()[run.kind] = made;
 
     result["run"] = run.run;
@@ -6682,8 +6755,17 @@ static bool kicadSimStop()
 
         // bg_halt accepted: ngspice's thread ends and its idle event queues the finish.
         // Refused (no run in the service: the worker died, and the next request booted a
-        // fresh one): no idle event will come, so the run is finished here.
-        if( !engine || !engine->Stop() )
+        // fresh one): no idle event will come, so the run is finished here. Also finished here:
+        // a run whose ngspice already ended with an error, and a run whose thread was seen
+        // running and has ended (the client's mirror, never an RPC): their idle event has come
+        // already, so none will follow the halt.
+        const bool halted = engine && engine->Stop();
+
+        if( !simLive() || simLive()->run != run || simLive()->finishQueued )
+            return;
+
+        if( !halted || simLive()->ngspiceExited
+                || ( simLive()->running && !engine->IsRunning() ) )
         {
             simLive()->finishQueued = true;
             finishSimRun( run );
