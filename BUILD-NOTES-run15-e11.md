@@ -356,3 +356,23 @@ Rebuild reach: occ_service (one source) and the editor's stub (one source).
 ### What the next build must probe (e11-7)
 
 Frame pcb, island harness, the `models3d-small` fixture with one body's file left out of the staging. `project.export` `pcb_export_3d` `{format: 'step'}`: the STEP is made, code 0, and the answer's `notes` hold ONE warning, `The 3D model <that file> was not added: Could not add 3D model for <ref>. File not found: <path>`. With every file present, there is no warning, and the record's lines are byte for byte those before the repair. A model used by two footprints and missing gives one warning, not two. Wrong if the warning is absent (the image lacks pcbjam c3c30d2, in the service or the editor), or if a clean board gains or loses a line.
+
+## Repair e11-8: a render of the last saved board (diagnosed, no engine change: the cause is in the island)
+
+What the board output jobs read, from the code:
+
+- **KiCad's jobs** (`pcb_render`, the drill files, the footprint position and report files, and the rest run through `ccRunBoardOutput`): these go to `fr->Kiway().ProcessJob( KIWAY::FACE_PCB, ... )`. Before that, `ccRunBoardOutput` refuses any run unless `Pgm().IsGUI()` is true and a project is open, so in this engine `PCBNEW_JOBS_HANDLER::getBoard` (kicad `pcbnew/pcbnew_jobs_handler.cpp` 481 to 518) always takes its GUI road: `editFrame->GetBoard()`, the frame's live board. The render's copy `ccJobExportRender` takes its board through the same `getBoard` (the lambda in the constructor), and hands that `BOARD*` straight to `BOARD_ADAPTER::SetBoard` and the raytracer. No file is read and nothing is saved.
+- **The 3D exports**: the editor's EXPORTER_STEP shadow (`wasm/stubs/exporter_step_stub.cpp`) writes its `m_board`, the same live board, as text, and sends that text to the 3D service.
+- **Our own outputs** (`ccRunOurBoardOutput`) are given `fr->GetBoard()`.
+
+So the render does not differ from the other jobs: its picture is drawn from the board on screen, a moved part included. What reads the saved file is the island's staging of the model bodies before a render: `bridge/ext/3d-i3.ts` `before()` reads `ctx.readBytes( ctx.opened() )`, the `.kicad_pcb` as last saved, and stages only the model lines that file names (island-close-1 row 3d-i3, "Staging reads the saved board", DESIGN). A footprint added since the save, or a model line changed since the save, has no body in the engine's model folder. The raytracer then draws that footprint with no body, while every moved part is drawn at its new place. The 3D exports are not affected: their staging goes through the 3D service's stage hook, which is given the live board text.
+
+The repair is therefore the island's (unit 3d-i3, `bridge/ext/3d-i3.ts`), not this lane's. Options:
+- (a) the site saves before a render, as the close report recommends;
+- (b) the island stages from the live board's model lines. That needs a read of the live board, which no engine export answers today for this purpose; it would be a new export, which E0 would list.
+
+No engine file was changed. No `e11-8.fixed` is written: nothing is fixed in the engine.
+
+### What the next build must probe (e11-8, the diagnosis)
+
+On the Glasgow fixture (pcb frame), move one footprint without saving and run `project.export` `pcb_render`. The picture shows the part at its new place, the board is still marked modified and the undo depth is unchanged (a render is no edit). If the moved part is drawn at its saved place, this diagnosis is wrong and the job reads a file. Then add a footprint with a model not on the saved board and render: its body is missing until the board is saved. That gap is the island staging fault above.
