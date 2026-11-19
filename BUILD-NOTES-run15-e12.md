@@ -37,9 +37,9 @@ Commits: kicad KLO (`backannotate.h`, `backannotate.cpp`), pcbjam PLO (`cc_e8_pc
 
 Changed `kicadSettingsGet`, `kicadSettingsSet` (two registered sections, no new export). File:
 pcbjam `wasm/bindings/cc_e12_pcb.inc` (includes `layer_pairs.h`, `pcbnew_settings.h`,
-`router/pns_routing_settings.h`, all in the board TU's include path). Both register with
-`setupOk` true, so a taken set runs Board Setup's OK steps and lo-e3s-e's tool reset (no second
-reset here).
+`router/pns_routing_settings.h`, all in the board TU's include path). layerPairs registers
+with `setupOk` true, so a taken set runs Board Setup's OK steps and lo-e3s-e's tool reset (no
+second reset here). router registers with `setupOk` false since repair e12-1 (below).
 
 **router** (`kRouter`). The router's own settings are `PCBNEW_SETTINGS::m_PnsSettings`
 (`tools.pns`), the object the live router holds by pointer (`PNS_TOOL_BASE::Reset` calls
@@ -325,6 +325,43 @@ kicad pcbnew/dialogs/panel_setup_tuning_profile_info.cpp (8322 ms)`, `syntax-che
 Export check (after 5138ecf, which changed comments only):
 `scripts/kicad/check-run15-exports.sh --since run15/main --kicad /home/matthew/cc-engine-wt/e12/kicad --kicad-since run15/main`:
 `215 names registered in the merged image (208 kicad names), 70 of 110 run 15 names, 0 failures`.
+
+## Repair e12-1: the router's custom sizes (fix note e12-1)
+
+The probe (build T3, Glasgow): `kicadSettingsSet` router `{currentTrack:{customWidth:0.4,
+custom:true}}` answered taken, and the get still read `custom` false and `customWidth` 0.15
+(the via the same); `{currentTrack:{index:1}}` and `{mode:1}` did take.
+
+Cause: the edits ran, then the registry ran Board Setup's OK steps (`setupOk` true), whose
+`board->SynchronizeNetsAndNetClasses( true )` (kicad `pcbnew/board.cpp` 2737 to 2747) sets
+`UseCustomTrackViaSize( false )` and every custom track, via and pair size back to the default
+net class's. The index is not touched there, which is why `index` survived.
+
+Fix (pcbjam e781ae3, `wasm/bindings/cc_e12_pcb.inc` only): the router section registers with
+`setupOk` false: its settings object (`PCBNEW_SETTINGS::m_PnsSettings`) and the current sizes
+are editor state, never saved in the board, so the board is no longer marked modified by a
+router set either. The live router reads the settings object in place (it holds it by pointer);
+after any current size edit the set runs `PCB_ACTIONS::trackViaSizeChanged`, the action KiCad's
+own size choices run (`board_editor_control.cpp` 1111, 1135, 1193), so a route in progress takes
+the sizes. A `custom` true also sets `m_TempOverrideTrackWidth`, as
+`ROUTER_TOOL::CustomTrackWidthDialog` does (`router_tool.cpp` 2873), so the custom width wins over
+a connected track's width. Ruling 3 stands: no second tool reset is added; the router section
+simply no longer asks for Board Setup's.
+
+Checks after `git merge run15/main` (pcbjam and kicad):
+`/home/matthew/cc-wave2/bin/gate.sh scripts/kicad/syntax-check-run15.sh --kicad /home/matthew/cc-engine-wt/e12/kicad all`:
+PASS pcbnew (15400 ms), PASS eeschema (14303 ms), PASS symedit (7538 ms), PASS fpedit
+(10071 ms), PASS dsedit (5642 ms), PASS kicad_editor (5533 ms), PASS occ (13215 ms),
+`syntax-check: 0 failed`.
+`scripts/kicad/check-run15-exports.sh --since run15/main --kicad /home/matthew/cc-engine-wt/e12/kicad --kicad-since run15/main`:
+`256 names registered in the merged image (249 kicad names), 111 of 111 run 15 names, 0 failures`.
+
+What the train must probe again (Glasgow, board frame): probe 3 of st-routing-e as written:
+set `{currentTrack:{customWidth:0.4, custom:true}}`, the get reads `currentTrack.custom` true,
+`width` 0.4, `currentVia.custom` true; set `{currentVia:{custom:true, customDiameter:0.8,
+customDrill:0.4}}`, the get reads `currentVia.diameter` 0.8 and `drill` 0.4; a new track routed
+after the set is 0.4 mm; `{currentTrack:{index:0}}` reads custom false again; the board's
+modified flag did not change on any router set. Wrong: any custom figure reads its old value.
 
 ## Handover
 
