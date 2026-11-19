@@ -29,7 +29,7 @@
 //                separatorsStyle (styles solid, dash, dot, dash_dot, dash_dot_dot; a width null
 //                when its strokes are off).
 //   barcode      text, layer, locked, x, y, width, height, textSize, angle, knockout, margin,
-//                showText, kind (code39, code128, datamatrix, qr, microqr), errorCorrection
+//                showText, symbology (code39, code128, datamatrix, qr, microqr), errorCorrection
 //                (L, M, Q, H).
 
 #pragma once
@@ -1035,7 +1035,8 @@ inline json barcodeJson( PCB_BARCODE* aCode, const VECTOR2I& aOrigin )
     out["knockout"] = aCode->IsKnockout();
     out["margin"] = pairJson( aCode->GetMargin() );
     out["showText"] = aCode->Text().IsVisible();
-    out["kind"] = nameOf( BARCODE_KINDS, aCode->GetKind() );
+    // The symbology has its own key: "kind" is the item record's own (fix e4-3).
+    out["symbology"] = nameOf( BARCODE_KINDS, aCode->GetKind() );
     out["errorCorrection"] = nameOf( ECC_LEVELS, aCode->GetErrorCorrection() );
     return out;
 }
@@ -1043,7 +1044,7 @@ inline json barcodeJson( PCB_BARCODE* aCode, const VECTOR2I& aOrigin )
 inline bool applyBarcode( PCB_BARCODE* aCode, const json& aSet, const VECTOR2I& aOrigin )
 {
     if( !onlyKeys( aSet, { "text", "layer", "locked", "x", "y", "width", "height", "textSize",
-                           "angle", "knockout", "margin", "showText", "kind",
+                           "angle", "knockout", "margin", "showText", "symbology",
                            "errorCorrection" } ) )
     {
         return false;
@@ -1103,7 +1104,7 @@ inline bool applyBarcode( PCB_BARCODE* aCode, const json& aSet, const VECTOR2I& 
     if( aSet.contains( "margin" ) && !( margin = pairOf( aSet["margin"], 0.0, SIZE_MAX_MM ) ) )
         return false;
 
-    if( aSet.contains( "kind" ) && !( kind = valueOf( BARCODE_KINDS, aSet["kind"] ) ) )
+    if( aSet.contains( "symbology" ) && !( kind = valueOf( BARCODE_KINDS, aSet["symbology"] ) ) )
         return false;
 
     if( aSet.contains( "errorCorrection" )

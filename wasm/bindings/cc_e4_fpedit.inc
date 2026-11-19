@@ -1215,8 +1215,11 @@ bool kicadFpEditPadDefaultsSet( std::string aArgsJson )
 // exactly (the dialog's spin ranges and its prefix box); starts KiCad's own click in order
 // numbering loop with them through PAD_TOOL::enumerateLoop (fp-e1b's split of EnumeratePads):
 // no dialog, the reader clicks or drags across pads, Esc ends it, KiCad commits it as ONE undo
-// step "Renumber Pads". False when the loop did not start (no pads, pad edit mode) or for any
-// other shape.
+// step "Renumber Pads". False when the loop cannot start (no pads, pad edit mode) or for any
+// other shape. The loop waits on tool events (a coroutine wait), so it is queued on the apply
+// coroutine, as pcbShow3DViewer runs its tool, and the call answers at once: run from the
+// call's own stack the first wait threw SuspendError (fix e4-1). The checks EnumeratePads makes
+// before its loop are made here first, so true means the loop starts.
 bool kicadFpEditEnumerate( std::string aArgsJson )
 {
     using namespace cc_fpedit;
@@ -1244,7 +1247,7 @@ bool kicadFpEditEnumerate( std::string aArgsJson )
 
     PAD_TOOL* padTool = fr->GetToolManager()->GetTool<PAD_TOOL>();
 
-    if( !padTool )
+    if( !padTool || padTool->InPadEditMode() || footprint->Pads().empty() )
         return false;
 
     SEQUENTIAL_PAD_ENUMERATION_PARAMS params;
@@ -1252,7 +1255,17 @@ bool kicadFpEditEnumerate( std::string aArgsJson )
     params.m_step = *step;
     params.m_prefix = *prefix;   // the dialog always sets it, empty included
 
-    return padTool->enumerateLoop( params ) == 1;
+    pcbjam_collab::runOnCoroutine( fr, [params]() {
+        FOOTPRINT_EDIT_FRAME* frame = cc_fpedit::fpEditFrame();   // re-resolved on the coroutine
+
+        if( !frame || !frame->GetToolManager() )
+            return;
+
+        if( PAD_TOOL* tool = frame->GetToolManager()->GetTool<PAD_TOOL>() )
+            tool->enumerateLoop( params );
+    } );
+
+    return true;
 }
 
 } // namespace cc_e4

@@ -410,8 +410,11 @@ inline json padJson( const PAD* aPad, const VECTOR2I& aOrigin )
     if( aPad->GetDrillSizeX() > 0 || aPad->GetDrillSizeY() > 0 )
     {
         drill = json::object();
-        drill["shape"] = aPad->GetDrillShape() == PAD_DRILL_SHAPE::OBLONG ? "oval" : "circle";
-        drill["size"] = sizeJson( aPad->GetDrillSize() );
+        const bool circle = aPad->GetDrillShape() != PAD_DRILL_SHAPE::OBLONG;
+        drill["shape"] = circle ? "circle" : "oval";
+        // A circle hole reads by its diameter, as the dialog shows it (fix e4-2).
+        drill["size"] = sizeJson( circle ? VECTOR2I( aPad->GetDrillSizeX(), aPad->GetDrillSizeX() )
+                                         : aPad->GetDrillSize() );
     }
 
     const TEARDROP_PARAMETERS& td = aPad->GetTeardropParams();
@@ -1331,6 +1334,17 @@ inline bool applyPatch( PAD* aPad, const PAD_PATCH& aPatch, const VECTOR2I& aOri
             const int d = pcbIUScale.mmToIU( DEFAULT_PAD_DRILL_DIAMETER_MM );
             aPad->SetDrillShape( PAD_DRILL_SHAPE::CIRCLE );
             aPad->SetDrillSize( VECTOR2I( d, d ) );
+        }
+
+        // A circle hole is its diameter alone: transferDataToPad writes the X box to both sizes
+        // (dialog_pad_properties.cpp, CHOICE_SHAPE_CIRCLE). KiCad's own master pad comes from
+        // SetDefaultMasterPad with a drill of 0.8 by 0, which CheckPad refuses until the dialog
+        // has written it so; without this every set on the master and every new pad (it imports
+        // the master) was refused (fix e4-2).
+        if( aPad->GetDrillShape() == PAD_DRILL_SHAPE::CIRCLE
+                && aPad->GetDrillSizeY() != aPad->GetDrillSizeX() )
+        {
+            aPad->SetDrillSize( VECTOR2I( aPad->GetDrillSizeX(), aPad->GetDrillSizeX() ) );
         }
     }
     else
