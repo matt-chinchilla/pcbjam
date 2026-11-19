@@ -270,3 +270,26 @@ Export check: `scripts/kicad/check-run15-exports.sh --since run15/main --kicad /
 Both worktrees hold `run15/main` (pcbjam 48e664e, kicad caf17fbe: `git merge run15/main` says already up to date) and are clean. The `all` syntax check and the export check above ran on the final code of both branches: `syntax-check: 0 failed` (eleven PASS lines above), `0 failures`.
 
 Lane units: m1x-e1, st-hold-e, m1-e, m1x-e2 (first seat), m12-e, st-keys-e, m6-e3 (relay seat). Merged image only: kicadSelectionFilterGet, kicadSelectionFilterSet halves (and every dispatcher export by its TU). Reported to E0: the two table tools' `ExportTableToCSV` keep KiCad's own copy of the CSV builder (`sch_edit_table_tool.cpp`, `pcb_edit_table_tool.cpp` belong to no lane); `CcTableCsvText` is the one builder `kicadTableCsv` uses.
+
+## Repair e1-1 (2026-11-19): kicadRunAction busy for good after one Position Relative
+
+The fault: `cc_e1::runAction` (`wasm/bindings/cc_e1_dispatch.inc`) answered 3 while `frame->Kiway().GetBlockingDialog()` was non null. KiCad's `DIALOG_SHIM` sets the Kiway's blocking dialog in its constructor and clears it only in its destructor (common/dialog_shim.cpp), and `POSITION_RELATIVE_TOOL` keeps its modeless dialog alive and hidden between uses, so after the first Shift+P every by-name action answered 3 for the frame's life.
+
+The repair (pcbjam 12df0ed, this file only, no KiCad file): the blocking dialog counts as busy only while it is shown (`blocking && blocking->IsShown()`). A real modal stays covered by `modalDialogUp()` and `CcHostPromptModalParked()`.
+
+Syntax check (`all`, after `git merge run15/main` in both worktrees):
+
+```
+PASS pcbnew         pcbnew_embind.cpp subdir=pcbnew -DKICAD_MERGED_EMBIND (17585 ms)
+PASS eeschema       eeschema_embind.cpp subdir=eeschema -DKICAD_MERGED_EMBIND (17744 ms)
+PASS symedit        symedit_embind.cpp subdir=eeschema  (8822 ms)
+PASS fpedit         fpedit_embind.cpp subdir=pcbnew  (11353 ms)
+PASS dsedit         dsedit_embind.cpp subdir=pagelayout_editor  (7190 ms)
+PASS kicad_editor   kicad_editor_embind.cpp subdir=common  (7127 ms)
+PASS occ            pcbnew_embind.cpp subdir=pcbnew (17605 ms)
+syntax-check: 0 failed
+```
+
+Export check: `256 names registered in the merged image (249 kicad names), 111 of 111 run 15 names, 0 failures`.
+
+What the build train must probe (canvas-kinds fixture, pcb frame, a recording `window.kicadHostPrompt`, R1 selected): rotateCcw 0; positionRelative 0 with one `positionRelative` ask; then either `kicadPromptCancel(token)` or `kicadPromptAnswer(token, '{"x":5,"y":0}')`; after both roads `kicadRunAction("pcbnew.InteractiveEdit.rotateCcw")` answers 0 and turns R1 (depth +1), and a by-name positionRelative asks anew (a new token). Still 3 while a modal prompt is parked (moveExact asked and not answered). Wrong: 3 after the prompt ends (the hidden dialog still counted), or 0 while moveExact's prompt is parked.
