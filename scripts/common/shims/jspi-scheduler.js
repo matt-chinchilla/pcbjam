@@ -23,6 +23,7 @@
 // Observability: an event ring + live activation table via __wxWaitDump().
 
 // Modified by Chirichella Inc. on 2026-10-15: kicadImportSchematic joins PARKER_NAMES.
+// Modified by Circuit Center Inc on 2026-11-23: kicadCompareWithSource joins PARKER_NAMES.
 
 (function () {
   "use strict";
@@ -185,6 +186,9 @@
       // SCH_EDIT_FRAME::importFile's progress reporter like an open, and in
       // its modal dialogs (the import-issues report, the error message).
       "kicadImportSchematic",
+      // Compare with its source (cc_e10_dispatch.inc): loads the source symbol or footprint
+      // through the hosted library, whose request waits on a wx wait token, so it parks.
+      "kicadCompareWithSource",
     ],
     _wrapParkers: function () {
       var wrapped = 0;

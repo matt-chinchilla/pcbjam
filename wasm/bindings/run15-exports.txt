@@ -126,6 +126,11 @@ new kicadMultichannelApply e13 st-mc-e
 new kicadSimUserSignals e13 m11-e
 new kicadSettingsSections e0 E0-R7
 new kicadBootCanvasOnly boot boot-e1
+new kicadActionStates e1 t17-14
+new kicadActiveTool e1 t17-15
+new kicadHostToolChanges e1 t17-15
+new kicadLibraryTableProblems e1 t17-8
+new kicadHostFpEditEnumerateEnd e4 t17-5
 
 run14 kicadAnnotate
 run14 kicadBoardEdit
