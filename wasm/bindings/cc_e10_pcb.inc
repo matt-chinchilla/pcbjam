@@ -711,6 +711,37 @@ std::string verticesUuid( const std::string& aArgs )
 
     return args["uuid"].get<std::string>();
 }
+
+/**
+ * The corner (outline, hole, index) of a vertex editable item, as boardVerticesSet names it:
+ * hole -1 for the outline itself. Fills aPoly and aIdx and answers true when the item has
+ * corners and that corner exists; false otherwise (aItem null included).
+ */
+bool vertexAt( BOARD_ITEM* aItem, long long aOutline, long long aHole, long long aIndex,
+               SHAPE_POLY_SET*& aPoly, SHAPE_POLY_SET::VERTEX_INDEX& aIdx )
+{
+    const char*     kind = "";
+    SHAPE_POLY_SET* poly = aItem ? vertexPoly( aItem, kind ) : nullptr;
+
+    if( !poly || aOutline < 0 || aOutline >= poly->OutlineCount() || aHole < -1
+            || aHole >= poly->HoleCount( static_cast<int>( aOutline ) ) || aIndex < 0 )
+    {
+        return false;
+    }
+
+    const SHAPE_LINE_CHAIN& contour =
+            aHole < 0 ? poly->COutline( static_cast<int>( aOutline ) )
+                      : poly->CHole( static_cast<int>( aOutline ), static_cast<int>( aHole ) );
+
+    if( aIndex >= contour.PointCount() )
+        return false;
+
+    aPoly = poly;
+    aIdx.m_polygon = static_cast<int>( aOutline );
+    aIdx.m_contour = static_cast<int>( aHole + 1 );
+    aIdx.m_vertex = static_cast<int>( aIndex );
+    return true;
+}
 } // namespace pcb
 
 /**
@@ -742,10 +773,15 @@ std::string boardVerticesGet( std::string aArgsJson )
  * keys only; outline the polygon, hole -1 for the outline itself else the hole's number,
  * index the corner, x and y in mm (board coordinates). One corner moved exactly as the pane's
  * OnGridCellChange moves it: BOARD_COMMIT Modify, SHAPE_POLY_SET::SetVertex, a zone unfilled,
- * marked for refill and its hatch redrawn, Push "Edit Vertex" (one undo step; none when the
- * corner is already there). Runs at once, as the pane's own grid event does, and answers the
- * read back record (board.vertices.get's shape); "" for any other shape, no frame, an open in
- * flight, an item with no corners or a corner that does not exist.
+ * marked for refill and its hatch redrawn, Push "Edit Vertex" (one undo step). The arguments,
+ * the item and the corner are checked at once. When the corner is already there nothing is
+ * committed and the read back record (board.vertices.get's shape) is answered at once.
+ * Otherwise the move is queued on the apply coroutine and {"queued":true} is answered: Push
+ * dispatches SelectedItemsModified when the item is selected, that dispatch resumes a tool
+ * coroutine, and a plain export cannot park (it trapped with SuspendError after the change was
+ * already applied, t17-1). The queued body resolves the item by uuid and checks the corner
+ * again (S4); the host reads the corner back once the apply queue is empty. "" for any other
+ * shape, no frame, an open in flight, an item with no corners or a corner that does not exist.
  */
 std::string boardVerticesSet( std::string aArgsJson )
 {
@@ -789,45 +825,42 @@ std::string boardVerticesSet( std::string aArgsJson )
     }
 
     const std::string uuid = args["uuid"].get<std::string>();
-    BOARD_ITEM*       item = ccResolve( fr->GetBoard(), uuid );
-    const char*       kind = "";
-    SHAPE_POLY_SET*   poly = item ? pcb::vertexPoly( item, kind ) : nullptr;
+    const long long   outline = args["outline"].get<long long>();
+    const long long   hole = args["hole"].get<long long>();
+    const long long   index = args["index"].get<long long>();
+    const VECTOR2I    vertex( KiROUND( ix ), KiROUND( iy ) );
 
-    if( !poly )
-        return "";
-
-    const long long outline = args["outline"].get<long long>();
-    const long long hole = args["hole"].get<long long>();
-    const long long index = args["index"].get<long long>();
-
-    if( outline < 0 || outline >= poly->OutlineCount() || hole < -1
-            || hole >= poly->HoleCount( static_cast<int>( outline ) ) || index < 0 )
-    {
-        return "";
-    }
-
-    const SHAPE_LINE_CHAIN& contour =
-            hole < 0 ? poly->COutline( static_cast<int>( outline ) )
-                     : poly->CHole( static_cast<int>( outline ), static_cast<int>( hole ) );
-
-    if( index >= contour.PointCount() )
-        return "";
-
+    BOARD_ITEM*                  item = ccResolve( fr->GetBoard(), uuid );
+    SHAPE_POLY_SET*              poly = nullptr;
     SHAPE_POLY_SET::VERTEX_INDEX idx;
-    idx.m_polygon = static_cast<int>( outline );
-    idx.m_contour = static_cast<int>( hole + 1 );
-    idx.m_vertex = static_cast<int>( index );
 
-    const VECTOR2I vertex( KiROUND( ix ), KiROUND( iy ) );
+    if( !pcb::vertexAt( item, outline, hole, index, poly, idx ) )
+        return "";
 
-    if( poly->CVertex( idx ) != vertex )
-    {
+    if( poly->CVertex( idx ) == vertex )
+        return pcb::verticesJson( item, uuid ).dump();
+
+    pcbjam_collab::runOnCoroutine( fr, [fr, uuid, outline, hole, index, vertex]() {
+        // Re-resolve (S4): the item may be gone, or its corners changed, by the time this runs.
+        if( pcbjam_open::busy() || pcb::vertexFrame() != fr || !fr->GetBoard() )
+            return;
+
+        BOARD_ITEM*                  live = ccResolve( fr->GetBoard(), uuid );
+        SHAPE_POLY_SET*              livePoly = nullptr;
+        SHAPE_POLY_SET::VERTEX_INDEX liveIdx;
+
+        if( !pcb::vertexAt( live, outline, hole, index, livePoly, liveIdx )
+                || livePoly->CVertex( liveIdx ) == vertex )
+        {
+            return;
+        }
+
         BOARD_COMMIT commit( fr );
-        commit.Modify( item );
+        commit.Modify( live );
 
-        poly->SetVertex( idx, vertex );
+        livePoly->SetVertex( liveIdx, vertex );
 
-        if( ZONE* zone = dynamic_cast<ZONE*>( item ) )
+        if( ZONE* zone = dynamic_cast<ZONE*>( live ) )
         {
             zone->UnFill();
             zone->SetNeedRefill( true );
@@ -838,12 +871,12 @@ std::string boardVerticesSet( std::string aArgsJson )
 
         if( fr->GetCanvas() )
         {
-            fr->GetCanvas()->GetView()->Update( item );
+            fr->GetCanvas()->GetView()->Update( live );
             fr->GetCanvas()->Refresh();
         }
-    }
+    } );
 
-    return pcb::verticesJson( item, uuid ).dump();
+    return "{\"queued\":true}";
 }
 } // namespace cc_e10
 
