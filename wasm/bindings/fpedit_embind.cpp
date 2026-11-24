@@ -46,12 +46,26 @@ using json = nlohmann::json;
 // the footprint editor's own settings (FOOTPRINT_EDIT_FRAME::GetColorSettings,
 // pcbnew/footprint_edit_frame.cpp 885 to 889), so their color_theme is the one set; the
 // frame's CommonSettingsChanged reloads the painter's colors and repaints, the view kept.
+// That function also reads the GAL options back from the editor's window settings, whose
+// grid.axes_enabled is false until KiCad's own SaveSettings forces it on (it sets
+// m_axesEnabled true before saving, footprint_edit_frame.cpp 833): the apply would hide the
+// footprint's origin axes. So the same invariant is set first, on the apply queue (FIFO).
 void fpSetColorTheme( std::string aTheme )
 {
     FOOTPRINT_EDIT_FRAME* frame = fpEditFrame();
 
-    if( frame )
-        pcbjam_theme::setColorTheme( frame, aTheme, frame->GetFootprintEditorSettings() );
+    if( !frame )
+        return;
+
+    pcbjam_collab::runOnCoroutine( frame, []() {
+        if( FOOTPRINT_EDIT_FRAME* fr = fpEditFrame() )
+        {
+            if( FOOTPRINT_EDITOR_SETTINGS* cfg = fr->GetFootprintEditorSettings() )
+                cfg->m_Window.grid.axes_enabled = true;
+        }
+    } );
+
+    pcbjam_theme::setColorTheme( frame, aTheme, frame->GetFootprintEditorSettings() );
 }
 
 #endif // __EMSCRIPTEN__
