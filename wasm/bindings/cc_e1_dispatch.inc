@@ -19,6 +19,7 @@
 #include <tool/tool_manager.h>
 #include <wx/dialog.h>
 #include <wx/toplevel.h>
+#include <libraries/cc_library_table_problems.h>
 #include "collab_common.h"
 #include "open_gate.h"
 
@@ -342,6 +343,29 @@ bool selectionFilterSet( std::string aArgs )
 
     return false;
 }
+// ---- t17-8: kicadLibraryTableProblems (kicad include/libraries/cc_library_table_problems.h) ---
+
+// The library tables KiCad could not read on its last pass over each of them, in place of the
+// warning window it would show: {"tables":[{"path","kind","message"}]}, kind "symbol",
+// "footprint" or "designBlock", message KiCad's own sentence (the parser's "Syntax error at
+// line N, column M" for a table it cannot parse). A table that then loads leaves the list. A
+// read, any frame.
+std::string libraryTableProblems()
+{
+    nlohmann::json tables = nlohmann::json::array();
+
+    for( const CC_LIBRARY_TABLE_PROBLEM& problem : CcLibraryTableProblems() )
+    {
+        tables.push_back( { { "path", problem.path },
+                            { "kind", problem.kind },
+                            { "message", problem.message } } );
+    }
+
+    nlohmann::json answer;
+    answer["tables"] = tables;
+
+    return answer.dump( -1, ' ', false, nlohmann::json::error_handler_t::replace );
+}
 } // namespace cc_e1
 
 EMSCRIPTEN_BINDINGS( cc_e1_dispatch )
@@ -360,4 +384,5 @@ EMSCRIPTEN_BINDINGS( cc_e1_dispatch )
     emscripten::function( "kicadHotkeysSet", &cc_e1::hotkeysSet );
     emscripten::function( "kicadSelectionFilterGet", &cc_e1::selectionFilterGet );
     emscripten::function( "kicadSelectionFilterSet", &cc_e1::selectionFilterSet );
+    emscripten::function( "kicadLibraryTableProblems", &cc_e1::libraryTableProblems );
 }
