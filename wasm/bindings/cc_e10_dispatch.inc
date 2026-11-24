@@ -55,6 +55,9 @@ std::string findDispatch( std::string aArgsJson )
 
 EMSCRIPTEN_BINDINGS( cc_e10_dispatch )
 {
-    function( "kicadCompareWithSource", &cc_e10::compareWithSource );
+    // A parker (t17-2): the compare loads its source through the hosted library, which asks the
+    // page and waits; a plain export cannot park. It answers a Promise, and the scheduler's
+    // PARKER_NAMES runs it on its own spill stack region.
+    function( "kicadCompareWithSource", &cc_e10::compareWithSource PCBJAM_PARKER_POLICY );
     function( "kicadFind", &cc_e10::findDispatch );
 }
