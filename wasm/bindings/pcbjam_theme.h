@@ -12,7 +12,10 @@
  * Modified by Circuit Center Inc on 2026-11-24: setColorTheme takes the app settings the
  * frame's colors are read from when they are not the frame's own config() (the symbol
  * editor reads eeschema's while use_eeschema_color_settings is on), so the footprint
- * editor, symbol editor and drawing sheet editor frames take a live theme too.
+ * editor, symbol editor and drawing sheet editor frames take a live theme too. A theme apply
+ * no longer changes the wx chrome's dark or light appearance (it followed the theme's name,
+ * so any theme but _builtin_default turned the panes dark by day): that look is the page's
+ * own, set at boot and through kicadSetDarkChrome, and an apply keeps it as it is.
  */
 
 #pragma once
@@ -96,9 +99,9 @@ inline void setColorTheme( EDA_DRAW_FRAME* aFrame, const std::string& aTheme,
         return;
 
     pcbjam_collab::runOnCoroutine( aFrame, [aFrame, aTheme, aColorCfg]() {
-        // The shell only ever sends our dark theme name or the builtin
-        // default, so the chrome appearance rides on that distinction.
-        const bool         dark = aTheme != "_builtin_default";
+        // The chrome's dark or light appearance is NOT this call's: the page
+        // sets it (kicadSetDarkChrome), and a canvas color theme says nothing
+        // about it, so it is kept exactly as it is.
         const wxString     theme = wxString::FromUTF8( aTheme.c_str() );
         APP_SETTINGS_BASE* cfg = aColorCfg ? aColorCfg : aFrame->config();
 
@@ -106,7 +109,7 @@ inline void setColorTheme( EDA_DRAW_FRAME* aFrame, const std::string& aTheme,
         // have stale MEMFS settings from a HomePage theme switch) — skip the
         // apply when nothing changes: CommonSettingsChanged below is not
         // free, it rebuilds the menubar and toolbars.
-        if( cfg && cfg->m_ColorTheme == theme && dark == wxWasmGetDarkAppearance() )
+        if( cfg && cfg->m_ColorTheme == theme )
             return;
 
         if( cfg )
@@ -116,9 +119,6 @@ inline void setColorTheme( EDA_DRAW_FRAME* aFrame, const std::string& aTheme,
             // save-on-close path would lose the choice.
             Pgm().GetSettingsManager().Save( cfg );
         }
-
-        // wx chrome first (panels/toolbars), then the GAL canvas colors.
-        syncChromeAppearance( dark );
 
         // 0 flags: no env/text vars changed; the frame's override chain still
         // unconditionally reloads colors and recaches the view.
