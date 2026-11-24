@@ -15,6 +15,7 @@
 #include <tool/host_context_menu.h>
 #include <hotkeys_basic.h>
 #include <tool/action_manager.h>
+#include <tool/selection_conditions.h>
 #include <tool/tool_action.h>
 #include <tool/tool_manager.h>
 #include <wx/dialog.h>
@@ -366,6 +367,85 @@ std::string libraryTableProblems()
 
     return answer.dump( -1, ' ', false, nlohmann::json::error_handler_t::replace );
 }
+// ---- t17-14: kicadActionStates, the checked state of named actions (unified frame 10.3) ------
+
+// One action's checked state as the top frame would draw it on its menu or toolbar
+// (EDA_BASE_FRAME::HandleUpdateUIEvent): the condition the frame registered with
+// ACTION_MANAGER::SetConditions, evaluated on the frame's current selection. null for a name
+// that is no action of this frame, an action with no registered conditions, an action whose
+// check condition is still KiCad's default (never checked: it is no toggle), and a condition
+// that threw.
+static nlohmann::json actionState( KIWAY_PLAYER* aFrame, ACTION_MANAGER* aActionMgr,
+                                   const std::string& aName )
+{
+    TOOL_ACTION* action = aActionMgr->FindAction( aName );
+
+    if( !action )
+        return nullptr;
+
+    const ACTION_CONDITIONS* cond = aActionMgr->GetCondition( *action );
+
+    if( !cond || !cond->checkCondition )
+        return nullptr;
+
+    using CONDITION_FN = bool ( * )( const SELECTION& );
+    const CONDITION_FN* plain = cond->checkCondition.target<CONDITION_FN>();
+
+    if( plain && *plain == &SELECTION_CONDITIONS::ShowNever )
+        return nullptr;
+
+    try
+    {
+        return cond->checkCondition( aFrame->GetCurrentSelection() );
+    }
+    catch( ... )
+    {
+        return nullptr;
+    }
+}
+
+// {"actions":[name, ...]} (1 to 256 strings) -> {"states":{"<name>":true|false|null}}: each
+// named action's checked state in the top frame, as its menus and toolbars show it (the grid,
+// the ratsnest, the polar coordinates). "" for any other shape, with no frame, or with an open in
+// flight. A read: synchronous, nothing queued, so an action run just before is read once the
+// apply queue has run it.
+std::string actionStates( std::string aArgs )
+{
+    const nlohmann::json args = nlohmann::json::parse( aArgs, nullptr, false );
+
+    if( args.is_discarded() || !args.is_object() || args.size() != 1 || !args.contains( "actions" )
+        || !args["actions"].is_array() || args["actions"].empty()
+        || args["actions"].size() > 256 )
+    {
+        return "";
+    }
+
+    for( const nlohmann::json& name : args["actions"] )
+    {
+        if( !name.is_string() )
+            return "";
+    }
+
+    KIWAY_PLAYER* frame =
+            wxTheApp ? dynamic_cast<KIWAY_PLAYER*>( wxTheApp->GetTopWindow() ) : nullptr;
+    TOOL_MANAGER* toolMgr = frame ? frame->GetToolManager() : nullptr;
+
+    if( !toolMgr || !toolMgr->GetActionManager() || pcbjam_open::busy() )
+        return "";
+
+    nlohmann::json states = nlohmann::json::object();
+
+    for( const nlohmann::json& name : args["actions"] )
+    {
+        const std::string text = name.get<std::string>();
+        states[text] = actionState( frame, toolMgr->GetActionManager(), text );
+    }
+
+    nlohmann::json answer;
+    answer["states"] = states;
+
+    return answer.dump( -1, ' ', false, nlohmann::json::error_handler_t::replace );
+}
 } // namespace cc_e1
 
 EMSCRIPTEN_BINDINGS( cc_e1_dispatch )
@@ -385,4 +465,5 @@ EMSCRIPTEN_BINDINGS( cc_e1_dispatch )
     emscripten::function( "kicadSelectionFilterGet", &cc_e1::selectionFilterGet );
     emscripten::function( "kicadSelectionFilterSet", &cc_e1::selectionFilterSet );
     emscripten::function( "kicadLibraryTableProblems", &cc_e1::libraryTableProblems );
+    emscripten::function( "kicadActionStates", &cc_e1::actionStates );
 }
