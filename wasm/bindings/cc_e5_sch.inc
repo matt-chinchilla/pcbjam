@@ -387,8 +387,10 @@ inline bool fits( EMBEDDED_FILES* aFiles, const SET_ARGS& aArgs )
  * and type (a file of that name replaced, as the panel's Overwrite); a removal removes the
  * file and, with alsoHeld, the copies the footprints or symbols carry (TransferDataFromWindow's
  * "Delete from footprints (symbols) as well?"); fonts is onFontEmbedClick then
- * SetAreFontsEmbedded (the font files dropped, then with embed the document's own EmbedFonts(),
- * which adds the outline fonts GetFonts() lists). False when KiCad could not read the file or the name is gone.
+ * SetAreFontsEmbedded (with embed false every font file dropped; with embed true only the font
+ * files the document's own EmbedFonts() adds back, the outline fonts GetFonts() lists, are
+ * dropped and read again, and a font file the reader added stays). False when KiCad could not
+ * read the file or the name is gone.
  */
 inline bool applySet( EMBEDDED_FILES* aFiles, const SET_ARGS& aArgs )
 {
@@ -431,12 +433,31 @@ inline bool applySet( EMBEDDED_FILES* aFiles, const SET_ARGS& aArgs )
         return true;
     }
 
-    // fonts
+    // fonts. With embed false every FONT file is dropped, as KiCad's own panel does. With embed
+    // true only the FONT files the document's EmbedFonts() adds back are dropped (the full names
+    // of GetFonts()' files, read fresh by AddFile), and every other FONT file stays: a font the
+    // reader added that no text resolves to in this build (no fontconfig) is never lost.
+    std::set<wxString> refreshed;
+
+    if( aArgs.embed )
+    {
+        // OUTLINE_FONT is incomplete here (see FONT_FILE_NAME); its one public base is FONT, so
+        // the pointer is read as its FONT and the file name through KiCad's own field.
+        for( KIFONT::OUTLINE_FONT* font : aFiles->GetFonts() )
+        {
+            if( font )
+            {
+                const auto* base = reinterpret_cast<const KIFONT::FONT*>( font );
+                refreshed.insert( wxFileName( FONT_FILE_NAME::of( base ) ).GetFullName() );
+            }
+        }
+    }
+
     std::vector<wxString> fontFiles;
 
     for( const auto& [name, file] : aFiles->EmbeddedFileMap() )
     {
-        if( file && file->type == EF::FILE_TYPE::FONT )
+        if( file && file->type == EF::FILE_TYPE::FONT && ( !aArgs.embed || refreshed.count( name ) ) )
             fontFiles.push_back( name );
     }
 
