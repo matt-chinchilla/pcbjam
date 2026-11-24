@@ -22,6 +22,9 @@
 #include <wx/toplevel.h>
 #include <libraries/cc_library_table_problems.h>
 #include <tool/cc_host_tool.h>
+#include <tool/cc_action_state.h>
+#include <wx/timer.h>
+#include <wx/window.h>
 #include "collab_common.h"
 #include "open_gate.h"
 
@@ -35,6 +38,86 @@ namespace cc_e1
 bool hostPrompts()
 {
     return true;
+}
+
+static bool modalDialogUp();
+
+// ---- t18-4: the focus goes back to the drawing once a held prompt ends ------------------------
+
+// A held dialog takes wx's focus in its constructor (the table prompt's grid editor) though it is
+// never shown, and its end leaves wx with no focus at all, so keys sent through key.press reached
+// no window until a press on the drawing. One try on the top frame, true when no try follows:
+// while a modal prompt is still parked, a modal dialog is up or a shown dialog blocks the frame,
+// it waits (and on the last try gives up, never taking a window's focus); while the ended
+// prompt's own dialog is still being taken down (the Kiway's blocking dialog, named from its
+// constructor to its destructor) it waits too, and on the last try goes on. Then, when wx has no
+// focus or its focus is outside the frame, the frame's drawing takes it.
+static bool focusBackTry( bool aLast )
+{
+    KIWAY_PLAYER* frame =
+            wxTheApp ? dynamic_cast<KIWAY_PLAYER*>( wxTheApp->GetTopWindow() ) : nullptr;
+
+    if( !frame )
+        return true;
+
+    wxWindow* blocking = frame->Kiway().GetBlockingDialog();
+
+    if( CcHostPromptModalParked() || modalDialogUp() || ( blocking && blocking->IsShown() ) )
+        return aLast;
+
+    if( blocking && !aLast )
+        return false;
+
+    wxWindow* canvas = frame->GetToolCanvas();
+    wxWindow* focus = wxWindow::FindFocus();
+
+    if( canvas && ( !focus || wxGetTopLevelParent( focus ) != frame ) )
+        canvas->SetFocus();
+
+    return true;
+}
+
+// The later tries, 20 ms apart, at most 50: a held modal prompt ends when the scheduler wakes its
+// wait on a later tick, and a CallAfter posted again from a CallAfter runs in the same drain of
+// pending events, before that wake.
+class FOCUS_BACK_TIMER : public wxTimer
+{
+public:
+    int m_tries = 0;
+
+    void Notify() override
+    {
+        if( !focusBackTry( ++m_tries >= 50 ) )
+            StartOnce( 20 );
+    }
+};
+
+static FOCUS_BACK_TIMER& focusBackTimer()
+{
+    static FOCUS_BACK_TIMER* timer = new FOCUS_BACK_TIMER();
+    return *timer;
+}
+
+// After an answer or a cancel has handed a held prompt back: the first try in a CallAfter on the
+// top frame, the rest on the timer. A second ending restarts the count.
+static void focusBackAfterPrompt()
+{
+    KIWAY_PLAYER* frame =
+            wxTheApp ? dynamic_cast<KIWAY_PLAYER*>( wxTheApp->GetTopWindow() ) : nullptr;
+
+    if( !frame )
+        return;
+
+    frame->CallAfter(
+            []()
+            {
+                FOCUS_BACK_TIMER& timer = focusBackTimer();
+                timer.Stop();
+                timer.m_tries = 0;
+
+                if( !focusBackTry( false ) )
+                    timer.StartOnce( 20 );
+            } );
 }
 
 static std::string promptAnswerText( const nlohmann::json& aResult )
@@ -51,13 +134,24 @@ std::string promptAnswer( int aToken, std::string aAnswer )
     if( answer.is_discarded() || !answer.is_object() )
         return "";
 
-    return promptAnswerText( CcHostPromptAnswer( aToken, answer ) );
+    const nlohmann::json result = CcHostPromptAnswer( aToken, answer );
+
+    // An accepted answer ends the prompt; a refused one leaves it parked (its dialog keeps asking).
+    if( result.value( "accepted", false ) )
+        focusBackAfterPrompt();
+
+    return promptAnswerText( result );
 }
 
 // The page canceled a parked prompt: 0 canceled, 1 stale.
 int promptCancel( int aToken )
 {
-    return CcHostPromptCancel( aToken );
+    const int code = CcHostPromptCancel( aToken );
+
+    if( code == 0 )
+        focusBackAfterPrompt();
+
+    return code;
 }
 
 // A modeless prompt's own picker ("item" or "point"): 0 runs, 1 stale, 2 this ask has none.
@@ -370,39 +464,27 @@ std::string libraryTableProblems()
 }
 // ---- t17-14: kicadActionStates, the checked state of named actions (unified frame 10.3) ------
 
-// One action's checked state as the top frame would draw it on its menu or toolbar
-// (EDA_BASE_FRAME::HandleUpdateUIEvent): the condition the frame registered with
-// ACTION_MANAGER::SetConditions, evaluated on the frame's current selection. null for a name
-// that is no action of this frame, an action with no registered conditions, an action whose
-// check condition is still KiCad's default (never checked: it is no toggle), and a condition
-// that threw.
-static nlohmann::json actionState( KIWAY_PLAYER* aFrame, ACTION_MANAGER* aActionMgr,
+// One action's checked state as the top frame would draw it on its menu or toolbar, read in the
+// core (kicad include/tool/cc_action_state.h, CcActionCheck): the condition the frame registered
+// with ACTION_MANAGER::SetConditions evaluated on its current selection, else the state KiCad's
+// own UI update event for the action sets. null for a name that is no action of this frame, an
+// action whose check condition is still KiCad's default (never checked: it is no toggle), and an
+// action neither road answers.
+static nlohmann::json actionState( KIWAY_PLAYER* aFrame, TOOL_MANAGER* aToolMgr,
                                    const std::string& aName )
 {
-    TOOL_ACTION* action = aActionMgr->FindAction( aName );
+    const CC_ACTION_CHECK check = CcActionCheck( aToolMgr, aFrame, aName );
 
-    if( !action )
+    if( !check.found || check.showNever )
         return nullptr;
 
-    const ACTION_CONDITIONS* cond = aActionMgr->GetCondition( *action );
+    if( check.value == 0 || check.value == 1 )
+        return check.value == 1;
 
-    if( !cond || !cond->checkCondition )
-        return nullptr;
+    if( check.uiValue == 0 || check.uiValue == 1 )
+        return check.uiValue == 1;
 
-    using CONDITION_FN = bool ( * )( const SELECTION& );
-    const CONDITION_FN* plain = cond->checkCondition.target<CONDITION_FN>();
-
-    if( plain && *plain == &SELECTION_CONDITIONS::ShowNever )
-        return nullptr;
-
-    try
-    {
-        return cond->checkCondition( aFrame->GetCurrentSelection() );
-    }
-    catch( ... )
-    {
-        return nullptr;
-    }
+    return nullptr;
 }
 
 // {"actions":[name, ...]} (1 to 256 strings) -> {"states":{"<name>":true|false|null}}: each
@@ -439,11 +521,45 @@ std::string actionStates( std::string aArgs )
     for( const nlohmann::json& name : args["actions"] )
     {
         const std::string text = name.get<std::string>();
-        states[text] = actionState( frame, toolMgr->GetActionManager(), text );
+        states[text] = actionState( frame, toolMgr, text );
     }
 
     nlohmann::json answer;
     answer["states"] = states;
+
+    return answer.dump( -1, ' ', false, nlohmann::json::error_handler_t::replace );
+}
+// ---- t18-14: kicadActionStateWhy, every step of one action's state read ----------------------
+
+// name -> {"found","id","uiId","condition","checkSet","showNever","value","threw","uiValue",
+// "conditions","twins","twinCondition"}: CcActionCheck's whole record for the top frame (kicad
+// include/tool/cc_action_state.h; value and uiValue -1 none, 0, 1), so a probe names the road
+// kicadActionStates took and, when neither answers, where it stopped. "" with no frame or with an
+// open in flight. A read, any frame.
+std::string actionStateWhy( std::string aName )
+{
+    KIWAY_PLAYER* frame =
+            wxTheApp ? dynamic_cast<KIWAY_PLAYER*>( wxTheApp->GetTopWindow() ) : nullptr;
+    TOOL_MANAGER* toolMgr = frame ? frame->GetToolManager() : nullptr;
+
+    if( !toolMgr || !toolMgr->GetActionManager() || pcbjam_open::busy() )
+        return "";
+
+    const CC_ACTION_CHECK check = CcActionCheck( toolMgr, frame, aName );
+
+    nlohmann::json answer;
+    answer["found"] = check.found;
+    answer["id"] = check.id;
+    answer["uiId"] = check.uiId;
+    answer["condition"] = check.condition;
+    answer["checkSet"] = check.checkSet;
+    answer["showNever"] = check.showNever;
+    answer["value"] = check.value;
+    answer["threw"] = check.threw;
+    answer["uiValue"] = check.uiValue;
+    answer["conditions"] = check.conditions;
+    answer["twins"] = check.twins;
+    answer["twinCondition"] = check.twinCondition;
 
     return answer.dump( -1, ' ', false, nlohmann::json::error_handler_t::replace );
 }
@@ -490,6 +606,7 @@ EMSCRIPTEN_BINDINGS( cc_e1_dispatch )
     emscripten::function( "kicadSelectionFilterSet", &cc_e1::selectionFilterSet );
     emscripten::function( "kicadLibraryTableProblems", &cc_e1::libraryTableProblems );
     emscripten::function( "kicadActionStates", &cc_e1::actionStates );
+    emscripten::function( "kicadActionStateWhy", &cc_e1::actionStateWhy );
     emscripten::function( "kicadHostToolChanges", &cc_e1::hostToolChanges );
     emscripten::function( "kicadActiveTool", &cc_e1::activeTool );
 }
