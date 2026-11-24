@@ -1592,12 +1592,24 @@ void openChain( std::shared_ptr<cc_symedit::SYMBOL_CHAIN> aChain, const wxString
 // theme while its use_eeschema_color_settings is on (the default) and its own otherwise
 // (SYMBOL_EDIT_FRAME::GetColorSettings, eeschema/symbol_editor/symbol_edit_frame.cpp 399 to
 // 407): the one it reads is the one set. CommonSettingsChanged reloads the painter's colors.
+// It also reads the GAL options back from the editor's window settings, whose
+// grid.axes_enabled is false until KiCad's own SaveSettings forces it on (symbol_edit_frame.cpp
+// 368): the apply would hide the symbol's origin axes. So the same invariant is set first, on
+// the apply queue (FIFO).
 void symSetColorTheme( std::string aTheme )
 {
     SYMBOL_EDIT_FRAME* frame = symEditFrame();
 
     if( !frame )
         return;
+
+    pcbjam_collab::runOnCoroutine( frame, []() {
+        if( SYMBOL_EDIT_FRAME* fr = symEditFrame() )
+        {
+            if( SYMBOL_EDITOR_SETTINGS* cfg = fr->GetSettings() )
+                cfg->m_Window.grid.axes_enabled = true;
+        }
+    } );
 
     SYMBOL_EDITOR_SETTINGS* own = frame->GetSettings();
     APP_SETTINGS_BASE*      cfg = own;
