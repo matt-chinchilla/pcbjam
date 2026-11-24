@@ -35,6 +35,10 @@
  * Modified by Circuit Center Inc on 2026-11-19: engine run 15, repair boot-1. The chrome
  * snapshot counts a menu bar or status bar the frame has not built yet as shown, so a show after
  * the start-up hold brings back the menu bar KiCad attaches after the frame's constructor.
+ *
+ * Modified by Circuit Center Inc on 2026-11-24: kicadSetColorTheme also applies the theme in
+ * the footprint editor, symbol editor and drawing sheet editor frames (their halves live in
+ * fpedit_embind.cpp, symedit_embind.cpp and dsedit_embind.cpp).
  */
 
 #ifdef __EMSCRIPTEN__
@@ -122,6 +126,10 @@ bool        pcbCollabTestClearSelection();
 // Live color-theme switch (comments-ux 0002 F4).
 void        pcbSetColorTheme( std::string aTheme );
 void        pcbSetDarkChrome( bool aDark );
+// Its halves for the other frames (fpedit_embind.cpp, symedit_embind.cpp, dsedit_embind.cpp).
+void        fpSetColorTheme( std::string aTheme );
+void        symSetColorTheme( std::string aTheme );
+void        dsSetColorTheme( std::string aTheme );
 
 // Post-theme-apply hook shared with pcbjam_theme.h — identical inline-variable
 // definition instead of including that header (this TU stays header-light);
@@ -869,7 +877,8 @@ static void collabSetStyle( std::string aJson )
 
 // Theme switch (comments-ux 0002 F4): BOTH editors, not just the active one —
 // a later frame switch (eeschema-switch-nav) must come up already themed.
-// Each side no-ops on a null frame.
+// Each side no-ops on a null frame. The footprint editor, symbol editor and drawing sheet
+// editor halves each act only when their frame is the top window.
 static void setColorTheme( std::string aTheme )
 {
     // A real theme apply rebuilds the menubar/toolbars, which come back
@@ -883,6 +892,9 @@ static void setColorTheme( std::string aTheme )
 
     pcbSetColorTheme( aTheme );
     schSetColorTheme( aTheme );
+    fpSetColorTheme( aTheme );
+    symSetColorTheme( aTheme );
+    dsSetColorTheme( aTheme );
 }
 
 // The chrome flag is process-global — one call suffices.

@@ -19,6 +19,8 @@
  * Modified by Circuit Center Inc on 2026-11-18: sy4-e, a placed part's reference prefix is read,
  * set and checked as its prefix (never its designator), and a new De Morgan symbol has two
  * body styles.
+ * Modified by Circuit Center Inc on 2026-11-24: symSetColorTheme, kicadSetColorTheme's symbol
+ * editor half, sets the theme the frame actually reads its colors from.
  */
 
 #ifdef __EMSCRIPTEN__
@@ -26,6 +28,12 @@
 #include <emscripten.h>
 #include <emscripten/bind.h>
 #include <refdes_utils.h>
+
+#include <eeschema_settings.h>
+#include <settings/settings_manager.h>
+#include <symbol_editor_settings.h>
+
+#include "pcbjam_theme.h"
 
 #include <algorithm>
 #include <array>
@@ -1578,6 +1586,27 @@ void openChain( std::shared_ptr<cc_symedit::SYMBOL_CHAIN> aChain, const wxString
 }
 
 } // namespace
+
+// kicadSetColorTheme's symbol editor half, called by the dispatcher (kicad_editor_embind.cpp
+// setColorTheme), a no-op when this frame is not the top window. The frame reads eeschema's
+// theme while its use_eeschema_color_settings is on (the default) and its own otherwise
+// (SYMBOL_EDIT_FRAME::GetColorSettings, eeschema/symbol_editor/symbol_edit_frame.cpp 399 to
+// 407): the one it reads is the one set. CommonSettingsChanged reloads the painter's colors.
+void symSetColorTheme( std::string aTheme )
+{
+    SYMBOL_EDIT_FRAME* frame = symEditFrame();
+
+    if( !frame )
+        return;
+
+    SYMBOL_EDITOR_SETTINGS* own = frame->GetSettings();
+    APP_SETTINGS_BASE*      cfg = own;
+
+    if( own && own->m_UseEeschemaColorSettings )
+        cfg = GetAppSettings<EESCHEMA_SETTINGS>( "eeschema" );
+
+    pcbjam_theme::setColorTheme( frame, aTheme, cfg );
+}
 
 // ── exports ───────────────────────────────────────────────────────────────────────────
 

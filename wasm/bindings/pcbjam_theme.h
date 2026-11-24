@@ -8,6 +8,11 @@
  * has to exist (standalone boot seeding writes it — web/standalone
  * src/wasm/boot.ts). The changed app settings are saved back to MEMFS so a
  * same-session relaunch (warm pool) comes up already themed.
+ *
+ * Modified by Circuit Center Inc on 2026-11-24: setColorTheme takes the app settings the
+ * frame's colors are read from when they are not the frame's own config() (the symbol
+ * editor reads eeschema's while use_eeschema_color_settings is on), so the footprint
+ * editor, symbol editor and drawing sheet editor frames take a live theme too.
  */
 
 #pragma once
@@ -81,18 +86,21 @@ inline void syncChromeAppearance( bool aDark )
 /** Apply `aTheme` ("pcbjam-dark", "_builtin_default", …) to one frame. Runs
  *  on the apply coroutine: CommonSettingsChanged reaches tool/view internals
  *  that must not run from a bare JS callback. Null frame no-ops (the merged
- *  dispatcher calls every editor, open or not). */
-inline void setColorTheme( EDA_DRAW_FRAME* aFrame, const std::string& aTheme )
+ *  dispatcher calls every editor, open or not). `aColorCfg` is the app
+ *  settings whose color_theme the frame's GetColorSettings reads, when that is
+ *  not the frame's own config(); null means config(). */
+inline void setColorTheme( EDA_DRAW_FRAME* aFrame, const std::string& aTheme,
+                           APP_SETTINGS_BASE* aColorCfg = nullptr )
 {
     if( !aFrame )
         return;
 
-    pcbjam_collab::runOnCoroutine( aFrame, [aFrame, aTheme]() {
+    pcbjam_collab::runOnCoroutine( aFrame, [aFrame, aTheme, aColorCfg]() {
         // The shell only ever sends our dark theme name or the builtin
         // default, so the chrome appearance rides on that distinction.
         const bool         dark = aTheme != "_builtin_default";
         const wxString     theme = wxString::FromUTF8( aTheme.c_str() );
-        APP_SETTINGS_BASE* cfg = aFrame->config();
+        APP_SETTINGS_BASE* cfg = aColorCfg ? aColorCfg : aFrame->config();
 
         // The shell re-sends its theme on EVERY boot (a warm relaunch can
         // have stale MEMFS settings from a HomePage theme switch) — skip the

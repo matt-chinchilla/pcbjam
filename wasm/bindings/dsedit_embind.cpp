@@ -62,6 +62,10 @@
 #include <view/view.h>
 
 #include "collab_common.h"
+#include "pcbjam_theme.h"
+
+#include <pl_editor_settings.h>
+#include <settings/settings_manager.h>
 #include "open_gate.h"
 
 #include "ds_editor_host.h"
@@ -2114,6 +2118,21 @@ bool dsHostDsEdit()
 
 } // namespace ds
 } // namespace cc_e6
+
+
+// kicadSetColorTheme's drawing sheet editor half, called by the dispatcher
+// (kicad_editor_embind.cpp setColorTheme), a no-op when this frame is not the top window. The
+// frame's colors come from pl_editor's own settings (PL_EDITOR_FRAME::CommonSettingsChanged,
+// pagelayout_editor/pl_editor_frame.cpp 659 to 660, and the canvas at its start,
+// pl_draw_panel_gal.cpp 57 to 59), so their color_theme is the one set.
+void dsSetColorTheme( std::string aTheme )
+{
+    PL_EDITOR_FRAME* frame = cc_e6::ds::dsFrame();
+
+    if( frame )
+        pcbjam_theme::setColorTheme( frame, aTheme,
+                                     GetAppSettings<PL_EDITOR_SETTINGS>( "pl_editor" ) );
+}
 
 
 // The drawing sheet frame's change hook. The fork's pagelayout_editor/pl_editor_frame.cpp

@@ -37,4 +37,21 @@ using json = nlohmann::json;
 #include "cc_e5_fpedit.inc"
 #include "cc_e6_fpedit.inc"
 
+#include <footprint_editor_settings.h>
+
+#include "pcbjam_theme.h"
+
+// kicadSetColorTheme's footprint editor half, called by the dispatcher (kicad_editor_embind.cpp
+// setColorTheme), a no-op when this frame is not the top window. The frame's colors come from
+// the footprint editor's own settings (FOOTPRINT_EDIT_FRAME::GetColorSettings,
+// pcbnew/footprint_edit_frame.cpp 885 to 889), so their color_theme is the one set; the
+// frame's CommonSettingsChanged reloads the painter's colors and repaints, the view kept.
+void fpSetColorTheme( std::string aTheme )
+{
+    FOOTPRINT_EDIT_FRAME* frame = fpEditFrame();
+
+    if( frame )
+        pcbjam_theme::setColorTheme( frame, aTheme, frame->GetFootprintEditorSettings() );
+}
+
 #endif // __EMSCRIPTEN__
