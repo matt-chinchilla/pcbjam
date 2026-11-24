@@ -131,6 +131,7 @@ new kicadActiveTool e1 t17-15
 new kicadHostToolChanges e1 t17-15
 new kicadLibraryTableProblems e1 t17-8
 new kicadHostFpEditEnumerateEnd e4 t17-5
+new kicadActionStateWhy e1 t18-14
 
 run14 kicadAnnotate
 run14 kicadBoardEdit
