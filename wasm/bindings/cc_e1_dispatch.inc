@@ -21,6 +21,7 @@
 #include <wx/dialog.h>
 #include <wx/toplevel.h>
 #include <libraries/cc_library_table_problems.h>
+#include <tool/cc_host_tool.h>
 #include "collab_common.h"
 #include "open_gate.h"
 
@@ -446,6 +447,29 @@ std::string actionStates( std::string aArgs )
 
     return answer.dump( -1, ' ', false, nlohmann::json::error_handler_t::replace );
 }
+// ---- t17-15: kicadHostToolChanges, kicadActiveTool (kicad include/tool/cc_host_tool.h) -------
+
+// A marker: this engine tells window.kicadHostTool.onChange( '{"tool":"<name>"}' ) each time the
+// top frame's tool changes (TOOLS_HOLDER::PushTool and PopTool). The island lists its cap
+// activeTool on it.
+bool hostToolChanges()
+{
+    return true;
+}
+
+// The tool the top frame holds now, as KiCad names it (TOOLS_HOLDER::CurrentToolName:
+// "common.InteractiveSelection.selectionTool" when no other tool is held); "" with no frame.
+// A read.
+std::string activeTool()
+{
+    KIWAY_PLAYER* frame =
+            wxTheApp ? dynamic_cast<KIWAY_PLAYER*>( wxTheApp->GetTopWindow() ) : nullptr;
+
+    if( !frame )
+        return "";
+
+    return frame->CurrentToolName();
+}
 } // namespace cc_e1
 
 EMSCRIPTEN_BINDINGS( cc_e1_dispatch )
@@ -466,4 +490,6 @@ EMSCRIPTEN_BINDINGS( cc_e1_dispatch )
     emscripten::function( "kicadSelectionFilterSet", &cc_e1::selectionFilterSet );
     emscripten::function( "kicadLibraryTableProblems", &cc_e1::libraryTableProblems );
     emscripten::function( "kicadActionStates", &cc_e1::actionStates );
+    emscripten::function( "kicadHostToolChanges", &cc_e1::hostToolChanges );
+    emscripten::function( "kicadActiveTool", &cc_e1::activeTool );
 }
