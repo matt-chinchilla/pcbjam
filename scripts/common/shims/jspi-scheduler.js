@@ -24,6 +24,7 @@
 
 // Modified by Chirichella Inc. on 2026-10-15: kicadImportSchematic joins PARKER_NAMES.
 // Modified by Circuit Center Inc on 2026-11-23: kicadCompareWithSource joins PARKER_NAMES.
+// Modified by Circuit Center Inc on 2026-11-23: kicadSchRescue, kicadImportLegacyProject and kicadSimNetlist join PARKER_NAMES.
 
 (function () {
   "use strict";
@@ -189,6 +190,11 @@
       // Compare with its source (cc_e10_dispatch.inc): loads the source symbol or footprint
       // through the hosted library, whose request waits on a wx wait token, so it parks.
       "kicadCompareWithSource",
+      // Registered promising (cc_e9_sch.inc, eeschema_embind.cpp) and parking through an open, a
+      // library load or the simulator service: each runs on its own spill stack region too.
+      "kicadSchRescue",
+      "kicadImportLegacyProject",
+      "kicadSimNetlist",
     ],
     _wrapParkers: function () {
       var wrapped = 0;
