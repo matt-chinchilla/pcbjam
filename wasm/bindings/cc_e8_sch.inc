@@ -1210,6 +1210,11 @@ void runSchItemSet( const std::string& aDir, const std::vector<ASKED_ITEM>& aIte
 
     SCH_COMMIT commit( fr );
 
+    // The reader's selection before a label conversion (its uuids), put back once the commit is
+    // pushed: the conversion runs on a selection of its own.
+    std::vector<std::string> selectedBefore;
+    bool                     restoreSelection = false;
+
     // A label kind change runs KiCad's own change label kind (SCH_EDIT_TOOL::ChangeTextType)
     // into this commit: the labels are selected, converted, and the new ones found again by
     // their place and text (KiCad gives a converted label a new uuid).
@@ -1226,6 +1231,10 @@ void runSchItemSet( const std::string& aDir, const std::vector<ASKED_ITEM>& aIte
         SCH_SELECTION_TOOL*  selTool = fr->GetToolManager()->GetTool<SCH_SELECTION_TOOL>();
         const TOOL_ACTION*   action = labelActionOf( *aSet.labelType );
 
+        for( EDA_ITEM* item : selTool->GetSelection() )
+            selectedBefore.push_back( cs::utf8( item->m_Uuid.AsString() ) );
+
+        restoreSelection = true;
         fr->GetToolManager()->RunAction( ACTIONS::selectionClear );
 
         for( const ITEM_HIT& h : hits )
@@ -1264,7 +1273,8 @@ void runSchItemSet( const std::string& aDir, const std::vector<ASKED_ITEM>& aIte
             }
         }
 
-        fr->GetToolManager()->RunAction( ACTIONS::selectionClear );
+        // Quietly: the reader's selection is put back after the commit, and reported then.
+        selTool->ClearSelection( true );
     }
 
     bool anyKey = false;
@@ -1298,6 +1308,38 @@ void runSchItemSet( const std::string& aDir, const std::vector<ASKED_ITEM>& aIte
 
     if( !commit.Empty() )
         commit.Push( _( "Edit" ) );
+
+    // The reader's selection put back: every uuid that still resolves on the sheet shown, a
+    // converted label through its new uuid. Quietly but the last, so the frame reports the
+    // selection once; nothing left to select reports the empty selection.
+    if( restoreSelection )
+    {
+        std::map<std::string, std::string> renamedTo;
+
+        for( const json& r : replaced )
+            renamedTo[r["from"].get<std::string>()] = r["to"].get<std::string>();
+
+        std::vector<EDA_ITEM*> again;
+
+        for( const std::string& uuid : selectedBefore )
+        {
+            auto              it = renamedTo.find( uuid );
+            const std::string id = it == renamedTo.end() ? uuid : it->second;
+            SCH_ITEM*         item = fr->GetCurrentSheet().ResolveItem( KIID( id ) );
+
+            if( item && std::find( again.begin(), again.end(), item ) == again.end() )
+                again.push_back( item );
+        }
+
+        SCH_SELECTION_TOOL* selTool = fr->GetToolManager()->GetTool<SCH_SELECTION_TOOL>();
+        selTool->ClearSelection( true );
+
+        for( size_t i = 0; i < again.size(); ++i )
+            selTool->AddItemToSel( again[i], i + 1 < again.size() );
+
+        if( again.empty() )
+            fr->GetToolManager()->ProcessEvent( EVENTS::ClearedEvent );
+    }
 
     fr->GetCanvas()->Refresh();
     finish();
