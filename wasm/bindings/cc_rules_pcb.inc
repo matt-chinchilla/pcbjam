@@ -28,11 +28,6 @@
 // The sections' get reads through ccPcbSettingsRead, which reads a given board and project
 // (the open design's, or another loaded beside it for kicadSettingsRead), and the registry
 // struct gains a reader at its end.
-//
-// Modified by Circuit Center Inc on 2026-11-23: the board's two cleanup previews (cleanupTracks,
-// cleanupGraphics) run KiCad's cleaner as an apply into the op's own commit and revert it
-// (ccRevertCleanup), so a preview counts what the apply changes; the rows of both modes name
-// their item (a track the apply removed is found by its uuid in the tracks held before the run).
 
 #include <board_stackup_manager/board_stackup.h>
 #include <board_stackup_manager/stackup_predefined_prms.h>
@@ -1605,13 +1600,8 @@ void ccOpDeleteGlobal( PCB_EDIT_FRAME* aFrame, BOARD_COMMIT& aCommit, const CC_B
     }
 }
 
-/**
- * The rows of a cleanup run. aHeld (optional) maps the uuid of each track held before the run
- * to its object: an apply's removals are off the board when the rows are built, but the commit
- * still owns them until its Push, so a row names the track it removed.
- */
 void ccCleanupRows( const std::vector<std::shared_ptr<CLEANUP_ITEM>>& aItems, BOARD* aBoard,
-                    CC_PCB_ROWS& aRows, const std::map<KIID, BOARD_ITEM*>* aHeld = nullptr )
+                    CC_PCB_ROWS& aRows )
 {
     for( const std::shared_ptr<CLEANUP_ITEM>& item : aItems )
     {
@@ -1619,118 +1609,7 @@ void ccCleanupRows( const std::vector<std::shared_ptr<CLEANUP_ITEM>>& aItems, BO
             continue;
 
         BOARD_ITEM* main = aBoard->ResolveItem( item->GetMainItemID(), true );
-
-        if( !main && aHeld )
-        {
-            auto it = aHeld->find( item->GetMainItemID() );
-
-            if( it != aHeld->end() )
-                main = it->second;
-        }
-
         aRows.Add( main, main ? ccPcbKind( main ) : "item", item->GetErrorMessage( false ) );
-    }
-}
-
-struct CC_CLEANUP_HOLD
-{
-    TRACKS                           tracks;
-    std::map<PCB_TRACK*, EDA_GROUP*> groups;
-    std::map<KIID, BOARD_ITEM*>      byUuid;
-    bool                             wasModified = false;
-};
-
-/** What a cleanup run must give back to a preview, held before the run. */
-CC_CLEANUP_HOLD ccHoldCleanup( PCB_EDIT_FRAME* aFrame )
-{
-    CC_CLEANUP_HOLD hold;
-    BOARD*          board = aFrame->GetBoard();
-
-    hold.tracks = board->Tracks();
-    hold.wasModified = aFrame->GetScreen() && aFrame->GetScreen()->IsContentModified();
-
-    for( PCB_TRACK* track : hold.tracks )
-    {
-        hold.byUuid[track->m_Uuid] = track;
-
-        if( EDA_GROUP* group = track->GetParentGroup() )
-            hold.groups[track] = group;
-    }
-
-    return hold;
-}
-
-/**
- * Takes back a cleanup run as an apply into aCommit, for a preview. KiCad's cleaners in their
- * dry run remove nothing, so a later pass counts an item an earlier one removes and misses what
- * a removal exposes: the preview runs the real cleanup, then this puts the board back exactly.
- *  - Every change the cleaners make is in aCommit (removals as Removed, merges as Modify, new
- *    rectangles as Add, graphics removals staged), and Revert undoes each one.
- *  - Revert adds a Removed item to the view although nothing took it out (only a Push does), and
- *    an item both merged (Modify) and later removed is added twice: each removed track is taken
- *    out of the view until no entry is left, then added once.
- *  - BOARD::Remove takes a track out of its group (or tuning pattern) and Revert does not put it
- *    back: each removed track goes back into the group it held before the run (the file lists a
- *    group's members sorted).
- *  - Revert puts a re-added track at the front of the board's list: the list is set back to the
- *    order held before the run when it holds the same tracks.
- *  - The cleaners' marks (IS_DELETED, SKIP_STRUCT) are cleared, connectivity and the ratsnest
- *    are built again from the board, and the modified flag is left as it was. Nothing is pushed,
- *    so the undo list is untouched.
- */
-void ccRevertCleanup( PCB_EDIT_FRAME* aFrame, BOARD_COMMIT& aCommit, const CC_CLEANUP_HOLD& aHold )
-{
-    BOARD*        board = aFrame->GetBoard();
-    KIGFX::VIEW*  view = aFrame->GetCanvas()->GetView();
-    const TRACKS& before = aHold.tracks;
-
-    std::set<PCB_TRACK*>    after( board->Tracks().begin(), board->Tracks().end() );
-    std::vector<PCB_TRACK*> removed;
-
-    for( PCB_TRACK* track : before )
-    {
-        if( !after.count( track ) )
-            removed.push_back( track );
-    }
-
-    if( !aCommit.Empty() )
-        aCommit.Revert();
-
-    for( PCB_TRACK* track : removed )
-    {
-        view->Remove( track );
-        view->Remove( track );
-        view->Add( track );
-
-        auto group = aHold.groups.find( track );
-
-        // Membership, not the track's pointer: a merged track's Revert brings its group pointer
-        // back while the group's own set no longer lists it.
-        if( group != aHold.groups.end() && !group->second->GetItems().count( track ) )
-            group->second->AddItem( track );
-    }
-
-    std::set<PCB_TRACK*> now( board->Tracks().begin(), board->Tracks().end() );
-    std::set<PCB_TRACK*> held( before.begin(), before.end() );
-
-    // BOARD gives its track list read only outside SWIG; the list itself is not const, so the
-    // cast is sound. Only the order changes: the set of tracks is checked equal first.
-    if( now == held && board->Tracks().size() == before.size() )
-        const_cast<TRACKS&>( board->Tracks() ) = before;
-
-    for( PCB_TRACK* track : board->Tracks() )
-        track->ClearFlags( IS_DELETED | SKIP_STRUCT );
-
-    for( BOARD_ITEM* drawing : board->Drawings() )
-        drawing->ClearFlags( IS_DELETED );
-
-    board->BuildConnectivity();
-    aFrame->Compile_Ratsnest( false );
-
-    if( BASE_SCREEN* screen = aFrame->GetScreen() )
-    {
-        if( !aHold.wasModified && screen->IsContentModified() )
-            screen->SetContentModified( false );
     }
 }
 
@@ -2262,31 +2141,13 @@ void ccRunBoardEdit( const std::string& aDir, const CC_BOARD_EDIT& a )
                             return !filter.Passes( aItem );   // true: leave the item alone
                         } );
 
-                const CC_CLEANUP_HOLD hold = ccHoldCleanup( fr );
-
                 if( !a.preview )
                     fr->GetToolManager()->RunAction( ACTIONS::selectionClear );
 
-                // Both modes run the real cleanup (aDryRun false): a preview takes it back.
                 fr->Compile_Ratsnest( false );
-                try
-                {
-                    cleaner.CleanupBoard( /*aDryRun*/ false, &items, a.removeShorts, a.redundantVias,
-                                          a.mergeCollinear, a.removeDangling, a.tracksInPads,
-                                          a.danglingVias, nullptr );
-                }
-                catch( ... )
-                {
-                    if( a.preview )
-                        ccRevertCleanup( fr, commit, hold );
-
-                    throw;
-                }
-
-                if( a.preview )
-                    ccRevertCleanup( fr, commit, hold );
-
-                ccCleanupRows( items, board, rows, &hold.byUuid );
+                cleaner.CleanupBoard( a.preview, &items, a.removeShorts, a.redundantVias, a.mergeCollinear,
+                                      a.removeDangling, a.tracksInPads, a.danglingVias, nullptr );
+                ccCleanupRows( items, board, rows );
                 name = "Board Cleanup";
             }
             else if( a.op == "unusedPads" )
@@ -2299,29 +2160,12 @@ void ccRunBoardEdit( const std::string& aDir, const CC_BOARD_EDIT& a )
                 std::vector<std::shared_ptr<CLEANUP_ITEM>> items;
                 GRAPHICS_CLEANER cleaner( board->Drawings(), nullptr, commit, fr->GetToolManager() );
 
-                const CC_CLEANUP_HOLD hold = ccHoldCleanup( fr );
-
                 if( !a.preview )
                     fr->GetToolManager()->RunAction( ACTIONS::selectionClear );
 
-                // Both modes run the real cleanup (aDryRun false): a preview takes it back.
                 fr->Compile_Ratsnest( false );
-                try
-                {
-                    cleaner.CleanupBoard( /*aDryRun*/ false, &items, a.mergeRects, a.deleteRedundant,
-                                          /*aMergePads*/ false, a.fixOutline, a.tolerance );
-                }
-                catch( ... )
-                {
-                    if( a.preview )
-                        ccRevertCleanup( fr, commit, hold );
-
-                    throw;
-                }
-
-                if( a.preview )
-                    ccRevertCleanup( fr, commit, hold );
-
+                cleaner.CleanupBoard( a.preview, &items, a.mergeRects, a.deleteRedundant,
+                                      /*aMergePads*/ false, a.fixOutline, a.tolerance );
                 ccCleanupRows( items, board, rows );
                 name = "Cleanup Graphics";
             }
