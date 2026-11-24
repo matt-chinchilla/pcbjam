@@ -25,6 +25,10 @@
 // Modified by Circuit Center Inc on 2026-11-18: the sections' get reads through
 // ccSchSettingsRead, which reads a given project (the open one, or another loaded beside it
 // for kicadSettingsRead), and the registry struct gains a reader at its end.
+//
+// Modified by Circuit Center Inc on 2026-11-23: the textGraphics edit takes each item once
+// (CC_EDIT_ROWS::First), so a sheet used on several paths no longer makes the preview count
+// its items once per path while the apply changes them once.
 
 #include <bus_alias.h>
 #include <font/font.h>
@@ -1264,12 +1268,20 @@ bool ccReadSchTextSet( const json& aValue, CC_SCH_TEXT_SET& aOut )
     return true;
 }
 
-/** The rows a run collects: the first CC_RULES_ROWS_MAX kept, every one counted. */
+/**
+ * The rows a run collects: the first CC_RULES_ROWS_MAX kept, every one counted. The run
+ * visits every sheet path, and a sheet used twice puts the same items on both paths: First
+ * is true only the first time an item is met, in both modes, so the preview counts each item
+ * once, as the apply changes it once (on its second path it already holds the value).
+ */
 struct CC_EDIT_ROWS
 {
-    json rows = json::array();
-    int  count = 0;
-    bool truncated = false;
+    json                      rows = json::array();
+    int                       count = 0;
+    bool                      truncated = false;
+    std::set<const SCH_ITEM*> seen;
+
+    bool First( const SCH_ITEM* aItem ) { return seen.insert( aItem ).second; }
 
     void Add( json&& aRow )
     {
@@ -1322,6 +1334,10 @@ const char* ccSchItemKind( const SCH_ITEM* aItem )
 void ccSchProcessText( SCH_COMMIT* aCommit, const SCH_SHEET_PATH& aPath, SCH_ITEM* aItem,
                        const CC_SCH_TEXT_SET& aSet, bool aApply, CC_EDIT_ROWS& aRows )
 {
+    // An item of a sheet used on several paths is taken on its first path only.
+    if( !aRows.First( aItem ) )
+        return;
+
     std::vector<std::string> words;
     std::string              from;
     std::string              to;
@@ -1597,7 +1613,10 @@ void ccSchVisit( SCH_COMMIT* aCommit, const SCH_SHEET_PATH& aPath, SCH_ITEM* aIt
             }
         }
 
-        if( aFilter.sheetBorders && aSet.lineWidth && sheet->GetBorderWidth() != *aSet.lineWidth )
+        // The sheet itself is never given to process (only its fields and pins), so its
+        // border takes the same once only rule here.
+        if( aFilter.sheetBorders && aSet.lineWidth && sheet->GetBorderWidth() != *aSet.lineWidth
+                && aRows.First( sheet ) )
         {
             if( aApply )
             {
