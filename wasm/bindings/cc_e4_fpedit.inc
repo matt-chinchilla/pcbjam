@@ -1268,6 +1268,16 @@ bool kicadFpEditEnumerate( std::string aArgsJson )
     return true;
 }
 
+
+// t17-5: the marker of the enumerate end notice. Answers true: this engine's Enumerate Pads
+// tells window.kicadHostFpEdit.onNotice('{"notice":"enumerateEnd","kept":true|false}') when
+// its interactive loop ends (kicad pcbnew/tools/pad_tool.cpp), so the island lists the cap
+// only when the engine sends it.
+bool kicadHostFpEditEnumerateEnd()
+{
+    return true;
+}
+
 } // namespace cc_e4
 
 EMSCRIPTEN_BINDINGS( cc_e4_fpedit )
@@ -1286,4 +1296,5 @@ EMSCRIPTEN_BINDINGS( cc_e4_fpedit )
     function( "kicadFpEditPadDefaultsGet", &cc_e4::kicadFpEditPadDefaultsGet );
     function( "kicadFpEditPadDefaultsSet", &cc_e4::kicadFpEditPadDefaultsSet );
     function( "kicadFpEditEnumerate", &cc_e4::kicadFpEditEnumerate );
+    function( "kicadHostFpEditEnumerateEnd", &cc_e4::kicadHostFpEditEnumerateEnd );
 }
