@@ -1,3 +1,6 @@
+<!-- Copyright (C) 2026 Circuit Center Inc -->
+<!-- SPDX-License-Identifier: GPL-3.0-or-later -->
+
 # Engine run 15, train 18, group A (items 14 and 4)
 
 ## Item 14 (t18-14): kicadActionStates, and kicadActionStateWhy
